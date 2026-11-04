@@ -1,0 +1,7 @@
+.ipynb_checkpoints/
+__pycache__/
+.env
+.venv/
+
+# 녹화 영상·실측 로그 등 대용량 데이터
+data/

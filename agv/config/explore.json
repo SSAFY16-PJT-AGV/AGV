@@ -1,0 +1,29 @@
+{
+  "_note": "agv/linecam.py DEFAULT_CONFIG를 덮어쓰는 값만 적는다. 현장에서 tools/camtool.py로 재서 고칠 것.",
+  "robot": {
+    "id": "agv1",
+    "speed_mm_s": 150,
+    "_speed_note": "follow.base_speed로 직진할 때 실제 속도(mm/s). camtool.py speed로 잰다.",
+    "invert_left": false,
+    "invert_right": false,
+    "trim": 0.0
+  },
+  "camera": {
+    "width": 320,
+    "height": 240,
+    "capture_width": 1280,
+    "capture_height": 720,
+    "fps": 30,
+    "flip": 0,
+    "lock_exposure": true
+  },
+  "arm": {
+    "_note": "--set-arm일 때만 적용. 1번=카메라 좌우, 5번=카메라 상하(+가 아래). 주행 자세를 실물에서 정한 뒤 적을 것.",
+    "servo_angles": {"1": 0, "5": 25}
+  },
+  "follow": {
+    "base_speed": 0.30,
+    "kp": 0.35,
+    "kd": 0.04
+  }
+}

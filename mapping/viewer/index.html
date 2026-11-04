@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AGV 트랙 맵 뷰어</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@400;500;600&display=swap">
+<style>
+/* 레이아웃: 왼쪽은 매트를 위에서 본 캔버스, 오른쪽은 요약·경고·선택·엣지·이벤트 패널. 좁으면 위아래로 쌓는다. */
+:root {
+  --bg: #eef1f4;
+  --panel: #ffffff;
+  --ink: #161a1f;
+  --muted: #5b6573;
+  --line: #d6dce4;
+  --mat: #fbfcfd;
+  --grid: #e6eaf0;
+  --grid-major: #d3d9e2;
+  --track: #1c1e21;
+  --accent: #2c55c9;
+  --accent-soft: #e3eaff;
+  --warn: #a8640b;
+  --warn-soft: #fff3df;
+  --ok: #1e7a4a;
+  --ok-soft: #e1f5ea;
+  --bad: #b3261e;
+  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --patch-orange: #d8692a; --patch-yellow: #e6bd23; --patch-green: #34a86d;
+  --patch-purple: #5d2b97; --patch-red: #c93a32; --patch-blue: #2f6fc0; --patch-other: #8a8f98;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1115; --panel: #151a20; --ink: #e6e9ed; --muted: #98a2ae; --line: #29313b;
+    --mat: #11161c; --grid: #1b2129; --grid-major: #252d37; --track: #d4d8dd;
+    --accent: #84a2ff; --accent-soft: #1c2747; --warn: #f0b552; --warn-soft: #2e2413;
+    --ok: #5fd096; --ok-soft: #13291e; --bad: #ff8a80; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1115; --panel: #151a20; --ink: #e6e9ed; --muted: #98a2ae; --line: #29313b;
+  --mat: #11161c; --grid: #1b2129; --grid-major: #252d37; --track: #d4d8dd;
+  --accent: #84a2ff; --accent-soft: #1c2747; --warn: #f0b552; --warn-soft: #2e2413;
+  --ok: #5fd096; --ok-soft: #13291e; --bad: #ff8a80; color-scheme: dark;
+}
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans);
+  display: flex; flex-direction: column;
+}
+.top {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding-block: 10px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.top h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.mapid { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+.spacer { flex: 1; }
+.btn {
+  font: 500 13px var(--sans); color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+.btn.on { background: var(--accent-soft); border-color: var(--accent); }
+.pill { font: 500 12px var(--sans); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.info { background: var(--accent-soft); color: var(--accent); }
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 380px; }
+.stage { position: relative; min-width: 0; min-height: 0; background: var(--mat); overflow: hidden; touch-action: none; }
+.stage svg { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; }
+.stage svg.panning { cursor: grabbing; }
+.tools { position: absolute; top: 10px; left: 10px; display: flex; flex-wrap: wrap; gap: 6px; max-width: calc(100% - 20px); }
+.foot {
+  position: absolute; left: 10px; bottom: 10px; right: 10px; display: flex; flex-wrap: wrap;
+  align-items: flex-end; gap: 8px 14px; pointer-events: none; font-size: 12px; color: var(--muted);
+}
+.foot > * { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.legend svg { width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; }
+.scalebar { display: flex; align-items: center; gap: 6px; font-family: var(--mono); }
+.scalebar i { display: block; height: 6px; border: 1.5px solid var(--ink); border-top: 0; }
+.drop {
+  position: absolute; inset: 12px; border: 2px dashed var(--accent); border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-soft) 80%, transparent);
+  display: grid; place-items: center; font-size: 15px; font-weight: 500; color: var(--accent);
+}
+.side { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; min-width: 0; }
+section { padding: 14px 16px; border-bottom: 1px solid var(--line); min-width: 0; }
+section h2 {
+  margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px;
+}
+dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 14px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.warns { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.warns li { background: var(--warn-soft); color: var(--ink); border-radius: 6px; padding: 6px 9px; font-size: 13px; border-left: 3px solid var(--warn); }
+.empty { color: var(--muted); font-size: 13px; }
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 4px 6px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td.mono, .mono { font-family: var(--mono); }
+td.num { text-align: right; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--accent-soft); }
+tr.row.sel td { background: var(--accent-soft); color: var(--accent); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+pre.raw { margin: 8px 0 0; padding: 8px; background: var(--bg); border-radius: 6px; font: 11.5px/1.45 var(--mono); max-height: 220px; overflow: auto; white-space: pre; }
+.bgctl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; align-items: center; font-size: 13px; }
+.bgctl input[type="number"] { width: 100%; box-sizing: border-box; font: 13px var(--mono); padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--ink); }
+.msg { margin: 8px 0 0; font-size: 13px; color: var(--bad); }
+.hint { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; }
+svg text { font-family: var(--mono); }
+.n-label { font-size: 42px; fill: var(--ink); paint-order: stroke; stroke: var(--mat); stroke-width: 10px; stroke-linejoin: round; }
+.e-label { font-size: 34px; fill: var(--muted); paint-order: stroke; stroke: var(--mat); stroke-width: 9px; stroke-linejoin: round; }
+.e-label.br { fill: var(--accent); font-weight: 500; }
+g.node, g.edge { cursor: pointer; }
+@media (max-width: 900px) {
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(360px, 58vh) auto; }
+  .side { border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
+  body { height: auto; }
+}
+@media (prefers-reduced-motion: no-preference) { .btn { transition: border-color .12s; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>AGV 트랙 맵 뷰어</h1>
+  <span class="mapid" id="mapid">-</span>
+  <span id="srcpill"></span>
+  <span class="spacer"></span>
+  <label class="btn primary" for="file">맵 JSON 열기</label>
+  <input id="file" type="file" accept=".json,.jsonl,application/json" hidden>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg" aria-label="트랙 맵">
+      <defs>
+        <pattern id="gridMinor" width="100" height="100" patternUnits="userSpaceOnUse">
+          <path d="M100 0H0V100" fill="none" stroke="var(--grid)" stroke-width="2"/>
+        </pattern>
+        <pattern id="gridMajor" width="500" height="500" patternUnits="userSpaceOnUse">
+          <rect width="500" height="500" fill="url(#gridMinor)"/>
+          <path d="M500 0H0V500" fill="none" stroke="var(--grid-major)" stroke-width="3"/>
+        </pattern>
+      </defs>
+      <rect id="gridRect" fill="url(#gridMajor)"/>
+      <image id="bgimg" preserveAspectRatio="none" opacity="0.5"/>
+      <g id="layerDropped"></g>
+      <g id="layerEdges"></g>
+      <g id="layerStubs"></g>
+      <g id="layerNodes"></g>
+    </svg>
+    <div class="tools">
+      <button class="btn" id="fit" type="button">전체 보기</button>
+      <button class="btn" id="zin" type="button" aria-label="확대">+</button>
+      <button class="btn" id="zout" type="button" aria-label="축소">−</button>
+      <button class="btn on" id="tLabels" type="button">길이 표시</button>
+      <button class="btn on" id="tDropped" type="button">제외된 엣지</button>
+      <button class="btn" id="relayout" type="button">다시 배치</button>
+    </div>
+    <div class="foot">
+      <span id="layoutNote"></span>
+      <span class="legend">
+        <span><svg viewBox="0 0 14 14"><rect x="1" y="1" width="12" height="12" rx="2" fill="var(--patch-orange)"/></svg>색 패치</span>
+        <span><svg viewBox="0 0 14 14"><path d="M7 1L13 7L7 13L1 7Z" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.6"/></svg>갈라짐</span>
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.5" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.6"/><circle cx="7" cy="7" r="2" fill="var(--ink)"/></svg>합쳐짐</span>
+        <span><svg viewBox="0 0 14 14"><path d="M1 7H13" stroke="var(--muted)" stroke-width="1.6" stroke-dasharray="3 2"/></svg>미탐색</span>
+      </span>
+      <span class="scalebar"><i id="sbar"></i><span id="sbarText"></span></span>
+    </div>
+    <div class="drop" id="drop" hidden>맵 JSON을 놓으세요</div>
+  </div>
+  <aside class="side">
+    <section>
+      <h2>요약</h2>
+      <dl class="kv" id="summary"></dl>
+      <div class="counts" id="counts"></div>
+      <p class="msg" id="err" hidden></p>
+    </section>
+    <section>
+      <h2>경고 <span id="warnCount"></span></h2>
+      <ul class="warns" id="warns"></ul>
+    </section>
+    <section>
+      <h2>선택한 항목</h2>
+      <div id="detail"><p class="empty">맵에서 노드나 엣지를 누르면 자세한 값이 나와요. 노드는 끌어서 옮길 수 있어요.</p></div>
+    </section>
+    <section>
+      <h2>엣지</h2>
+      <div class="tbl-wrap"><table id="edgeTbl"></table></div>
+    </section>
+    <section>
+      <h2>이벤트 로그 <span id="evFilter"></span></h2>
+      <div class="tbl-wrap"><table id="evTbl"></table></div>
+      <p class="hint" id="evHint"></p>
+    </section>
+    <section>
+      <h2>배경 사진</h2>
+      <div class="bgctl">
+        <label for="bgfile">사진</label><input id="bgfile" type="file" accept="image/*">
+        <label for="bgop">투명도</label><input id="bgop" type="range" min="0" max="1" step="0.05" value="0.5">
+        <label for="bgw">사진 폭(mm)</label><input id="bgw" type="number" value="2000" step="10">
+        <label for="bgx">왼쪽 x(mm)</label><input id="bgx" type="number" value="0" step="10">
+        <label for="bgy">위쪽 y(mm)</label><input id="bgy" type="number" value="1500" step="10">
+      </div>
+      <p class="hint">매트를 위에서 찍어 반듯하게 편 사진을 깔고, 노드를 끌어 맞춰 보면서 맵이 맞는지 확인해요. 좌표가 없는 맵은 배치가 추정값이에요.</p>
+    </section>
+  </aside>
+</main>
+<script type="application/json" id="sample-map">{"map_id":"sim_ssafy_mat","version":0,"schema":"topo-v0","unit":"mm","created_at":"2026-11-04T15:36:05","origin_node":"P_orange","nodes":[{"id":"P_green","type":"patch","pos":null,"visits":3,"color":"green"},{"id":"P_orange","type":"patch","pos":null,"visits":4,"color":"orange"},{"id":"P_purple","type":"patch","pos":null,"visits":3,"color":"purple"},{"id":"P_yellow","type":"patch","pos":null,"visits":3,"color":"yellow"},{"id":"M1","type":"merge","pos":null,"visits":2},{"id":"M2","type":"merge","pos":null,"visits":3},{"id":"S1","type":"split","pos":null,"visits":3,"branches":{"left":"E3","right":"E9"}},{"id":"S2","type":"split","pos":null,"visits":3,"branches":{"left":"E7","right":"E10"}}],"edges":[{"id":"E1","from":"P_orange","to":"P_green","branch":null,"length_mm":1060.1,"length_std_mm":3.6,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E2","from":"P_green","to":"S1","branch":null,"length_mm":548.1,"length_std_mm":4.1,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E3","from":"S1","to":"P_purple","branch":"left","length_mm":270.7,"length_std_mm":5.0,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E4","from":"P_purple","to":"M1","branch":null,"length_mm":24.2,"length_std_mm":0.0,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E5","from":"M1","to":"P_yellow","branch":null,"length_mm":1048.9,"length_std_mm":4.3,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E6","from":"P_yellow","to":"S2","branch":null,"length_mm":156.9,"length_std_mm":4.2,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E7","from":"S2","to":"M2","branch":"left","length_mm":830.0,"length_std_mm":4.9,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E8","from":"M2","to":"P_orange","branch":null,"length_mm":675.9,"length_std_mm":6.3,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E9","from":"S1","to":"P_purple","branch":"right","length_mm":209.1,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E10","from":"S2","to":"M2","branch":"right","length_mm":937.8,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1}],"explore":{"complete":true,"unexplored":[]},"warnings":["P_purple→P_yellow 엣지(1회)는 M1 검출 누락으로 보고 제외함"],"debug":{"dropped_edges":[{"from":"P_purple","to":"P_yellow","branch":null,"length_mm":1112.5,"traversals":1,"via":"M1"}],"runs":["sim_s0"],"events":[{"run":"sim_s0","seg":0,"seq":1,"ts":1700000000.85,"type":"patch","d_mm":127.0,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":2,"ts":1700000008.2,"type":"patch","d_mm":1191.3,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":3,"ts":1700000013.05,"type":"split","d_mm":1734.7,"detail":"left","node":"S1"},{"run":"sim_s0","seg":0,"seq":4,"ts":1700000014.0,"type":"patch","d_mm":2008.9,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":5,"ts":1700000014.2,"type":"merge","d_mm":2033.1,"detail":"left","node":"M1"},{"run":"sim_s0","seg":0,"seq":6,"ts":1700000021.7,"type":"patch","d_mm":3085.0,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":7,"ts":1700000023.4,"type":"split","d_mm":3239.6,"detail":"left","node":"S2"},{"run":"sim_s0","seg":0,"seq":8,"ts":1700000028.6,"type":"merge","d_mm":4066.1,"detail":"left","node":"M2"},{"run":"sim_s0","seg":0,"seq":9,"ts":1700000033.5,"type":"patch","d_mm":4739.0,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":10,"ts":1700000040.8,"type":"patch","d_mm":5797.4,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":11,"ts":1700000045.6,"type":"split","d_mm":6347.8,"detail":"right","node":"S1"},{"run":"sim_s0","seg":0,"seq":12,"ts":1700000046.1,"type":"patch","d_mm":6556.9,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":13,"ts":1700000053.9,"type":"patch","d_mm":7669.4,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":14,"ts":1700000055.5,"type":"split","d_mm":7823.8,"detail":"right","node":"S2"},{"run":"sim_s0","seg":0,"seq":15,"ts":1700000061.7,"type":"merge","d_mm":8761.6,"detail":"right","node":"M2"},{"run":"sim_s0","seg":0,"seq":16,"ts":1700000066.55,"type":"patch","d_mm":9444.8,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":17,"ts":1700000073.85,"type":"patch","d_mm":10502.5,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":18,"ts":1700000078.7,"type":"split","d_mm":11053.0,"detail":"left","node":"S1"},{"run":"sim_s0","seg":0,"seq":19,"ts":1700000079.65,"type":"patch","d_mm":11320.1,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":20,"ts":1700000079.85,"type":"merge","d_mm":11344.3,"detail":"left","node":"M1"},{"run":"sim_s0","seg":0,"seq":21,"ts":1700000087.3,"type":"patch","d_mm":12390.1,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":22,"ts":1700000089.05,"type":"split","d_mm":12551.8,"detail":"left","node":"S2"},{"run":"sim_s0","seg":0,"seq":23,"ts":1700000094.3,"type":"merge","d_mm":13385.3,"detail":"left","node":"M2"},{"run":"sim_s0","seg":0,"seq":24,"ts":1700000099.2,"type":"patch","d_mm":14057.0,"detail":"orange","node":"P_orange"}]}}</script>
+<script>
+(function () {
+  "use strict";
+  var SVGNS = "http://www.w3.org/2000/svg";
+  var MIN_LAYOUT_MM = 300;
+  var $ = function (id) { return document.getElementById(id); };
+  var S = { map: null, pos: {}, estimated: true, sel: null, evNode: null,
+            view: { x: 0, y: 0, w: 2000, h: 1500 }, showLabels: true, showDropped: true, sample: false };
+
+  // ---------- 로딩 ----------
+  function showError(msg) { var e = $("err"); e.textContent = msg; e.hidden = !msg; }
+  function loadText(text, name) {
+    var t = text.trim();
+    if (!t) return;
+    if (t.charAt(0) === "{" && t.indexOf("\n{") > 0 && /"type"\s*:\s*"(start|patch|split)"/.test(t.slice(0, 300))) {
+      showError("이벤트 로그(" + (name || "jsonl") + ")예요. mapping/build_map.py로 맵 JSON을 먼저 만든 뒤 여세요.");
+      return;
+    }
+    var m;
+    try { m = JSON.parse(t); } catch (e) { showError("JSON을 읽지 못했어요: " + e.message); return; }
+    if (!m || !Array.isArray(m.nodes) || !Array.isArray(m.edges)) {
+      showError("nodes와 edges 배열이 있는 맵 JSON이 아니에요."); return;
+    }
+    showError("");
+    S.sample = false;
+    setMap(m);
+  }
+  function readFile(f) {
+    var r = new FileReader();
+    r.onload = function () { loadText(String(r.result), f.name); };
+    r.readAsText(f);
+  }
+  $("file").addEventListener("change", function (e) { if (e.target.files[0]) readFile(e.target.files[0]); e.target.value = ""; });
+  var stage = $("stage"), dragDepth = 0;
+  stage.addEventListener("dragenter", function (e) { e.preventDefault(); dragDepth++; $("drop").hidden = false; });
+  stage.addEventListener("dragover", function (e) { e.preventDefault(); });
+  stage.addEventListener("dragleave", function () { if (--dragDepth <= 0) { dragDepth = 0; $("drop").hidden = true; } });
+  stage.addEventListener("drop", function (e) {
+    e.preventDefault(); dragDepth = 0; $("drop").hidden = true;
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) readFile(f);
+  });
+  document.addEventListener("paste", function (e) {
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    var t = e.clipboardData && e.clipboardData.getData("text");
+    if (t && t.trim().charAt(0) === "{") loadText(t, "붙여넣기");
+  });
+
+  // ---------- 배치 ----------
+  function nodeIds() { return S.map.nodes.map(function (n) { return n.id; }); }
+  function byId(id) { for (var i = 0; i < S.map.nodes.length; i++) if (S.map.nodes[i].id === id) return S.map.nodes[i]; return null; }
+
+  function computeLayout() {
+    var nodes = S.map.nodes, ids = nodeIds(), n = ids.length, idx = {};
+    ids.forEach(function (id, i) { idx[id] = i; });
+    var allPos = n > 0 && nodes.every(function (nd) { return Array.isArray(nd.pos) && nd.pos.length >= 2; });
+    S.pos = {};
+    if (allPos) {
+      S.estimated = false;
+      nodes.forEach(function (nd) { S.pos[nd.id] = { x: +nd.pos[0], y: +nd.pos[1] }; });
+      return;
+    }
+    S.estimated = true;
+    if (!n) return;
+    // 엣지 길이로 최단거리 행렬
+    var INF = 1e15, D = [], i, j, k;
+    for (i = 0; i < n; i++) { D.push([]); for (j = 0; j < n; j++) D[i].push(i === j ? 0 : INF); }
+    S.map.edges.forEach(function (e) {
+      var a = idx[e.from], b = idx[e.to];
+      if (a === undefined || b === undefined || a === b) return;
+      // 화면 배치용: 아주 짧은 엣지도 노드 그림이 겹치지 않게 최소 간격을 둔다(길이 라벨은 실제 값)
+      var L = Math.max(MIN_LAYOUT_MM, +e.length_mm || 300);
+      if (L < D[a][b]) { D[a][b] = L; D[b][a] = L; }
+    });
+    for (k = 0; k < n; k++) for (i = 0; i < n; i++) for (j = 0; j < n; j++)
+      if (D[i][k] + D[k][j] < D[i][j]) D[i][j] = D[i][k] + D[k][j];
+    var maxD = 0;
+    for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (D[i][j] < INF) maxD = Math.max(maxD, D[i][j]);
+    for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (D[i][j] >= INF) D[i][j] = maxD * 1.2 + 500;
+    // 초기값: 원점부터 진행 방향 순서로 원 위에
+    var order = [], seen = {}, origin = S.map.origin_node && idx[S.map.origin_node] !== undefined ? S.map.origin_node : ids[0];
+    var queue = [origin];
+    while (queue.length) {
+      var cur = queue.shift(); if (seen[cur]) continue; seen[cur] = 1; order.push(cur);
+      S.map.edges.forEach(function (e) { if (e.from === cur && !seen[e.to]) queue.push(e.to); });
+    }
+    ids.forEach(function (id) { if (!seen[id]) order.push(id); });
+    var total = 0; S.map.edges.forEach(function (e) { total += Math.max(60, +e.length_mm || 300); });
+    var R = Math.max(300, total / (2 * Math.PI) * 0.7);
+    var X = new Array(n), Y = new Array(n);
+    order.forEach(function (id, t) { var a = -Math.PI / 2 + 2 * Math.PI * t / n; X[idx[id]] = R * Math.cos(a); Y[idx[id]] = R * Math.sin(a); });
+    // 응력 최소화(SMACOF, 국소 갱신)
+    for (var it = 0; it < 600; it++) {
+      for (i = 0; i < n; i++) {
+        var nx = 0, ny = 0, ws = 0;
+        for (j = 0; j < n; j++) {
+          if (i === j) continue;
+          var dx = X[i] - X[j], dy = Y[i] - Y[j], dist = Math.sqrt(dx * dx + dy * dy) || 1e-6;
+          var w = 1 / (D[i][j] * D[i][j]);
+          nx += w * (X[j] + D[i][j] * dx / dist); ny += w * (Y[j] + D[i][j] * dy / dist); ws += w;
+        }
+        X[i] = nx / ws; Y[i] = ny / ws;
+      }
+    }
+    // 원점이 아래쪽 가운데 오도록 회전
+    var cx = 0, cy = 0; for (i = 0; i < n; i++) { cx += X[i]; cy += Y[i]; } cx /= n; cy /= n;
+    var o = idx[origin], ang = Math.atan2(Y[o] - cy, X[o] - cx), rot = -Math.PI / 2 - ang;
+    var c = Math.cos(rot), s = Math.sin(rot);
+    for (i = 0; i < n; i++) {
+      var px = X[i] - cx, py = Y[i] - cy;
+      S.pos[ids[i]] = { x: px * c - py * s, y: px * s + py * c };
+    }
+    // 진행 방향이 반시계가 되도록(사진과 같은 방향) 필요하면 좌우 반전
+    var area = 0;
+    for (i = 0; i < order.length; i++) {
+      var p1 = S.pos[order[i]], p2 = S.pos[order[(i + 1) % order.length]];
+      area += p1.x * p2.y - p2.x * p1.y;
+    }
+    if (area < 0) ids.forEach(function (id) { S.pos[id].x = -S.pos[id].x; });
+  }
+
+  // ---------- 그리기 ----------
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) if (attrs[k] !== undefined && attrs[k] !== null) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function patchVar(color) {
+    var known = ["orange", "yellow", "green", "purple", "red", "blue"];
+    return "var(--patch-" + (known.indexOf(color) >= 0 ? color : "other") + ")";
+  }
+  function sv(p) { return { x: p.x, y: -p.y }; } // mm(y 위) -> SVG(y 아래)
+
+  function edgeGeom(e, sideHint, multi) {
+    var a = S.pos[e.from], b = S.pos[e.to];
+    if (!a || !b) return null;
+    var A = sv(a), B = sv(b), dx = B.x - A.x, dy = B.y - A.y, c = Math.sqrt(dx * dx + dy * dy) || 1;
+    var L = Math.max(MIN_LAYOUT_MM, +e.length_mm || c), sag = 0;
+    if (S.estimated && L > c * 1.03) sag = Math.min(Math.sqrt(3 * c * (L - c) / 8), c * 0.7);
+    var side = e.branch === "left" ? 1 : e.branch === "right" ? -1 : (sideHint || 0);
+    if (side === 0 && sag) side = 1;
+    if (multi) sag = Math.max(sag, Math.min(160, c * 0.22));
+    // 진행 방향 기준 왼쪽 법선(화면 좌표, y 아래)
+    var nx = dy / c, ny = -dx / c;
+    var mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+    var C = { x: mx + nx * 2 * sag * side, y: my + ny * 2 * sag * side };
+    function at(t) {
+      var u = 1 - t;
+      return { x: u * u * A.x + 2 * u * t * C.x + t * t * B.x, y: u * u * A.y + 2 * u * t * C.y + t * t * B.y,
+               tx: 2 * u * (C.x - A.x) + 2 * t * (B.x - C.x), ty: 2 * u * (C.y - A.y) + 2 * t * (B.y - C.y) };
+    }
+    return { d: "M" + A.x + " " + A.y + "Q" + C.x + " " + C.y + " " + B.x + " " + B.y, at: at, nx: nx, ny: ny, side: side };
+  }
+
+  function draw() {
+    var LE = $("layerEdges"), LN = $("layerNodes"), LS = $("layerStubs"), LD = $("layerDropped");
+    [LE, LN, LS, LD].forEach(function (g) { while (g.firstChild) g.removeChild(g.firstChild); });
+    if (!S.map) return;
+    var sel = S.sel;
+    // 같은 두 노드를 잇는 여러 엣지는 서로 다른 쪽으로 휜다
+    var pairCount = {}, pairSeen = {};
+    S.map.edges.forEach(function (e) { var k = [e.from, e.to].sort().join("|"); pairCount[k] = (pairCount[k] || 0) + 1; });
+    S.map.edges.forEach(function (e) {
+      var k = [e.from, e.to].sort().join("|"), hint = 0;
+      if (pairCount[k] > 1 && !e.branch) { pairSeen[k] = (pairSeen[k] || 0) + 1; hint = pairSeen[k] % 2 ? 1 : -1; }
+      var g = edgeGeom(e, hint, pairCount[k] > 1); if (!g) return;
+      var isSel = sel && sel.kind === "edge" && sel.id === e.id;
+      var hl = sel && sel.kind === "node" && (e.from === sel.id || e.to === sel.id);
+      var grp = el("g", { "class": "edge", "data-edge": e.id }, LE);
+      el("path", { d: g.d, fill: "none", stroke: "transparent", "stroke-width": 70 }, grp);
+      el("path", { d: g.d, fill: "none", stroke: isSel || hl ? "var(--accent)" : "var(--track)",
+                   "stroke-width": isSel ? 30 : 22, "stroke-linecap": "round" }, grp);
+      var m = g.at(0.5), tl = Math.sqrt(m.tx * m.tx + m.ty * m.ty) || 1, ux = m.tx / tl, uy = m.ty / tl;
+      // 진행 방향 화살표(셰브론)
+      var s = 26;
+      el("path", { d: "M" + (m.x - ux * s - uy * s) + " " + (m.y - uy * s + ux * s) + "L" + (m.x + ux * s * 0.6) + " " + (m.y + uy * s * 0.6) +
+                      "L" + (m.x - ux * s + uy * s) + " " + (m.y - uy * s - ux * s),
+                   fill: "none", stroke: "var(--mat)", "stroke-width": 7, "stroke-linecap": "round", "stroke-linejoin": "round" }, grp);
+      if (S.showLabels) {
+        var off = 58 * (g.side || 1), lx = m.x + g.nx * off, ly = m.y + g.ny * off;
+        var t = el("text", { x: lx, y: ly + 12, "text-anchor": "middle", "class": "e-label" }, grp);
+        t.textContent = Math.round(e.length_mm) + " mm";
+        var t2 = el("text", { x: lx, y: ly - 26, "text-anchor": "middle", "class": "e-label" + (e.branch ? " br" : "") }, grp);
+        t2.textContent = e.id + (e.branch ? " · " + (e.branch === "left" ? "왼쪽" : "오른쪽") : "") + " · " + e.traversals + "회";
+      }
+    });
+    // 제외된(검출 누락으로 본) 엣지
+    var dropped = (S.map.debug && S.map.debug.dropped_edges) || [];
+    if (S.showDropped) dropped.forEach(function (e) {
+      var g = edgeGeom({ from: e.from, to: e.to, length_mm: e.length_mm, branch: null }, -1); if (!g) return;
+      el("path", { d: g.d, fill: "none", stroke: "var(--bad)", "stroke-width": 8, "stroke-dasharray": "30 24", opacity: 0.7 }, LD);
+    });
+    // 미탐색 가지
+    var unexp = (S.map.explore && S.map.explore.unexplored) || [];
+    unexp.forEach(function (u) {
+      var p = S.pos[u.node]; if (!p) return;
+      var inc = S.map.edges.filter(function (e) { return e.to === u.node; })[0];
+      var dirx = 0, diry = 1;
+      if (inc && S.pos[inc.from]) { var q = S.pos[inc.from]; dirx = p.x - q.x; diry = p.y - q.y; var l = Math.hypot(dirx, diry) || 1; dirx /= l; diry /= l; }
+      var a = (u.branch === "left" ? 1 : -1) * 0.6, cx = Math.cos(a), sx = Math.sin(a);
+      var vx = dirx * cx - diry * sx, vy = dirx * sx + diry * cx, P = sv(p), Q = sv({ x: p.x + vx * 260, y: p.y + vy * 260 });
+      el("line", { x1: P.x, y1: P.y, x2: Q.x, y2: Q.y, stroke: "var(--muted)", "stroke-width": 14, "stroke-dasharray": "26 20", "stroke-linecap": "round" }, LS);
+      var t = el("text", { x: Q.x + vx * 50, y: Q.y - vy * 50 + 12, "text-anchor": "middle", "class": "e-label br" }, LS);
+      t.textContent = "? " + (u.branch === "left" ? "왼쪽" : "오른쪽");
+    });
+    // 노드
+    S.map.nodes.forEach(function (n) {
+      var p = S.pos[n.id]; if (!p) return;
+      var P = sv(p), isSel = sel && sel.kind === "node" && sel.id === n.id;
+      var g = el("g", { "class": "node", "data-node": n.id, transform: "translate(" + P.x + " " + P.y + ")" }, LN);
+      if (S.map.origin_node === n.id) el("circle", { r: 118, fill: "none", stroke: "var(--accent)", "stroke-width": 6, "stroke-dasharray": "14 10" }, g);
+      if (n.type === "patch") {
+        el("rect", { x: -70, y: -70, width: 140, height: 140, rx: 10, fill: patchVar(n.color),
+                     stroke: isSel ? "var(--accent)" : "var(--mat)", "stroke-width": isSel ? 14 : 6 }, g);
+        el("rect", { x: -11, y: -70, width: 22, height: 140, fill: "var(--track)", opacity: 0.85 }, g);
+      } else if (n.type === "split") {
+        el("path", { d: "M0 -52L52 0L0 52L-52 0Z", fill: "var(--panel)", stroke: isSel ? "var(--accent)" : "var(--ink)", "stroke-width": isSel ? 14 : 9 }, g);
+      } else {
+        el("circle", { r: 44, fill: "var(--panel)", stroke: isSel ? "var(--accent)" : "var(--ink)", "stroke-width": isSel ? 14 : 9 }, g);
+        el("circle", { r: 15, fill: isSel ? "var(--accent)" : "var(--ink)" }, g);
+      }
+      var lab = el("text", { x: 0, y: n.type === "patch" ? 118 : 100, "text-anchor": "middle", "class": "n-label" }, g);
+      lab.textContent = n.id;
+    });
+    var gr = $("gridRect"), v = S.view, pad = Math.max(v.w, v.h) * 3;
+    gr.setAttribute("x", v.x - pad); gr.setAttribute("y", v.y - pad);
+    gr.setAttribute("width", v.w + 2 * pad); gr.setAttribute("height", v.h + 2 * pad);
+  }
+
+  // ---------- 보기(이동·확대) ----------
+  var svg = $("svg");
+  function applyView() {
+    var v = S.view;
+    svg.setAttribute("viewBox", v.x + " " + v.y + " " + v.w + " " + v.h);
+    var gr = $("gridRect"), pad = Math.max(v.w, v.h) * 3;
+    gr.setAttribute("x", v.x - pad); gr.setAttribute("y", v.y - pad);
+    gr.setAttribute("width", v.w + 2 * pad); gr.setAttribute("height", v.h + 2 * pad);
+    // 축척 막대
+    var r = svg.getBoundingClientRect(), mmPerPx = Math.max(v.w / (r.width || 1), v.h / (r.height || 1));
+    var target = mmPerPx * 110, steps = [50, 100, 200, 250, 500, 1000, 2000, 5000], len = steps[0];
+    steps.forEach(function (s) { if (s <= target) len = s; });
+    $("sbar").style.width = (len / mmPerPx) + "px";
+    $("sbarText").textContent = len >= 1000 ? (len / 1000) + " m" : len + " mm";
+  }
+  function fit() {
+    var ids = Object.keys(S.pos);
+    if (!ids.length) { S.view = { x: -1000, y: -750, w: 2000, h: 1500 }; applyView(); return; }
+    var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    ids.forEach(function (id) { var P = sv(S.pos[id]); x0 = Math.min(x0, P.x); y0 = Math.min(y0, P.y); x1 = Math.max(x1, P.x); y1 = Math.max(y1, P.y); });
+    var m = 320, w = x1 - x0 + 2 * m, h = y1 - y0 + 2 * m, r = svg.getBoundingClientRect(), asp = (r.width || 4) / (r.height || 3);
+    if (w / h < asp) { var nw = h * asp; x0 -= (nw - w) / 2; w = nw; } else { var nh = w / asp; y0 -= (nh - h) / 2; h = nh; }
+    S.view = { x: x0 - m, y: y0 - m - h * 0.04, w: w, h: h * 1.08 };
+    applyView();
+  }
+  function zoom(f, cx, cy) {
+    var v = S.view; if (cx === undefined) { cx = v.x + v.w / 2; cy = v.y + v.h / 2; }
+    S.view = { x: cx - (cx - v.x) * f, y: cy - (cy - v.y) * f, w: v.w * f, h: v.h * f };
+    applyView();
+  }
+  function toSvg(evt) {
+    var r = svg.getBoundingClientRect(), v = S.view, sc = Math.max(v.w / r.width, v.h / r.height);
+    var ox = (r.width * sc - v.w) / 2, oy = (r.height * sc - v.h) / 2;
+    return { x: v.x - ox + (evt.clientX - r.left) * sc, y: v.y - oy + (evt.clientY - r.top) * sc, sc: sc };
+  }
+  svg.addEventListener("wheel", function (e) { e.preventDefault(); var p = toSvg(e); zoom(e.deltaY > 0 ? 1.15 : 1 / 1.15, p.x, p.y); }, { passive: false });
+  $("fit").onclick = fit;
+  $("zin").onclick = function () { zoom(1 / 1.3); };
+  $("zout").onclick = function () { zoom(1.3); };
+  $("tLabels").onclick = function () { S.showLabels = !S.showLabels; this.classList.toggle("on", S.showLabels); draw(); };
+  $("tDropped").onclick = function () { S.showDropped = !S.showDropped; this.classList.toggle("on", S.showDropped); draw(); };
+  $("relayout").onclick = function () { computeLayout(); draw(); fit(); };
+
+  var drag = null;
+  svg.addEventListener("pointerdown", function (e) {
+    var target = e.target.closest ? e.target.closest("g.node, g.edge") : null;
+    var p = toSvg(e);
+    drag = { sx: e.clientX, sy: e.clientY, moved: false, p0: p, view0: { x: S.view.x, y: S.view.y } };
+    if (target && target.getAttribute("data-node")) drag.node = target.getAttribute("data-node");
+    else if (target && target.getAttribute("data-edge")) drag.edge = target.getAttribute("data-edge");
+    svg.setPointerCapture(e.pointerId);
+    if (!drag.node) svg.classList.add("panning");
+  });
+  svg.addEventListener("pointermove", function (e) {
+    if (!drag) return;
+    if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 4) drag.moved = true;
+    if (!drag.moved) return;
+    if (drag.node) {
+      var p = toSvg(e); S.pos[drag.node] = { x: p.x, y: -p.y }; draw();
+    } else {
+      var sc = drag.p0.sc;
+      S.view.x = drag.view0.x - (e.clientX - drag.sx) * sc; S.view.y = drag.view0.y - (e.clientY - drag.sy) * sc; applyView();
+    }
+  });
+  svg.addEventListener("pointerup", function () {
+    if (drag && !drag.moved) {
+      if (drag.node) select({ kind: "node", id: drag.node });
+      else if (drag.edge) select({ kind: "edge", id: drag.edge });
+      else select(null);
+    }
+    drag = null; svg.classList.remove("panning");
+  });
+
+  // ---------- 패널 ----------
+  function esc(s) { return String(s === null || s === undefined ? "-" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function kv(rows) { return rows.map(function (r) { return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>"; }).join(""); }
+  var TYPE_KO = { patch: "색 패치", split: "갈라짐", merge: "합쳐짐" };
+
+  function renderSummary() {
+    var m = S.map;
+    $("mapid").textContent = (m.map_id || "map") + "@" + (m.version === undefined ? "?" : m.version);
+    $("srcpill").innerHTML = S.sample ? '<span class="pill info">예시: 시뮬레이션 맵</span>' : "";
+    $("summary").innerHTML = kv([
+      ["형식", m.schema || "-"], ["생성", m.created_at || "-"], ["원점", m.origin_node || "-"],
+      ["단위", m.unit || "mm"], ["주행 로그", ((m.debug && m.debug.runs) || []).join(", ") || "-"]
+    ]);
+    var c = { patch: 0, split: 0, merge: 0 };
+    m.nodes.forEach(function (n) { c[n.type] = (c[n.type] || 0) + 1; });
+    var ex = m.explore || {}, un = (ex.unexplored || []).length;
+    $("counts").innerHTML =
+      '<span class="pill info">노드 ' + m.nodes.length + "</span>" +
+      '<span class="pill info">패치 ' + c.patch + " · 갈라짐 " + c.split + " · 합쳐짐 " + c.merge + "</span>" +
+      '<span class="pill info">엣지 ' + m.edges.length + "</span>" +
+      (un ? '<span class="pill warn">미탐색 가지 ' + un + "</span>" : '<span class="pill ok">모든 가지 탐색함</span>');
+    var w = m.warnings || [];
+    $("warnCount").innerHTML = w.length ? '<span class="pill warn">' + w.length + "</span>" : "";
+    $("warns").innerHTML = w.length ? w.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("") : '<li class="empty" style="background:none;border:0;padding:0">경고 없음</li>';
+    $("layoutNote").textContent = S.estimated
+      ? "좌표 없음 · 엣지 길이로 자동 배치한 추정 모양"
+      : "실측 좌표(mm)";
+  }
+
+  function renderEdges() {
+    var sel = S.sel, rows = S.map.edges.map(function (e) {
+      var on = sel && ((sel.kind === "edge" && sel.id === e.id) || (sel.kind === "node" && (e.from === sel.id || e.to === sel.id)));
+      return '<tr class="row' + (on ? " sel" : "") + '" data-edge="' + esc(e.id) + '"><td class="mono">' + esc(e.id) + '</td><td class="mono">' + esc(e.from) + " → " + esc(e.to) +
+        "</td><td>" + (e.branch ? (e.branch === "left" ? "왼쪽" : "오른쪽") : "") + '</td><td class="num mono">' + Math.round(e.length_mm) +
+        '</td><td class="num mono">±' + Math.round(e.length_std_mm || 0) + '</td><td class="num mono">' + e.traversals + "</td></tr>";
+    }).join("");
+    $("edgeTbl").innerHTML = "<thead><tr><th>ID</th><th>경로</th><th>가지</th><th>길이 mm</th><th>편차</th><th>횟수</th></tr></thead><tbody>" + rows + "</tbody>";
+  }
+  $("edgeTbl").addEventListener("click", function (e) {
+    var tr = e.target.closest("tr[data-edge]"); if (tr) select({ kind: "edge", id: tr.getAttribute("data-edge") });
+  });
+
+  function renderEvents() {
+    var evs = (S.map.debug && S.map.debug.events) || [];
+    var f = S.evNode, list = f ? evs.filter(function (e) { return e.node === f; }) : evs;
+    $("evFilter").innerHTML = f ? '<span class="pill info">' + esc(f) + '</span> <button class="btn" type="button" id="evAll">전체 보기</button>' : "";
+    if (f) $("evAll").onclick = function () { S.evNode = null; renderEvents(); };
+    var shown = list.slice(0, 400);
+    $("evTbl").innerHTML = "<thead><tr><th>로그</th><th>seq</th><th>종류</th><th>값</th><th>거리 mm</th><th>노드</th></tr></thead><tbody>" +
+      shown.map(function (e) {
+        return '<tr class="row' + (S.sel && S.sel.kind === "node" && S.sel.id === e.node ? " sel" : "") + '" data-node="' + esc(e.node) + '"><td class="mono">' + esc(e.run) + "/" + esc(e.seg) +
+          '</td><td class="num mono">' + esc(e.seq) + "</td><td>" + esc(TYPE_KO[e.type] || e.type) + '</td><td class="mono">' + esc(e.detail) +
+          '</td><td class="num mono">' + Math.round(e.d_mm) + '</td><td class="mono">' + esc(e.node) + "</td></tr>";
+      }).join("") + "</tbody>";
+    $("evHint").textContent = !evs.length ? "이 맵에는 debug.events가 없어요." :
+      (list.length > shown.length ? "앞의 " + shown.length + "개만 보여요. " : "") + "행을 누르면 그 노드를 선택해요.";
+  }
+  $("evTbl").addEventListener("click", function (e) {
+    var tr = e.target.closest("tr[data-node]"); if (tr) select({ kind: "node", id: tr.getAttribute("data-node") }, true);
+  });
+
+  function renderDetail() {
+    var d = $("detail"), sel = S.sel;
+    if (!sel) { d.innerHTML = '<p class="empty">맵에서 노드나 엣지를 누르면 자세한 값이 나와요. 노드는 끌어서 옮길 수 있어요.</p>'; return; }
+    var obj, rows;
+    if (sel.kind === "node") {
+      obj = byId(sel.id); if (!obj) { d.innerHTML = ""; return; }
+      var outs = S.map.edges.filter(function (e) { return e.from === obj.id; });
+      var ins = S.map.edges.filter(function (e) { return e.to === obj.id; });
+      rows = [["ID", obj.id], ["종류", (TYPE_KO[obj.type] || obj.type) + (obj.color ? " · " + obj.color : "")],
+              ["지난 횟수", obj.visits], ["좌표", obj.pos ? obj.pos.join(", ") + " mm" : "없음"],
+              ["들어오는 엣지", ins.map(function (e) { return e.id + "(" + e.from + ")"; }).join(", ") || "-"],
+              ["나가는 엣지", outs.map(function (e) { return e.id + "→" + e.to + (e.branch ? "[" + e.branch + "]" : ""); }).join(", ") || "-"]];
+      S.evNode = obj.id;
+    } else {
+      obj = S.map.edges.filter(function (e) { return e.id === sel.id; })[0]; if (!obj) { d.innerHTML = ""; return; }
+      rows = [["ID", obj.id], ["경로", obj.from + " → " + obj.to], ["가지", obj.branch || "-"],
+              ["길이", Math.round(obj.length_mm) + " ± " + Math.round(obj.length_std_mm || 0) + " mm (" + (obj.length_src || "-") + ")"],
+              ["지난 횟수", obj.traversals], ["형상", obj.shape ? obj.shape.length + "점" : "없음"]];
+    }
+    var sw = obj.type === "patch" ? '<span class="swatch" style="background:' + patchVar(obj.color) + '"></span>' : "";
+    d.innerHTML = sw + '<dl class="kv">' + kv(rows) + '</dl><pre class="raw">' + esc(JSON.stringify(obj, null, 1)) + "</pre>";
+  }
+
+  function select(sel, keepEvFilter) {
+    S.sel = sel;
+    if (!sel || sel.kind !== "node") { if (!keepEvFilter) S.evNode = null; }
+    renderDetail(); renderEdges(); renderEvents(); draw();
+  }
+
+  function setMap(m) {
+    S.map = m; S.sel = null; S.evNode = null;
+    computeLayout(); renderSummary(); renderEdges(); renderEvents(); renderDetail(); draw(); fit();
+  }
+
+  // ---------- 배경 사진 ----------
+  function applyBg() {
+    var img = $("bgimg"), w = +$("bgw").value || 2000, x = +$("bgx").value || 0, y = +$("bgy").value || 0;
+    img.setAttribute("opacity", $("bgop").value);
+    if (!img.getAttribute("href")) return;
+    var ratio = +img.getAttribute("data-ratio") || 0.75;
+    img.setAttribute("x", x); img.setAttribute("y", -y); img.setAttribute("width", w); img.setAttribute("height", w * ratio);
+  }
+  $("bgfile").addEventListener("change", function (e) {
+    var f = e.target.files[0]; if (!f) return;
+    var r = new FileReader();
+    r.onload = function () {
+      var im = new Image();
+      im.onload = function () { var b = $("bgimg"); b.setAttribute("href", r.result); b.setAttribute("data-ratio", im.height / im.width); applyBg(); };
+      im.src = r.result;
+    };
+    r.readAsDataURL(f);
+  });
+  ["bgop", "bgw", "bgx", "bgy"].forEach(function (id) { $(id).addEventListener("input", applyBg); });
+
+  window.addEventListener("resize", applyView);
+
+  // ---------- 시작 ----------
+  var sampleText = $("sample-map").textContent.trim(), started = false;
+  try {
+    var q = new URLSearchParams(location.search).get("map");
+    if (q) {
+      started = true;
+      fetch(q).then(function (r) { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.text(); })
+        .then(function (t) { loadText(t, q); })
+        .catch(function (err) { showError(q + "를 불러오지 못했어요(" + err.message + "). 파일을 직접 열어 주세요."); });
+    }
+  } catch (e) { /* 쿼리 없음 */ }
+  if (!started && sampleText && sampleText.charAt(0) === "{") {
+    try { S.sample = true; setMap(JSON.parse(sampleText)); S.sample = true; renderSummary(); } catch (e) { S.sample = false; }
+  }
+  if (!S.map) { applyView(); $("summary").innerHTML = kv([["상태", "맵 JSON을 열거나 끌어다 놓으세요"]]); }
+})();
+</script>
+</body>
+</html>
