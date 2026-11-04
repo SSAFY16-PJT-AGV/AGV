@@ -147,6 +147,16 @@ class AllocationStore:
             db.execute('CREATE TABLE IF NOT EXISTS allocation_outbox '
                        '(task_id TEXT PRIMARY KEY NOT NULL REFERENCES allocation_jobs(task_id), '
                        'payload TEXT NOT NULL, state TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS allocation_meta '
+                       '(key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)')
+            maps = [row[0] for row in db.execute('SELECT DISTINCT map_id FROM allocation_jobs')]
+            if len(maps) > 1:
+                raise AllocationConflict('existing allocations use multiple maps; manual reconciliation required')
+            active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
+            if active is None and maps:
+                db.execute('INSERT INTO allocation_meta(key, value) VALUES (?, ?)', ('active_map', maps[0]))
+            elif active is not None and maps and active[0] != maps[0]:
+                raise AllocationConflict('active map differs from existing allocation; manual reconciliation required')
 
     def create_task(self, task_id):
         _id(task_id, 'task_id')
@@ -168,6 +178,11 @@ class AllocationStore:
                 row = db.execute('SELECT status FROM tasks WHERE task_id=?', (task_id,)).fetchone()
                 if row is None or row[0] != 'PENDING':
                     raise AllocationConflict('task is missing or not pending')
+                active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
+                if active is None:
+                    db.execute('INSERT INTO allocation_meta(key, value) VALUES (?, ?)', ('active_map', map_id))
+                elif active[0] != map_id:
+                    raise AllocationConflict('map differs from the persistent active map')
                 db.execute('INSERT INTO allocation_jobs VALUES (?, ?, ?, ?, ?)',
                            (task_id, robot_id, map_id, nodes_json, released_until))
                 db.executemany('INSERT INTO allocation_occupancy VALUES (?, ?, ?)',

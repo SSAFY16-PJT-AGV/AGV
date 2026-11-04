@@ -1,5 +1,6 @@
 import json
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -161,6 +162,58 @@ class AllocationStoreTests(unittest.TestCase):
         self.store.mark_attempted('T1')
         with self.assertRaises(AllocationConflict): self.store.mark_attempted('T1')
         self.assertEqual(self.store.get_order('T1')['state'], 'uncertain')
+
+    def test_first_map_is_locked_and_survives_reopening(self):
+        self.store.create_task('T1'); self.store.create_task('T2')
+        self.store.allocate(*self.args())
+        original_occupancy = self.store.list_occupancy()
+        reopened = AllocationStore(self.path)
+        reopened.initialize()
+        different_map = list(self.args('T2', 'r2', nodes=['N3', 'N4']))
+        different_map[2] = 'layout@v2'
+        with self.assertRaises(AllocationConflict):
+            reopened.allocate(*different_map)
+        self.assertIsNone(reopened.get_allocation('T2'))
+        self.assertIsNone(reopened.get_order('T2'))
+        self.assertEqual(reopened.list_occupancy(), original_occupancy)
+        self.assertEqual(SqliteTaskStore(self.path).get('T2').status, 'PENDING')
+        reopened.allocate(*self.args('T2', 'r2', nodes=['N3', 'N4']))
+
+    def test_concurrent_first_allocations_on_different_maps_have_one_winner(self):
+        self.store.create_task('T1'); self.store.create_task('T2')
+        gate = threading.Barrier(2); results = []
+        def attempt(task, robot, nodes, map_id):
+            gate.wait()
+            args = list(self.args(task, robot, nodes=nodes)); args[2] = map_id
+            try:
+                AllocationStore(self.path).allocate(*args)
+                results.append('ok')
+            except AllocationConflict:
+                results.append('conflict')
+        threads = [threading.Thread(target=attempt, args=x) for x in [
+            ('T1', 'r1', ['N1', 'N2'], 'layout@v1'),
+            ('T2', 'r2', ['N3', 'N4'], 'layout@v2')]]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        self.assertEqual(sorted(results), ['conflict', 'ok'])
+        self.assertEqual(len(self.store.list_occupancy()), 3)
+
+    def test_legacy_allocation_backfills_map_and_inconsistent_legacy_rejected(self):
+        self.store.create_task('T1'); self.store.create_task('T2')
+        self.store.allocate(*self.args())
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute('DELETE FROM allocation_meta'); db.commit()
+        reopened = AllocationStore(self.path)
+        reopened.initialize()
+        different = list(self.args('T2', 'r2', nodes=['N3', 'N4']))
+        different[2] = 'layout@v2'
+        with self.assertRaises(AllocationConflict):
+            reopened.allocate(*different)
+        reopened.allocate(*self.args('T2', 'r2', nodes=['N3', 'N4']))
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute("UPDATE allocation_jobs SET map_id='layout@v2' WHERE task_id='T2'"); db.commit()
+        with self.assertRaises(AllocationConflict):
+            AllocationStore(self.path).initialize()
 
 
 if __name__ == '__main__':
