@@ -340,6 +340,24 @@ class RecoveryGate:
                 raise
 
     @contextmanager
+    def serialized(self):
+        """Hold the local gate through an attempt record and queue operation.
+
+        This only orders callbacks processed through this instance. It cannot
+        detect or stop a real robot at the instant a physical link fails.
+        """
+        with self._operation_lock:
+            if not self._initialized:
+                raise RecoveryError('recovery gate is not initialized')
+            if getattr(self._local, 'db', None) is not None or getattr(self._local, 'serializing', False):
+                raise RecoveryError('nested serialized operation is not supported')
+            self._local.serializing = True
+            try:
+                yield
+            finally:
+                self._local.serializing = False
+
+    @contextmanager
     def transaction(self):
         """Serialize local invalidations with a SQLite write transaction.
 

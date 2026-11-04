@@ -259,6 +259,34 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(RecoveryError):
             self._required()
 
+    def test_serialized_allows_nested_gate_transaction_but_blocks_invalidation_until_exit(self):
+        payload = self._attempt()
+        token = self.gate.begin('T1', 'boot-1')
+        self._response(token, payload)
+        started, finished = threading.Event(), threading.Event()
+        def invalidate():
+            started.set()
+            self.gate.invalidate('T1')
+            finished.set()
+        with self.gate.serialized():
+            with self.gate.transaction() as db:
+                self.gate.require_reconciled(db, 'T1', 'boot-1', expected_seq=1, expected_stopped_at='N2')
+            thread = threading.Thread(target=invalidate)
+            thread.start()
+            self.assertTrue(started.wait(2))
+            self.assertFalse(finished.wait(0.1))
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(finished.is_set())
+        with self.assertRaises(RecoveryError):
+            self._required()
+
+    def test_serialized_inside_database_transaction_is_rejected(self):
+        with self.gate.transaction():
+            with self.assertRaises(RecoveryError):
+                with self.gate.serialized():
+                    pass
+
     def test_transaction_and_database_are_required_for_proof(self):
         payload = self._attempt()
         token = self.gate.begin('T1', 'boot-1')
