@@ -4,3 +4,9 @@ __pycache__/
 .env
 .env.*
 *.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
