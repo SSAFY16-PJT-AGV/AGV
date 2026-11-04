@@ -139,7 +139,7 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(self.progress.advance('sim-r1', final)['status'], 'duplicate')
         self.assertEqual(self.store.get_order('T1')['state'], 'acked')
 
-    def test_pending_or_uncertain_cannot_be_reported_as_rear_clear(self):
+    def test_pending_order_cannot_be_reported_as_rear_clear(self):
         self.progress.advance('sim-r1', self.event)
         event2 = dict(self.event, event_id='event-2', seq=2, stopped_at='N5',
                       cleared_resources=[list(x) for x in sorted(self.new - {('node','N5')})])
@@ -240,6 +240,49 @@ class ProgressTests(unittest.TestCase):
             self.progress.mark_attempted('T1', 2, 'boot-1', payload, self.new)
         self.assertEqual(self.progress.get_order('T1', 2)['state'], 'pending')
         self.assertEqual(set(self.store.list_occupancy()), self.new)
+
+    def test_invalidation_is_serialized_with_progress_transaction(self):
+        from server.recovery import RecoveryGate, RecoveryError
+        from server.segment_progress import SegmentProgress
+        gate = RecoveryGate(self.store.path); gate.initialize()
+        progress = SegmentProgress(self.store, self.map, simulation_enabled=True, recovery_gate=gate)
+        progress.initialize()
+        challenge = gate.begin('T1', 'boot-1')
+        order = json.loads(self.store.get_order('T1')['payload'])
+        digest = hashlib.sha256(json.dumps(order, sort_keys=True, ensure_ascii=True,
+            allow_nan=False, separators=(',', ':')).encode('ascii')).hexdigest()
+        gate.complete('T1', 'boot-1', challenge, robot_id='sim-r1', order_id='T1',
+                      seq=1, map_id='layout@v4', stopped_at='N3',
+                      order_digest=digest, stopped=True)
+        checked, proceed, invalidated = threading.Event(), threading.Event(), threading.Event()
+        errors, results = [], []
+        original = progress._authorize
+        def pause_after_check(*args):
+            original(*args)
+            checked.set()
+            if not proceed.wait(5):
+                raise TimeoutError('test did not release transaction')
+        progress._authorize = pause_after_check
+        def advance():
+            try: results.append(progress.advance('sim-r1', self.event))
+            except Exception as error: errors.append(error)
+        def invalidate():
+            try: gate.invalidate('T1'); invalidated.set()
+            except Exception as error: errors.append(error)
+        first = threading.Thread(target=advance); second = threading.Thread(target=invalidate)
+        first.start()
+        self.assertTrue(checked.wait(5))
+        second.start()
+        self.assertFalse(invalidated.wait(.1))
+        proceed.set()
+        first.join(5); second.join(5)
+        self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0]['status'], 'advanced')
+        self.assertTrue(invalidated.is_set())
+        with self.assertRaises(RecoveryError):
+            progress.mark_attempted('T1', 2, 'boot-1', results[0]['payload'], self.new)
+        self.assertEqual(progress.get_order('T1', 2)['state'], 'pending')
 
 
 if __name__ == '__main__':
