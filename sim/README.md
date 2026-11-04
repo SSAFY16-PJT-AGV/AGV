@@ -65,3 +65,57 @@ DB는 로봇 ID와 맵 버전에 고정된다. 로봇·맵 불일치, 기존 주
 ```powershell
 .\.venv\Scripts\python -m unittest discover -s sim/tests -v
 ```
+
+## 가상 후단 이탈 이벤트 수신
+
+`sim.event_receiver.SimEventReceiver`는 호출자가 제공한 **별도 격리 브로커의
+전용 Paho 클라이언트**에 이벤트 콜백을 연결한다. 기본값은 비활성화이며
+`simulation_enabled=True`와 로봇 ID별 활성 작업 ID의 명시적 매핑이 필요하다.
+`SegmentProgress`와 동일한 `RecoveryGate` 및 같은 DB와 로봇 작업 매핑의
+`SimEventInbox`를 전달한다. 어댑터는 클라이언트를 연결하거나 재연결하거나
+주문을 발행하지 않는다. Paho 자동 재연결은 반드시 꺼야 하며 MQTT 3.1.1
+전용 클라이언트는 고정 client ID와 `clean_session=False`를 사용해야 한다.
+호출자가 클라이언트 연결 및 네트워크 루프를 관리한다.
+
+```python
+receiver = SimEventReceiver(
+    dedicated_client, progress, inbox=event_inbox, recovery_gate=gate,
+    robot_tasks={"sim-r1": ("task-1",)}, simulation_enabled=True,
+    on_result=handle_result, on_error=handle_error,
+)
+```
+
+`agv/+/event`와 `agv/+/conn`을 각각 QoS 1로 구독한다. 실제 이벤트의
+수신 QoS가 1이고 retained 전달이 아니며, 토픽의 가상 로봇 ID와 메시지의
+작업 ID가 명시된 매핑에 속할 때만 `SegmentProgress.advance`에 전달한다.
+UTF-8, JSON 객체, 중복 키·비정상 숫자와 크기를 검사한다. `offline` 연결
+보고는 QoS 0 또는 1과 retained 여부에 관계없이 해당 로봇의 복구 proof를
+무효화하고, `online`은 proof를 생성하지 않는다. 알 수 없는 연결 값도 해당
+로봇의 proof를 무효화한다. 브로커 연결이 끊기거나 구독이 실패하면 모든
+매핑 작업의 proof를 무효화하고 수신기를 닫는다. 영속 세션 재접속 시 구독
+확인 전 도착하는 이벤트는 검증 후 저장하고 ACK는 구독 확인까지 보류한다.
+이 이벤트는 자동 실행하지 않으며 명시적 retry가 필요하다. 구독 확인 전
+`offline`은 즉시 proof를 무효화한다. 보류 ACK는 최대 64개이며, 초과·검증
+오류·저장 오류에서는 ACK 없이 닫고 전체 proof를 무효화한다. 새로운 작업 매핑이나
+재연결에는 새 전용 클라이언트와 명시적 재동기화가 필요하다.
+
+이벤트는 검증 후 먼저 inbox에 저장하고 저장이 완료된 다음 MQTT 수동 ACK를
+보낸다. 이어서 한 번 처리를 시도하며, 복구 미완료나 충돌 등으로 실패하면
+이벤트는 pending으로 남고 `on_error`와 `last_error`에 오류가 전달된다.
+호출자는 원인을 확인하고 복구한 후
+`event_inbox.retry("sim-r1", event_id, progress)`를 명시적으로 실행한다.
+이벤트 ACK는 영속 저장 확인이지 구간 진행 완료의 확인이 아니다. 저장이나
+ACK가 실패하면 전체 proof를 무효화하고 수신기를 닫는다. QoS 1 offline 보고는
+proof 무효화가 성공한 뒤 ACK한다. 이 수신기는 FastAPI에 자동 연결되지 않고
+다음 주문을 자동 발행하지 않는다.
+
+브로커가 유지하는 세션이 살아 있어야 미확인 메시지를 재전달받을 수 있다.
+브로커 재시작 시 세션 영속성과 만료는 브로커 설정에 달려 있으며 보장하지
+않는다. 송신 측 응용 프로그램의 재전송·수신 확인 규약은 팀 협의가 필요하다.
+콜백은 짧아야 하며 명시적 재시도가 자동으로 실행되지는 않는다.
+
+MQTT 3.1.1에서는 발행자가 retain을 설정했더라도 기존 구독자에게 전달되는
+메시지에서 retain 표시가 제거될 수 있다. 따라서 `message.retain=False`는
+발행자가 non-retained로 보냈다는 증거가 아니며, 발행자 규약과 격리 브로커가
+별도로 필요하다. 이 이벤트·온라인 보고·불리언은 로봇의 실제 위치, 후단 이탈,
+정지 또는 메시지 출처를 인증하지 않는다. **실물 운행에 사용하지 않는다.**
