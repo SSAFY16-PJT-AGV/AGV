@@ -18,7 +18,7 @@ def map_data():
             {'from': 'N3', 'to': 'N4', 'shape': [[20, 0], [30, 0]], 'bidirectional': True, 'lanes': 1},
         ],
         'zones': [
-            {'id': 'cross', 'type': 'shared', 'nodes': ['N2', 'N3']},
+            {'id': 'cross', 'type': 'shared', 'nodes': ['N2']},
             {'id': 'wait3', 'type': 'waiting', 'node': 'N3'},
             {'id': 'wait4', 'type': 'waiting', 'node': 'N4'},
         ],
@@ -55,6 +55,12 @@ class SegmentTest(unittest.TestCase):
     def test_destination_must_be_a_waiting_node_if_no_earlier_waiting_node(self):
         with self.assertRaises(ValueError):
             self.segment.plan_segment(map_data(), ['N1', 'N2'])
+
+    def test_waiting_node_inside_shared_zone_is_rejected(self):
+        data = map_data()
+        data['zones'][0]['nodes'].append('N3')
+        with self.assertRaises(ValueError):
+            self.segment.plan_segment(data, ['N1', 'N2', 'N3', 'N4'])
 
     def test_invalid_edges_directions_and_paths_are_rejected(self):
         data = map_data()

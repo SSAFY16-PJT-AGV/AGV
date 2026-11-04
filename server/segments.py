@@ -72,6 +72,9 @@ def plan_segment(map_data, nodes):
         else:
             raise ValueError('unrecognized zone type')
 
+    if any(waiting.intersection(members) for _, members in shared):
+        raise ValueError('waiting nodes must not belong to a shared zone')
+
     end = next((i for i in range(1, len(nodes)) if nodes[i] in waiting), None)
     if end is None:
         raise ValueError('no waiting node exists on the route after the start')
