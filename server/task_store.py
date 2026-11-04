@@ -81,6 +81,15 @@ class SqliteTaskStore:
             current = row[0]
             if current != expected:
                 raise StateConflictError("task state no longer matches expected state")
+            has_outbox = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='allocation_outbox'"
+            ).fetchone()
+            if has_outbox:
+                outbox = connection.execute(
+                    "SELECT state FROM allocation_outbox WHERE task_id=?", (task_id,)
+                ).fetchone()
+                if outbox is not None and outbox[0] in ('uncertain', 'acked'):
+                    raise StateConflictError("task with attempted order cannot transition before reconciliation")
             if current not in _NEXT or (target != _NEXT[current] and target not in _EXCEPTIONS):
                 raise InvalidTransitionError("transition is not allowed")
             connection.execute(

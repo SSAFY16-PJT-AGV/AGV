@@ -9,6 +9,7 @@ import copy
 import json
 import math
 import os
+import re
 import sqlite3
 
 
@@ -18,6 +19,12 @@ class AllocationConflict(ValueError):
 
 class InvalidAllocation(ValueError):
     """Data is invalid or too ambiguous for an allocation."""
+
+
+def _fingerprint(value):
+    if not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None:
+        raise InvalidAllocation('map_fingerprint must be a lowercase SHA-256 hex string')
+    return value
 
 
 def _id(value, name, topic_component=False):
@@ -159,9 +166,15 @@ class AllocationStore:
             if len(maps) > 1:
                 raise AllocationConflict('existing allocations use multiple maps; manual reconciliation required')
             active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
-            if active is None and maps:
-                db.execute('INSERT INTO allocation_meta(key, value) VALUES (?, ?)', ('active_map', maps[0]))
-            elif active is not None and maps and active[0] != maps[0]:
+            fingerprint = db.execute("SELECT value FROM allocation_meta WHERE key='map_fingerprint'").fetchone()
+            if (maps and (active is None or fingerprint is None)) or ((active is None) != (fingerprint is None)):
+                raise AllocationConflict('map fingerprint missing; manual reconciliation required')
+            if fingerprint is not None:
+                try:
+                    _fingerprint(fingerprint[0])
+                except InvalidAllocation as exc:
+                    raise AllocationConflict('invalid saved map fingerprint') from exc
+            if active is not None and maps and active[0] != maps[0]:
                 raise AllocationConflict('active map differs from existing allocation; manual reconciliation required')
 
     def create_task(self, task_id):
@@ -172,7 +185,8 @@ class AllocationStore:
         except sqlite3.IntegrityError as exc:
             raise AllocationConflict('task already exists') from exc
 
-    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end):
+    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint):
+        _fingerprint(map_fingerprint)
         try:
             nodes_copy, resources_copy, action_copy = copy.deepcopy((nodes, resources, action_at_end))
         except (RecursionError, TypeError, ValueError) as exc:
@@ -185,10 +199,14 @@ class AllocationStore:
                 if row is None or row[0] != 'PENDING':
                     raise AllocationConflict('task is missing or not pending')
                 active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
-                if active is None:
+                fingerprint = db.execute("SELECT value FROM allocation_meta WHERE key='map_fingerprint'").fetchone()
+                has_jobs = db.execute('SELECT 1 FROM allocation_jobs LIMIT 1').fetchone() is not None
+                if active is None and fingerprint is None and not has_jobs:
                     db.execute('INSERT INTO allocation_meta(key, value) VALUES (?, ?)', ('active_map', map_id))
-                elif active[0] != map_id:
-                    raise AllocationConflict('map differs from the persistent active map')
+                    db.execute('INSERT INTO allocation_meta(key, value) VALUES (?, ?)', ('map_fingerprint', map_fingerprint))
+                elif (active is None or fingerprint is None or active[0] != map_id
+                      or fingerprint[0] != map_fingerprint):
+                    raise AllocationConflict('map or fingerprint differs from the persistent active map')
                 db.execute('INSERT INTO allocation_jobs VALUES (?, ?, ?, ?, ?)',
                            (task_id, robot_id, map_id, nodes_json, released_until))
                 db.executemany('INSERT INTO allocation_occupancy VALUES (?, ?, ?)',
@@ -202,12 +220,14 @@ class AllocationStore:
     def get_allocation(self, task_id):
         _id(task_id, 'task_id')
         with closing(self._connect()) as db:
-            row = db.execute('SELECT robot_id, map_id, nodes_json, released_until FROM allocation_jobs WHERE task_id=?',
+            row = db.execute("SELECT robot_id, map_id, nodes_json, released_until, "
+                             "(SELECT value FROM allocation_meta WHERE key='map_fingerprint') "
+                             'FROM allocation_jobs WHERE task_id=?',
                              (task_id,)).fetchone()
         if row is None:
             return None
         return {'task_id': task_id, 'robot_id': row[0], 'map_id': row[1],
-                'nodes': json.loads(row[2]), 'released_until': row[3]}
+                'nodes': json.loads(row[2]), 'released_until': row[3], 'map_fingerprint': row[4]}
 
     def list_occupancy(self):
         with closing(self._connect()) as db:
@@ -229,8 +249,55 @@ class AllocationStore:
             if result.rowcount != 1:
                 raise AllocationConflict('outbox state does not match')
 
-    def mark_attempted(self, task_id):
-        self._mark(task_id, 'pending', 'uncertain')
+    def mark_attempted(self, task_id, expected_payload, expected_allocation, expected_resources):
+        """Atomically verify the intended order and occupancy before marking uncertain."""
+        _id(task_id, 'task_id')
+        try:
+            allocation = copy.deepcopy(expected_allocation)
+            expected = set(copy.deepcopy(expected_resources))
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise AllocationConflict('invalid expected allocation or resources') from exc
+        if not isinstance(expected_payload, str) or not isinstance(allocation, dict):
+            raise AllocationConflict('invalid expected allocation or payload')
+        with self._write() as db:
+            row = db.execute(
+                'SELECT t.status,j.robot_id,j.map_id,j.nodes_json,j.released_until,o.payload,o.state '
+                'FROM tasks t JOIN allocation_jobs j ON j.task_id=t.task_id '
+                'JOIN allocation_outbox o ON o.task_id=t.task_id WHERE t.task_id=?', (task_id,)
+            ).fetchone()
+            if row is None or row[0] != 'ASSIGNED' or row[6] != 'pending' or row[5] != expected_payload:
+                raise AllocationConflict('task or order changed before publication')
+            try:
+                nodes = json.loads(row[3])
+                order = json.loads(row[5])
+                actual_allocation = {'task_id': task_id, 'robot_id': row[1], 'map_id': row[2],
+                                     'nodes': nodes, 'released_until': row[4],
+                                     'map_fingerprint': (db.execute("SELECT value FROM allocation_meta WHERE key='map_fingerprint'").fetchone() or (None,))[0]}
+                if (not isinstance(order, dict) or set(order) != {'order_id', 'seq', 'map_id',
+                        'nodes', 'released_until', 'action_at_end'} or order['order_id'] != task_id
+                        or type(order['seq']) is not int or order['seq'] != 1
+                        or order['map_id'] != row[2] or order['nodes'] != nodes
+                        or order['released_until'] != row[4]):
+                    raise AllocationConflict('order and allocation disagree')
+                actual_resources = set(db.execute(
+                    'SELECT kind,resource_id FROM allocation_occupancy WHERE task_id=?', (task_id,)
+                ).fetchall())
+                if actual_allocation != allocation or actual_resources != expected:
+                    raise AllocationConflict('allocation or resource occupancy changed')
+                _, canonical_payload = _input(task_id, row[1], row[2], nodes, row[4],
+                                              actual_resources, order['action_at_end'])
+                active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
+                _fingerprint(actual_allocation['map_fingerprint'])
+                if active is None or active[0] != row[2] or canonical_payload != row[5]:
+                    raise AllocationConflict('order or active map is inconsistent')
+            except (ValueError, TypeError, RecursionError, KeyError) as exc:
+                if isinstance(exc, AllocationConflict):
+                    raise
+                raise AllocationConflict('invalid persisted order or allocation') from exc
+            updated = db.execute("UPDATE allocation_outbox SET state='uncertain' "
+                                 "WHERE task_id=? AND state='pending'", (task_id,))
+            if updated.rowcount != 1:
+                raise AllocationConflict('outbox state changed before publication')
 
     def mark_broker_acked(self, task_id):
         self._mark(task_id, 'uncertain', 'acked')
