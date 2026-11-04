@@ -151,10 +151,12 @@ class SegmentProgress:
         for index, (seq, payload, state) in enumerate(rows, start=1):
             if seq != index or state not in ('pending', 'uncertain', 'acked'):
                 raise AllocationConflict('order history is invalid')
-            if index < len(rows) and state != 'acked':
-                verified_event = db.execute('SELECT 1 FROM progress_events WHERE task_id=? AND seq=?',
-                                            (task_id, seq)).fetchone()
-                if state != 'uncertain' or verified_event is None:
+            if index < len(rows):
+                verified_event = db.execute(
+                    "SELECT 1 FROM progress_events WHERE task_id=? AND robot_id=? AND seq=? "
+                    "AND next_seq=? AND result='advanced'", (task_id, robot_id, seq, seq + 1)
+                ).fetchone()
+                if state not in ('uncertain', 'acked') or verified_event is None:
                     raise AllocationConflict('previous order has no verified progression event')
             order = _read_order(payload)
             validate_order(robot_id, order)
