@@ -52,20 +52,26 @@ python -m venv .venv
   첫 이동 구간의 배정·예약·주문을 연결한다. **기본 비활성화된 격리
   시뮬레이션 전용**이며, FastAPI나 MQTT 상태 수신기에 자동 연결되지 않는다.
   실행 조건과 제한은 [통합 안내](docs/coordinator.md)를 먼저 읽는다.
+- `recovery.py`, `segment_progress.py`, `progress_publisher.py`: 가상 로봇의
+  재동기화, 후단 이탈 후 다음 구간 예약 및 후속 주문을 처리한다. 새 이벤트와
+  복구 메시지는 [팀 협의용 제안](docs/segment_recovery_proposal.md)이며,
+  실제 로봇 통신 규격으로 확정되지 않았다.
 - `mqtt_log.py`: 기록 및 격리 재생 구성요소. [기록·재생 안내](docs/mqtt_logging.md)를
   먼저 읽는다. 재생은 설계의 원본 토픽 대신 `replay/` 접두사를 사용한다.
 - `mqtt_capture.py`: 별도로 실행하는 MQTT 기록 수집기.
   [수집기 안내](docs/mqtt_capture.md)를 먼저 읽는다.
 
-현재 첫 구간의 배정·예약·발행은 격리 시뮬레이션에서만 연결되어 있다.
-실제 로봇 운행을 위한 다음 구간 해제, 점유 재동기화, 통신 장애 대응,
-주문 중복 처리와 물리적 정지는 팀 간 프로토콜 합의와 실물 검증이 필요하다.
+구간 진행과 재동기화도 격리 시뮬레이션에서만 연결되어 있다. 실제 로봇
+운행을 위한 후단 이탈 증명, 이벤트 인증, 점유 재동기화, 주문 중복 처리와
+물리적 정지는 팀 간 프로토콜 합의와 실물 검증이 필요하다. 기존 FastAPI
+서버를 실행해도 시뮬레이션 workflow가 자동으로 시작되지는 않는다.
 
 ## 테스트
 
 ```powershell
 .\.venv\Scripts\python -m unittest discover -s server/tests -v
 .\.venv\Scripts\python -m unittest discover -s server/demo -v
+.\.venv\Scripts\python -m unittest discover -s sim/tests -v
 ```
 
 단위 테스트는 실제 로봇과 모터를 사용하지 않는다.
