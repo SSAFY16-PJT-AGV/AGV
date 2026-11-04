@@ -29,8 +29,11 @@
   일치하며 맵·경로·해제 구간도 상호 일치할 때만 `uncertain`으로 변경한다.
   기대 자원은 해당 작업의 전체 `(kind, id)` 집합이다. 어느 항목이라도 다르거나
   이미 취소되었다면 전이를 거절하며 보존된 점유를 자동 해제하지 않는다.
-- `mark_broker_acked(task_id)`: 발행자가 브로커 확인을 검증한 이후에만
-  `uncertain`을 `acked`로 변경해야 한다. 브로커 확인은 로봇 실행 증거가 아니다.
+- `mark_broker_acked(task_id, expected_payload, expected_allocation, expected_resources)`:
+  발행자가 브로커 확인을 검증한 이후에만 호출한다. `uncertain` 상태에서
+  같은 트랜잭션으로 작업·주문·맵·fingerprint·배정·전체 점유를 다시 검증하고
+  모두 동일할 때만 `acked`로 변경한다. 불일치면 `uncertain`을 유지한다.
+  브로커 확인은 로봇 실행 증거가 아니다.
 
 같은 로봇이나 자원을 배정받은 다른 작업이 있으면 `AllocationConflict`가
 발생한다. 생성한 파일을 다시 열면 배정·점유와 outbox 상태가 유지된다.

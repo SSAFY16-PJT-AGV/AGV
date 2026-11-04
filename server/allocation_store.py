@@ -241,16 +241,9 @@ class AllocationStore:
             row = db.execute('SELECT payload, state FROM allocation_outbox WHERE task_id=?', (task_id,)).fetchone()
         return None if row is None else {'payload': row[0], 'state': row[1]}
 
-    def _mark(self, task_id, expected, target):
-        _id(task_id, 'task_id')
-        with self._write() as db:
-            result = db.execute('UPDATE allocation_outbox SET state=? WHERE task_id=? AND state=?',
-                                (target, task_id, expected))
-            if result.rowcount != 1:
-                raise AllocationConflict('outbox state does not match')
-
-    def mark_attempted(self, task_id, expected_payload, expected_allocation, expected_resources):
-        """Atomically verify the intended order and occupancy before marking uncertain."""
+    def _transition_verified(self, task_id, expected_payload, expected_allocation,
+                             expected_resources, expected_state, target_state):
+        """Verify the intended order and occupancy within the same write transaction."""
         _id(task_id, 'task_id')
         try:
             allocation = copy.deepcopy(expected_allocation)
@@ -265,8 +258,8 @@ class AllocationStore:
                 'FROM tasks t JOIN allocation_jobs j ON j.task_id=t.task_id '
                 'JOIN allocation_outbox o ON o.task_id=t.task_id WHERE t.task_id=?', (task_id,)
             ).fetchone()
-            if row is None or row[0] != 'ASSIGNED' or row[6] != 'pending' or row[5] != expected_payload:
-                raise AllocationConflict('task or order changed before publication')
+            if row is None or row[0] != 'ASSIGNED' or row[6] != expected_state or row[5] != expected_payload:
+                raise AllocationConflict('task or order changed before transition')
             try:
                 nodes = json.loads(row[3])
                 order = json.loads(row[5])
@@ -294,10 +287,17 @@ class AllocationStore:
                 if isinstance(exc, AllocationConflict):
                     raise
                 raise AllocationConflict('invalid persisted order or allocation') from exc
-            updated = db.execute("UPDATE allocation_outbox SET state='uncertain' "
-                                 "WHERE task_id=? AND state='pending'", (task_id,))
+            updated = db.execute('UPDATE allocation_outbox SET state=? WHERE task_id=? AND state=?',
+                                 (target_state, task_id, expected_state))
             if updated.rowcount != 1:
-                raise AllocationConflict('outbox state changed before publication')
+                raise AllocationConflict('outbox state changed before transition')
 
-    def mark_broker_acked(self, task_id):
-        self._mark(task_id, 'uncertain', 'acked')
+    def mark_attempted(self, task_id, expected_payload, expected_allocation, expected_resources):
+        """Atomically verify intended order and occupancy before marking uncertain."""
+        self._transition_verified(task_id, expected_payload, expected_allocation,
+                                  expected_resources, 'pending', 'uncertain')
+
+    def mark_broker_acked(self, task_id, expected_payload, expected_allocation, expected_resources):
+        """Atomically reverify the same order and occupancy before recording PUBACK."""
+        self._transition_verified(task_id, expected_payload, expected_allocation,
+                                  expected_resources, 'uncertain', 'acked')

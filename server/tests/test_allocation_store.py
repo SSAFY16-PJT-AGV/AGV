@@ -58,7 +58,7 @@ class AllocationStoreTests(unittest.TestCase):
             'released_until': 'N2', 'action_at_end': {'type': 'unload', 'shelf': 'S1'}})
         reopened.mark_attempted('T1', *self.expected())
         self.assertEqual(AllocationStore(self.path).get_order('T1')['state'], 'uncertain')
-        reopened.mark_broker_acked('T1')
+        reopened.mark_broker_acked('T1', *self.expected())
         self.assertEqual(AllocationStore(self.path).get_order('T1')['state'], 'acked')
 
     def test_existing_task_store_sees_atomic_assignment_and_rollback(self):
@@ -172,7 +172,7 @@ class AllocationStoreTests(unittest.TestCase):
 
     def test_outbox_state_cannot_skip_or_repeat(self):
         self.store.create_task('T1'); self.store.allocate(*self.args())
-        with self.assertRaises(AllocationConflict): self.store.mark_broker_acked('T1')
+        with self.assertRaises(AllocationConflict): self.store.mark_broker_acked('T1', *self.expected())
         expected = self.expected()
         self.store.mark_attempted('T1', *expected)
         with self.assertRaises(AllocationConflict): self.store.mark_attempted('T1', *expected)
@@ -208,7 +208,7 @@ class AllocationStoreTests(unittest.TestCase):
         tasks = SqliteTaskStore(self.path)
         with self.assertRaises(StateConflictError):
             tasks.transition('T1', 'ASSIGNED', 'CANCELLED')
-        self.store.mark_broker_acked('T1')
+        self.store.mark_broker_acked('T1', *self.expected())
         with self.assertRaises(StateConflictError):
             tasks.transition('T1', 'ASSIGNED', 'PICKING')
         self.assertEqual(tasks.get('T1').status, 'ASSIGNED')
@@ -239,6 +239,36 @@ class AllocationStoreTests(unittest.TestCase):
         outbox = self.store.get_order('T1')['state']
         self.assertIn((status, outbox), [('CANCELLED', 'pending'), ('ASSIGNED', 'uncertain')])
         self.assertTrue(self.store.list_occupancy())
+
+    def test_ack_rejects_mutated_order_or_missing_occupancy(self):
+        for kind in ('payload', 'resource', 'fingerprint', 'status', 'allocation'):
+            with self.subTest(kind=kind):
+                task = 'task-' + kind
+                nodes = ['a-' + kind, 'b-' + kind]
+                resources = self.segment(*nodes)
+                self.store.create_task(task)
+                self.store.allocate(*self.args(task, 'robot-' + kind, resources, nodes))
+                expected = self.expected(task)
+                self.store.mark_attempted(task, *expected)
+                with closing(sqlite3.connect(self.path)) as db:
+                    if kind == 'payload':
+                        db.execute('UPDATE allocation_outbox SET payload=? WHERE task_id=?', ('{}', task))
+                    elif kind == 'resource':
+                        db.execute('DELETE FROM allocation_occupancy WHERE task_id=? AND kind=?', (task, 'edge'))
+                    elif kind == 'fingerprint':
+                        db.execute("UPDATE allocation_meta SET value=? WHERE key='map_fingerprint'", ('b' * 64,))
+                    elif kind == 'status':
+                        db.execute("UPDATE tasks SET status='CANCELLED' WHERE task_id=?", (task,))
+                    else:
+                        db.execute("UPDATE allocation_jobs SET released_until=? WHERE task_id=?", (nodes[0], task))
+                    db.commit()
+                with self.assertRaises(AllocationConflict):
+                    self.store.mark_broker_acked(task, *expected)
+                self.assertEqual(self.store.get_order(task)['state'], 'uncertain')
+                if kind == 'fingerprint':
+                    with closing(sqlite3.connect(self.path)) as db:
+                        db.execute("UPDATE allocation_meta SET value=? WHERE key='map_fingerprint'", ('a' * 64,))
+                        db.commit()
 
     def test_legacy_task_store_without_outbox_table_still_transitions(self):
         path = str(Path(self.tmp.name) / 'legacy.sqlite3')
