@@ -38,6 +38,12 @@ class OrderPublisherTests(unittest.TestCase):
                              "server.order_publisher must exist")
         self.module = importlib.import_module("server.order_publisher")
 
+    def claimed(self, client):
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        owner = object()
+        publisher.claim(owner)
+        return publisher, owner
+
     def test_disabled_by_default_and_cannot_publish(self):
         client = FakeClient()
         publisher = self.module.OrderPublisher(client)
@@ -47,8 +53,8 @@ class OrderPublisherTests(unittest.TestCase):
 
     def test_enabled_publishes_exact_json_with_qos1_and_no_retain(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
-        info = publisher.publish("sim-robot1", order())
+        publisher, owner = self.claimed(client)
+        info = publisher.publish("sim-robot1", order(), owner=owner)
         self.assertIs(info, client.info)
         self.assertEqual(len(client.calls), 1)
         topic, payload, qos, retain = client.calls[0]
@@ -57,17 +63,18 @@ class OrderPublisherTests(unittest.TestCase):
 
     def test_disabled_or_disconnected_never_calls_publish(self):
         client = FakeClient(connected=False)
-        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher, owner = self.claimed(client)
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(client.calls, [])
 
     def test_invalid_robot_id_never_published(self):
         for value in ("", " ", "robot1", "sim-", "sim-r/1", "sim-+", "sim-r#", "sim-r\x00", "sim-\ud800", "sim-" + "a" * 129):
             with self.subTest(value=value):
                 client = FakeClient()
+                publisher, owner = self.claimed(client)
                 with self.assertRaises(ValueError):
-                    self.module.OrderPublisher(client, enabled=True).publish(value, order())
+                    publisher.publish(value, order(), owner=owner)
                 self.assertEqual(client.calls, [])
 
     def test_invalid_orders_never_published(self):
@@ -87,26 +94,27 @@ class OrderPublisherTests(unittest.TestCase):
         for value in variants:
             with self.subTest(value=value):
                 client = FakeClient()
+                publisher, owner = self.claimed(client)
                 with self.assertRaises(ValueError):
-                    self.module.OrderPublisher(client, enabled=True).publish("sim-robot1", value)
+                    publisher.publish("sim-robot1", value, owner=owner)
                 self.assertEqual(client.calls, [])
 
     def test_rejected_enqueue_is_reported_and_is_not_retried(self):
         client = FakeClient(rc=4)
-        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher, owner = self.claimed(client)
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
 
     def test_one_instance_cannot_send_twice_even_after_success(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
-        publisher.publish("sim-robot1", order())
+        publisher, owner = self.claimed(client)
+        publisher.publish("sim-robot1", order(), owner=owner)
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
 
     def test_client_exception_is_reported_without_retry(self):
@@ -114,8 +122,9 @@ class OrderPublisherTests(unittest.TestCase):
         def fail(*args, **kwargs):
             raise OSError("disconnect")
         client.publish = fail
+        publisher, owner = self.claimed(client)
         with self.assertRaises(self.module.OrderPublishError):
-            self.module.OrderPublisher(client, enabled=True).publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
 
     def test_enabling_requires_an_actual_boolean(self):
         for value in (None, 1, "true"):
@@ -132,50 +141,50 @@ class OrderPublisherTests(unittest.TestCase):
 
     def test_reconnect_setting_changed_after_construction_prevents_publish(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher, owner = self.claimed(client)
         client._reconnect_on_failure = True
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.publish("sim-robot1", order())
+            publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(client.calls, [])
 
     def test_validate_has_no_send_or_one_shot_side_effect(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
-        publisher.validate("sim-robot1", order())
-        publisher.validate("sim-robot1", order())
+        publisher, owner = self.claimed(client)
+        publisher.validate("sim-robot1", order(), owner=owner)
+        publisher.validate("sim-robot1", order(), owner=owner)
         self.assertEqual(client.calls, [])
-        publisher.publish("sim-robot1", order())
+        publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.validate("sim-robot1", order())
+            publisher.validate("sim-robot1", order(), owner=owner)
 
     def test_validate_checks_disabled_invalid_and_disconnected_without_sending(self):
         client = FakeClient()
         with self.assertRaises(self.module.OrderPublishingDisabled):
             self.module.OrderPublisher(client).validate("sim-robot1", order())
-        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher, owner = self.claimed(client)
         with self.assertRaises(ValueError):
-            publisher.validate("robot1", order())
+            publisher.validate("robot1", order(), owner=owner)
         invalid = order(); invalid["released_until"] = "missing"
         with self.assertRaises(ValueError):
-            publisher.validate("sim-robot1", invalid)
+            publisher.validate("sim-robot1", invalid, owner=owner)
         client.connected = False
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.validate("sim-robot1", order())
+            publisher.validate("sim-robot1", order(), owner=owner)
         self.assertEqual(client.calls, [])
 
     def test_validate_checks_reconnect_flag_and_connection_errors(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher, owner = self.claimed(client)
         client._reconnect_on_failure = True
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.validate("sim-robot1", order())
+            publisher.validate("sim-robot1", order(), owner=owner)
         client._reconnect_on_failure = False
         def fail():
             raise OSError("not connected")
         client.is_connected = fail
         with self.assertRaises(self.module.OrderPublishError):
-            publisher.validate("sim-robot1", order())
+            publisher.validate("sim-robot1", order(), owner=owner)
         self.assertEqual(client.calls, [])
 
     def test_validate_order_is_pure_schema_check_without_mqtt_client(self):
@@ -206,6 +215,17 @@ class OrderPublisherTests(unittest.TestCase):
         with self.assertRaises(self.module.OrderPublishError):
             publisher.release_claim(owner)
 
+    def test_unclaimed_publisher_cannot_validate_or_publish(self):
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        for owner in (None, object()):
+            with self.subTest(owner=owner):
+                with self.assertRaises(self.module.OrderPublishError):
+                    publisher.validate("sim-robot1", order(), owner=owner)
+                with self.assertRaises(self.module.OrderPublishError):
+                    publisher.publish("sim-robot1", order(), owner=owner)
+        self.assertEqual(client.calls, [])
+
     def test_claim_and_release_require_same_owner_identity(self):
         class EqualObjects:
             def __eq__(self, other):
@@ -219,7 +239,11 @@ class OrderPublisherTests(unittest.TestCase):
         with self.assertRaises(self.module.OrderPublishError):
             publisher.release_claim(same_value)
         publisher.release_claim(owner)
-        publisher.publish("sim-robot1", order())
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.publish("sim-robot1", order())
+        new_owner = object()
+        publisher.claim(new_owner)
+        publisher.publish("sim-robot1", order(), owner=new_owner)
         self.assertEqual(len(client.calls), 1)
 
     def test_claim_cannot_be_released_after_an_uncertain_attempt(self):
@@ -268,8 +292,8 @@ class OrderPublisherTests(unittest.TestCase):
 
     def test_same_client_cannot_be_wrapped_again_after_first_attempt(self):
         client = FakeClient()
-        publisher = self.module.OrderPublisher(client, enabled=True)
-        publisher.publish("sim-robot1", order())
+        publisher, owner = self.claimed(client)
+        publisher.publish("sim-robot1", order(), owner=owner)
         with self.assertRaises(ValueError):
             self.module.OrderPublisher(client, enabled=True)
         self.assertEqual(len(client.calls), 1)
@@ -297,7 +321,9 @@ class OrderPublisherTests(unittest.TestCase):
         for thread in threads: thread.start()
         for thread in threads: thread.join()
         self.assertEqual((len(successes), len(failures)), (1, 1))
-        successes[0].publish("sim-robot1", order())
+        owner = object()
+        successes[0].claim(owner)
+        successes[0].publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
 
     def test_client_tracking_uses_identity_not_equality_and_does_not_keep_client_alive(self):
@@ -314,13 +340,15 @@ class OrderPublisherTests(unittest.TestCase):
         gc.collect()
         self.assertIsNone(ref())
         self.assertNotIn(first_id, self.module._registered_clients)
-        two.publish("sim-robot1", order())
+        owner = object()
+        two.claim(owner)
+        two.publish("sim-robot1", order(), owner=owner)
 
     def test_disabled_wrapper_does_not_claim_client(self):
         client = FakeClient()
         self.module.OrderPublisher(client)
-        publisher = self.module.OrderPublisher(client, enabled=True)
-        publisher.publish("sim-robot1", order())
+        publisher, owner = self.claimed(client)
+        publisher.publish("sim-robot1", order(), owner=owner)
         self.assertEqual(len(client.calls), 1)
 
     def test_untrackable_client_cannot_be_enabled(self):

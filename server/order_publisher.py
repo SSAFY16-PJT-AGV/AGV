@@ -173,7 +173,7 @@ class OrderPublisher:
             self._claim_owner = None
 
     def _check_owner(self, owner):
-        if self._claim_owner is not owner:
+        if owner is None or self._claim_owner is None or self._claim_owner is not owner:
             raise OrderPublishError("publisher claim belongs to another operation")
 
     def _check_transport(self):

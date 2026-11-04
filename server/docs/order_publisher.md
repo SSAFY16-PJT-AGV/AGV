@@ -17,16 +17,16 @@ payload 크기와 중첩 깊이, 로봇 ID 길이에도 임시 상한이 있으�
 `validate_order(robot_id, order)`는 브로커에 접근하거나 발행하지 않고 대상과
 주문 JSON 구조만 검사하며, 오류가 있으면 `ValueError`를 발생시킨다. 예약과
 작업 상태를 영속 확정하기 전 불량 입력을 걸러내는 용도다.
-`publisher.validate(robot_id, order)`는 여기에 비활성화 여부, 전송 객체의
+`publisher.validate(robot_id, order, owner=owner)`는 여기에 비활성화 여부, 전송 객체의
 사용 여부, 자동 재연결 설정과 현재 연결 여부까지 검사한다. 어떤 검사도 메시지를
 보내거나 객체의 1회 사용 기회를 소비하지 않는다. 이 확인 직후 연결이 변할 수
 있으므로, 확인 성공이 나중의 발행 성공을 보장하지 않는다.
 
 한 발행 객체를 두 coordinator가 동시에 준비에 사용하지 않도록,
-`claim(owner)`로 해당 객체를 먼저 선점할 수 있다. `owner`는 `None`이 아닌
+`claim(owner)`로 해당 객체를 먼저 선점해야 한다. `owner`는 `None`이 아닌
 고유 객체이며 같은 객체인지(`is`)로 확인한다. 선점된 동안에는 같은 owner를
 `validate(..., owner=owner)`와 `publish(..., owner=owner)`에 명시해야 하며,
-다른 owner와 owner 없는 직접 호출은 거부된다. `release_claim(owner)`는
+다른 owner와 선점하지 않은 직접 호출은 거부된다. `release_claim(owner)`는
 발행을 시도하기 전이고 해당 배정·예약이 DB에 남지 않았음을 호출자가 확실히
 확인한 경우에만 호출해야 한다. 발행 시도 뒤에는 해제할 수 없다. DB 확인이
 실패하거나 결과가 불확실하면 선점을 유지하고 객체를 폐기해야 한다.
@@ -35,8 +35,9 @@ payload 크기와 중첩 깊이, 로봇 ID 길이에도 임시 상한이 있으�
 사라져도 클라이언트가 살아 있는 동안 재생성을 거부한다. 클라이언트가 참조
 해제되면 레지스트리도 정리되며, 약한 참조를 지원하지 않는 클라이언트는
 거부한다. 비활성 publisher는 클라이언트를 선점하지 않는다. 이 보호는 한
-Python 프로세스에 한정되며, 별도 프로세스나 다른 클라이언트 또는 주입된
-Paho 클라이언트를 다른 코드가 직접 사용하는 경우는 차단하지 못한다.
+Python 프로세스에 한정되며, 임의 코드에서 직접 `claim()`을 호출하거나 별도
+프로세스나 다른 클라이언트 또는 주입된 Paho 클라이언트를 다른 코드가 직접
+사용하는 경우는 차단하지 못한다.
 
 ```python
 from server.order_publisher import OrderPublisher
@@ -44,9 +45,11 @@ from server.order_publisher import OrderPublisher
 # client는 격리된 브로커에 이미 연결한 전용 Paho 클라이언트다.
 # 생성 시 reconnect_on_failure=False를 지정해야 한다.
 publisher = OrderPublisher(client, enabled=True)
-publisher.validate("sim-robot1", order)
+owner = object()
+publisher.claim(owner)
+publisher.validate("sim-robot1", order, owner=owner)
 # 호출자는 이후 발행 시도를 영속 저장한 다음 발행해야 한다.
-info = publisher.publish("sim-robot1", order)
+info = publisher.publish("sim-robot1", order, owner=owner)
 ```
 
 `publish()`가 반환하는 `MQTTMessageInfo`의 성공 결과는 **로컬 큐에 넣은
