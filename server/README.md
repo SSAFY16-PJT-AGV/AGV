@@ -24,7 +24,9 @@ python -m venv .venv
 기존 셸 환경변수는 `.env`보다 우선한다. 최초 브로커 소켓 연결이 실패하면
 서버 시작도 실패한다. FastAPI 시작 완료는 MQTT 구독 완료를 보장하지 않으며,
 구독 준비 여부는 내부 `app.state.mqtt_service.snapshot()`의 `ready`로 확인한다.
-아직 로봇 상태를 제공하는 HTTP API는 없다.
+읽기 전용 `GET /robots` 조회는 팀 협의 전 제안이며 인증이 없으므로 로컬에서만
+사용한다. 응답의 의미와 한계는 [HTTP API 제안](docs/http_api_proposal.md)을
+먼저 읽는다.
 
 ## 구현 상태와 제한
 
