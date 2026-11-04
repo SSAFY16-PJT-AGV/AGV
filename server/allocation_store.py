@@ -71,6 +71,12 @@ def _validate_json(value):
 
 def _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end):
     _id(task_id, 'task_id'); _id(robot_id, 'robot_id', True); _id(map_id, 'map_id')
+    if '@' not in map_id:
+        raise InvalidAllocation('map_id must include a version')
+    map_name, version = map_id.rsplit('@', 1)
+    if (not map_name.strip() or not version.startswith('v') or not version[1:]
+            or not version[1:].isascii() or not version[1:].isdecimal()):
+        raise InvalidAllocation('map_id must use map-name@v<nonnegative integer>')
     if not isinstance(nodes, list) or len(nodes) < 2:
         raise InvalidAllocation('nodes must contain at least a start and next node')
     for node in nodes:

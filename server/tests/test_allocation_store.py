@@ -179,6 +179,16 @@ class AllocationStoreTests(unittest.TestCase):
         self.assertEqual(SqliteTaskStore(self.path).get('T2').status, 'PENDING')
         reopened.allocate(*self.args('T2', 'r2', nodes=['N3', 'N4']))
 
+    def test_unversioned_or_incomplete_map_identity_is_rejected(self):
+        self.store.create_task('T1')
+        for invalid_map in ('layout', 'layout@', '@v1', 'layout@4', 'layout@v', 'layout@v-1', 'layout@v１'):
+            args = list(self.args()); args[2] = invalid_map
+            with self.subTest(map_id=invalid_map):
+                with self.assertRaises(InvalidAllocation):
+                    self.store.allocate(*args)
+        self.assertIsNone(self.store.get_allocation('T1'))
+        self.assertEqual(self.store.list_occupancy(), {})
+
     def test_concurrent_first_allocations_on_different_maps_have_one_winner(self):
         self.store.create_task('T1'); self.store.create_task('T2')
         gate = threading.Barrier(2); results = []
