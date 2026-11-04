@@ -1,0 +1,134 @@
+{
+  "map_id": "integration",
+  "version": 1,
+  "unit": "mm",
+  "nodes": [
+    {
+      "id": "N1",
+      "pos": [
+        10,
+        0
+      ]
+    },
+    {
+      "id": "N2",
+      "pos": [
+        20,
+        0
+      ]
+    },
+    {
+      "id": "N3",
+      "pos": [
+        30,
+        0
+      ]
+    },
+    {
+      "id": "N4",
+      "pos": [
+        40,
+        0
+      ]
+    },
+    {
+      "id": "N5",
+      "pos": [
+        50,
+        0
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "N1",
+      "to": "N2",
+      "shape": [
+        [
+          10,
+          0
+        ],
+        [
+          20,
+          0
+        ]
+      ],
+      "bidirectional": true,
+      "lanes": 1
+    },
+    {
+      "from": "N2",
+      "to": "N3",
+      "shape": [
+        [
+          20,
+          0
+        ],
+        [
+          30,
+          0
+        ]
+      ],
+      "bidirectional": true,
+      "lanes": 1
+    },
+    {
+      "from": "N3",
+      "to": "N4",
+      "shape": [
+        [
+          30,
+          0
+        ],
+        [
+          40,
+          0
+        ]
+      ],
+      "bidirectional": true,
+      "lanes": 1
+    },
+    {
+      "from": "N4",
+      "to": "N5",
+      "shape": [
+        [
+          40,
+          0
+        ],
+        [
+          50,
+          0
+        ]
+      ],
+      "bidirectional": true,
+      "lanes": 1
+    }
+  ],
+  "zones": [
+    {
+      "id": "cross1",
+      "type": "shared",
+      "nodes": [
+        "N2"
+      ]
+    },
+    {
+      "id": "cross2",
+      "type": "shared",
+      "nodes": [
+        "N4"
+      ]
+    },
+    {
+      "id": "wait3",
+      "type": "waiting",
+      "node": "N3"
+    },
+    {
+      "id": "wait5",
+      "type": "waiting",
+      "node": "N5"
+    }
+  ]
+}

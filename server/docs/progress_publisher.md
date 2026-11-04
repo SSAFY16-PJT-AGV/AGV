@@ -2,8 +2,10 @@
 
 `ProgressPublisher`는 `SegmentProgress.advance`가 DB에 준비한 2번째 이후
 `pending` 주문을 별도의 `OrderPublisher`로 명시적으로 한 번 발행한다. 새
-MQTT 토픽이나 주문 필드는 추가하지 않는다. 이 기능은 FastAPI나 MQTT 이벤트
-수신에 자동으로 연결되지 않고 기본 발행자가 없어 비활성화된다.
+MQTT 토픽이나 주문 필드는 추가하지 않는다. 이 객체 자체는 기본 발행자가
+없어 비활성화된다. 명시적으로 활성화한 FastAPI 시뮬레이션 런타임은 새
+이벤트 처리 결과를 워커에 연결하고, 저장된 후속 주문은 별도 HTTP 요청으로
+제출할 수 있다. 자세한 조건은 [FastAPI 제안](sim_http_proposal.md)을 참고한다.
 
 1. 동일 DB의 `RecoveryGate`를 새 프로세스에서 초기화하고, 현재 가상 로봇의
    세션·이전 순번·정지 지점에 대한 일회용 challenge 응답을 검증한다.

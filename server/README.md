@@ -50,7 +50,7 @@ python -m venv .venv
   [저장소 안내](docs/task_store.md)를 먼저 읽는다.
 - `coordinator.py`, `segments.py`, `allocation_store.py`, `order_publisher.py`:
   첫 이동 구간의 배정·예약·주문을 연결한다. **기본 비활성화된 격리
-  시뮬레이션 전용**이며, FastAPI나 MQTT 상태 수신기에 자동 연결되지 않는다.
+  시뮬레이션 전용**이며, 명시적으로 시뮬레이션 설정을 켠 FastAPI에서만 연결된다.
   실행 조건과 제한은 [통합 안내](docs/coordinator.md)를 먼저 읽는다.
 - `recovery.py`, `segment_progress.py`, `progress_publisher.py`: 가상 로봇의
   재동기화, 후단 이탈 후 다음 구간 예약 및 후속 주문을 처리한다. 새 이벤트와
@@ -63,8 +63,59 @@ python -m venv .venv
 
 구간 진행과 재동기화도 격리 시뮬레이션에서만 연결되어 있다. 실제 로봇
 운행을 위한 후단 이탈 증명, 이벤트 인증, 점유 재동기화, 주문 중복 처리와
-물리적 정지는 팀 간 프로토콜 합의와 실물 검증이 필요하다. 기존 FastAPI
-서버를 실행해도 시뮬레이션 workflow가 자동으로 시작되지는 않는다.
+물리적 정지는 팀 간 프로토콜 합의와 실물 검증이 필요하다. 기본 설정으로는
+시뮬레이션 workflow가 시작되지 않는다.
+
+## FastAPI에서 격리 시뮬레이션 켜기
+
+실물과 공유하지 않는 독립 로컬 MQTT 브로커와 가상 로봇을 사용한다.
+루프백 주소나 `sim-` 이름만으로 브로커가 격리되었다는 보장은 없다.
+관측 서비스도 실물 브로커와 분리하려면 `.env`의 `MQTT_HOST`와 `MQTT_PORT`를
+해당 시뮬레이션 브로커로 설정한다. 토큰과 접속 설정은 커밋하지 않는다.
+
+1. `.env`에 `AGV_SIM_CONFIG`로 아래 설정 파일 경로를, `AGV_SIM_API_TOKEN`으로
+   임의로 생성한 32자 이상의 공백 없는 ASCII 토큰을 지정한다. PowerShell에서
+   `python -c "import secrets; print(secrets.token_urlsafe(32))"`로 만들 수 있다.
+2. 저장소 루트에 무시 대상인 `.env.sim.json`을 만들고 예시처럼 설정한다.
+   아래 브로커 포트는 **예시**이며 실제 장비가 사용하지 않는 별도 포트를 쓴다.
+   상대 경로는 이 JSON 파일이 있는 폴더를 기준으로 한다.
+
+```json
+{
+  "database": "sim-test.sqlite3",
+  "map_file": "sim/examples/two-segment-map.json",
+  "robots": {"sim-r1": {"T1": "boot-1"}},
+  "mqtt_port": 18883,
+  "mqtt_client_id": "isolated-sim-server"
+}
+```
+
+3. 브로커를 먼저 실행하고 다음 명령으로 서버를 **단일 프로세스**로 시작한다.
+   관측 서비스의 `MQTT_HOST`, `MQTT_PORT`도 `.env`에 있어야 한다. 여러 worker나
+   reload, 역방향 프록시는 사용하지 않는다. DB별 잠금은 중복 기동을 막기 위한
+   보조 장치이며 네트워크 격리나 장치 인증을 대신하지 않는다.
+
+```powershell
+.\.venv\Scripts\python -m uvicorn server.main:app --host 127.0.0.1 --port 8000 --workers 1 --no-proxy-headers
+```
+
+4. `http://127.0.0.1:8000/docs`에서 **Authorize**를 눌러 토큰 값만 입력한다.
+   `/simulation/status`가 준비 상태를 보여 주고, 작업 생성 → 준비 → 첫 주문
+   발행을 각각 호출할 수 있다. 경로와 요청 값은 [API 제안](docs/sim_http_proposal.md)을
+   참고한다. `ready`는 브로커 구독 준비를 뜻하며 로봇의 위치나 안전 확인이 아니다.
+
+고정 로봇·작업·세션 매핑은 시작 시 설정한다. 로봇 위치와 가용성은 별도로
+확인한 시뮬레이션 값이어야 한다. 첫 주문 후 새로운 challenge와 가상 로봇이
+제공한 상태로 복구 확인을 해야 후단 이탈을 처리한다. 서버 재시작 후 남은
+이벤트는 조회·재처리하며, 재처리로 생성된 후속 주문은 별도로 submit한다.
+`uncertain` 주문과 재시작 전 준비만 된 첫 `pending` 주문은 자동 발행하지 않는다.
+후자는 아직 API에서 안전한 취소·재배정을 제공하지 않으므로 예약을 유지하고
+수동으로 상태를 확인해야 한다. MQTT PUBACK은 실행 완료가 아니다.
+
+수신 세션이 단절되거나 세션이 다르면 기존 복구 확인을 폐기한다. 수신 이벤트는
+SQLite에 먼저 저장되지만, 브로커 재시작 이후까지 MQTT 미전달 메시지가 보존되는지
+여부는 브로커의 영속 세션 설정에 달려 있다. 가상 로봇의 재전송 규칙도 별도로
+확인해야 한다.
 
 ## 테스트
 
