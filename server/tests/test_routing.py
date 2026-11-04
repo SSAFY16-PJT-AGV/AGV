@@ -8,7 +8,12 @@ def example_map():
         "map_id": "layout_A",
         "version": 4,
         "unit": "mm",
-        "nodes": [{"id": name} for name in ("N1", "N2", "N3", "N4")],
+        "nodes": [
+            {"id": "N1", "pos": [0, 0]},
+            {"id": "N2", "pos": [100, 0]},
+            {"id": "N3", "pos": [200, 0]},
+            {"id": "N4", "pos": [300, 0]},
+        ],
         "edges": [
             {"from": "N1", "to": "N2", "shape": [[0, 0], [100, 0]], "bidirectional": True},
             {"from": "N2", "to": "N3", "shape": [[100, 0], [200, 0]], "bidirectional": False},
@@ -48,6 +53,28 @@ class RoutingTests(unittest.TestCase):
             graph.shortest_path("missing", "N1")
         with self.assertRaises(self.routing.UnknownNodeError):
             graph.shortest_path("N1", "missing")
+
+    def test_rejects_missing_or_invalid_node_positions(self):
+        for position in (None, [0], [0, 1, 2], [True, 1], [0, float("nan")], "0,0"):
+            invalid = example_map()
+            invalid["nodes"][0]["pos"] = position
+            with self.subTest(position=position):
+                with self.assertRaises(self.routing.InvalidMapError):
+                    self.routing.MapGraph(invalid)
+
+    def test_rejects_edge_ends_that_do_not_match_node_positions(self):
+        for end, point in ((0, [0.001, 0]), (-1, [99.999, 0])):
+            invalid = example_map()
+            invalid["edges"][0]["shape"][end] = point
+            with self.subTest(end=end):
+                with self.assertRaises(self.routing.InvalidMapError):
+                    self.routing.MapGraph(invalid)
+
+    def test_accepts_integer_and_float_with_equal_coordinates(self):
+        data = example_map()
+        data["edges"][0]["shape"] = [[0.0, 0.0], [100.0, 0.0]]
+        graph = self.routing.MapGraph(data)
+        self.assertEqual(graph.shortest_path("N1", "N2").distance_mm, 100)
 
     def test_rejects_invalid_or_ambiguous_graphs(self):
         variants = []

@@ -2,6 +2,8 @@
 
 This module computes geometry only. It does not grant reservations, command
 robots, validate localization or guarantee that a route is safe to drive.
+Node positions and corresponding polyline endpoints must match exactly;
+the geometry tolerance is zero until the team agrees an error allowance.
 """
 
 from collections import namedtuple
@@ -75,13 +77,20 @@ class MapGraph:
         if not isinstance(nodes, list) or not nodes or not isinstance(edges, list):
             raise InvalidMapError("nodes and edges must be lists and nodes nonempty")
         adjacency = {}
+        positions = {}
         for node in nodes:
             if not isinstance(node, dict):
                 raise InvalidMapError("node must be an object")
             node_id = node.get("id")
             if not isinstance(node_id, str) or not node_id.strip() or node_id in adjacency:
                 raise InvalidMapError("node ids must be unique nonempty strings")
+            position = node.get("pos")
+            if not isinstance(position, list) or len(position) != 2:
+                raise InvalidMapError("node positions must be 2-D coordinates")
+            for coordinate in position:
+                _number(coordinate)
             adjacency[node_id] = {}
+            positions[node_id] = tuple(position)
 
         for edge in edges:
             if not isinstance(edge, dict):
@@ -94,7 +103,10 @@ class MapGraph:
             bidirectional = edge.get("bidirectional")
             if not isinstance(bidirectional, bool):
                 raise InvalidMapError("bidirectional must be a boolean")
-            distance = _length(edge.get("shape"))
+            shape = edge.get("shape")
+            distance = _length(shape)
+            if tuple(shape[0]) != positions[source] or tuple(shape[-1]) != positions[target]:
+                raise InvalidMapError("edge endpoints must exactly match node positions")
             arcs = [(source, target)]
             if bidirectional:
                 arcs.append((target, source))
