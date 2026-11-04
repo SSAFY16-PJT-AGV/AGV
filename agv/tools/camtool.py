@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """현장 보정 도구. 저장소 루트에서 실행한다.
 
-    # 지금 카메라 화면 한 장 + 검출 결과 그림 저장 (카메라 자세·라인 검출 확인)
+    # 지금 카메라 화면 저장. 원본 해상도(full.png) + 주행 해상도(raw.png) + 검출 결과(debug.png)
     python3 -m agv.tools.camtool snap [--camera gst] [--out data/snap]
+
+    # 캘리브레이션용 원본 해상도 연속 촬영(1.5초 간격 25장). 찍히는 동안 체커보드를 옮긴다
+    python3 -m agv.tools.camtool snap --count 25 --out data/calib
 
     # 사진의 사각형 영역 HSV 분포 출력 -> config의 patch.colors / line.v_max 조정에 사용
     python3 -m agv.tools.camtool hsv data/snap/raw.png 120 150 40 30      # x y w h (px)
@@ -24,25 +27,49 @@ from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
 
 
 def cmd_snap(a, cfg):
-    cam = open_camera(a.camera, cfg["camera"])
-    try:
-        frame = None
-        for _ in range(5):
-            frame = cam.read()
-    finally:
-        cam.close()
-    if frame is None:
-        print(u"프레임을 못 읽었어요.")
-        return 1
+    """카메라를 캡처 해상도(capture_width x capture_height) 그대로 열고, 주행 해상도 영상은
+    소프트웨어로 줄여 만든다. full*.png는 캘리브레이션용, raw.png/debug.png는 주행 화면과 같다."""
+    c = cfg["camera"]
+    full_cfg = dict(c)
+    full_cfg["width"], full_cfg["height"] = c.get("capture_width", 1280), c.get("capture_height", 720)
     if not os.path.isdir(a.out):
         os.makedirs(a.out)
+    cam = open_camera(a.camera, full_cfg)
+    full = None
+    try:
+        for _ in range(5):
+            full = cam.read()
+        if full is None:
+            print(u"프레임을 못 읽었어요.")
+            return 1
+        if a.count <= 1:
+            cv2.imwrite(os.path.join(a.out, "full.png"), full)
+        else:
+            print(u"%.1f초 간격으로 %d장 찍어요. 체커보드를 화면 가운데·네 귀퉁이·가장자리로, "
+                  u"기울기도 바꿔 가며 옮기세요." % (a.interval, a.count))
+            for i in range(a.count):
+                time.sleep(a.interval)
+                f = None
+                for _ in range(3):      # 버퍼에 남은 이전 프레임 버림
+                    f = cam.read()
+                if f is None:
+                    continue
+                full = f
+                path = os.path.join(a.out, "full_%03d.png" % i)
+                cv2.imwrite(path, full)
+                print(u"  [%d/%d] %s" % (i + 1, a.count, path))
+    finally:
+        cam.close()
+    frame = cv2.resize(full, (c["width"], c["height"]), interpolation=cv2.INTER_AREA)
     an = analyze(frame, cfg)
     cv2.imwrite(os.path.join(a.out, "raw.png"), frame)
     cv2.imwrite(os.path.join(a.out, "debug.png"), draw_debug(frame, an, None, JunctionTracker(cfg), PatchTracker(cfg)))
     cv2.imwrite(os.path.join(a.out, "line_mask.png"), an.line_mask * 255)
-    print(u"저장: %s (raw.png, debug.png, line_mask.png)" % a.out)
+    print(u"저장: %s (원본 %dx%d full*.png / 주행 해상도 %dx%d raw.png, debug.png, line_mask.png)" % (
+        a.out, full.shape[1], full.shape[0], frame.shape[1], frame.shape[0]))
     print(u"줄별 라인 조각 수(위=멂): " + " ".join(str(len(s)) for _, s in an.rows))
     print(u"패치 색 비율(화면 아래쪽): " + ", ".join("%s %.2f" % kv for kv in sorted(an.patch_fracs.items())))
+    print(u"HSV는 주행 해상도 사진(raw.png) 좌표로 재세요.")
     return 0
 
 
@@ -92,6 +119,8 @@ def main(argv=None):
     s = sub.add_parser("snap")
     s.add_argument("--camera", default="gst")
     s.add_argument("--out", default=os.path.join(ROOT, "data", "snap"))
+    s.add_argument("--count", type=int, default=1, help="원본 해상도로 연속 촬영할 장 수(캘리브레이션용)")
+    s.add_argument("--interval", type=float, default=1.5, help="연속 촬영 간격(초)")
     h = sub.add_parser("hsv")
     h.add_argument("image")
     for k in ("x", "y", "w", "h"):

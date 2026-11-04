@@ -22,8 +22,10 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 
 1. **카메라 자세 확인**: `python3 -m agv.tools.camtool snap`
    - 팔을 숙여 카메라가 차체 앞 바닥을 보게 한다. `data/snap/debug.png`에서 라인이 화면 아래 절반의 가운데쯤 보이고, 가로줄마다 초록 점이 하나씩 찍혀야 한다.
+   - `full.png`(원본 해상도)도 같이 저장된다. 검출 그림과 HSV 측정은 주행 해상도인 `raw.png` 기준이다.
    - 이 자세를 주행 자세로 정하고, 서보 각도를 `config/explore.json`의 `arm.servo_angles`에 적어 두면 `--set-arm`으로 다시 맞출 수 있다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
+   - **캘리브레이션 사진**(다음 단계인 실제 축척 형상·AprilTag용, 지금 맵 생성에는 필요 없음): `python3 -m agv.tools.camtool snap --count 25 --out data/calib`로 원본 해상도 25장을 1.5초 간격으로 찍는다. 그동안 체커보드(노트북 화면에 띄워도 됨)를 화면 가운데·귀퉁이·가장자리로, 기울기도 바꿔 가며 옮긴다. 계산은 나중에 노트북에서 한다.
 2. **색 재기**: 패치 4개와 라인 위에서 각각 `snap`을 찍고 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`로 HSV를 잰다. 결과로 `patch.colors`(H 범위)와 `line.v_max`를 고친다. 주황(H 0~18)과 노랑(19~38)이 가까우니 특히 확인한다.
 3. **검출만 확인(모터 없음)**: `python3 -m agv.explore --mode passive --record`
    - 로봇을 손으로 밀어 한 바퀴 돌린다. 터미널에 `patch`(4색), `split`, `merge` 이벤트가 찍혀야 한다.
