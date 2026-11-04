@@ -1,7 +1,9 @@
 import importlib
 import importlib.util
+import copy
 import gc
 import json
+import pickle
 import threading
 import weakref
 import unittest
@@ -357,6 +359,17 @@ class OrderPublisherTests(unittest.TestCase):
             _reconnect_on_failure = False
         with self.assertRaises(ValueError):
             self.module.OrderPublisher(UntrackableClient(), enabled=True)
+
+    def test_publisher_cannot_be_copied_or_serialized(self):
+        client = FakeClient()
+        publisher, owner = self.claimed(client)
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaises(TypeError):
+                    operation(publisher)
+        self.assertEqual(client.calls, [])
+        publisher.publish("sim-robot1", order(), owner=owner)
+        self.assertEqual(len(client.calls), 1)
 
 
 if __name__ == "__main__":

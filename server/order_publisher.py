@@ -134,6 +134,15 @@ def validate_order(robot_id, order):
 class OrderPublisher:
     """One-shot publisher for an explicitly isolated simulation client only."""
 
+    def __copy__(self):
+        raise TypeError("order publishers cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("order publishers cannot be copied")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("order publishers cannot be serialized")
+
     def __init__(self, client, *, enabled=False):
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
