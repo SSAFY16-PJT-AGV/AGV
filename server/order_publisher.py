@@ -8,6 +8,7 @@ The caller must durably record each attempt and retain reservations before use.
 import json
 import math
 import threading
+import weakref
 
 import paho.mqtt.client as mqtt
 
@@ -16,6 +17,8 @@ _ORDER_FIELDS = frozenset(("order_id", "seq", "map_id", "nodes", "released_until
 _MAX_PAYLOAD_BYTES = 256 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_ROBOT_ID_BYTES = 128
+_client_registry_lock = threading.RLock()
+_registered_clients = {}
 
 
 class OrderPublishingDisabled(RuntimeError):
@@ -24,6 +27,26 @@ class OrderPublishingDisabled(RuntimeError):
 
 class OrderPublishError(RuntimeError):
     """Publish did not report queue acceptance, or may have an unknown outcome."""
+
+
+def _register_client(client):
+    """Register client identity for its lifetime without keeping it alive."""
+    key = id(client)
+    with _client_registry_lock:
+        existing = _registered_clients.get(key)
+        if existing is not None and existing() is not None:
+            raise ValueError("MQTT client already has an enabled publisher")
+
+        def remove(reference):
+            with _client_registry_lock:
+                if _registered_clients.get(key) is reference:
+                    del _registered_clients[key]
+
+        try:
+            reference = weakref.ref(client, remove)
+        except TypeError as exc:
+            raise ValueError("enabled MQTT client must support weak references") from exc
+        _registered_clients[key] = reference
 
 
 def _nonempty_string(value):
@@ -119,6 +142,8 @@ class OrderPublisher:
         # entries after disconnect; the caller must still never reconnect/reuse.
         if enabled and getattr(client, "_reconnect_on_failure", None) is not False:
             raise ValueError("simulation client must disable automatic reconnect")
+        if enabled:
+            _register_client(client)
         self._client = client
         self._enabled = enabled
         self._attempted = False

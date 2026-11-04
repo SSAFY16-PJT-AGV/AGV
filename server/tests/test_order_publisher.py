@@ -1,7 +1,9 @@
 import importlib
 import importlib.util
+import gc
 import json
 import threading
+import weakref
 import unittest
 from types import SimpleNamespace
 
@@ -189,6 +191,8 @@ class OrderPublisherTests(unittest.TestCase):
         publisher = self.module.OrderPublisher(client, enabled=True)
         owner = object()
         publisher.claim(owner)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.claim(owner)
         publisher.validate("sim-robot1", order(), owner=owner)
         for other in (None, object()):
             with self.subTest(other=other):
@@ -261,6 +265,70 @@ class OrderPublisherTests(unittest.TestCase):
             publisher.claim(None)
         with self.assertRaises(self.module.OrderPublishError):
             publisher.release_claim(object())
+
+    def test_same_client_cannot_be_wrapped_again_after_first_attempt(self):
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher.publish("sim-robot1", order())
+        with self.assertRaises(ValueError):
+            self.module.OrderPublisher(client, enabled=True)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_same_client_cannot_be_wrapped_after_publisher_is_collected(self):
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        del publisher
+        gc.collect()
+        with self.assertRaises(ValueError):
+            self.module.OrderPublisher(client, enabled=True)
+        self.assertEqual(client.calls, [])
+
+    def test_two_simultaneous_wrappers_of_same_client_have_only_one_winner(self):
+        client = FakeClient()
+        gate = threading.Barrier(2)
+        successes, failures = [], []
+        def wrap():
+            gate.wait()
+            try:
+                successes.append(self.module.OrderPublisher(client, enabled=True))
+            except ValueError:
+                failures.append(True)
+        threads = [threading.Thread(target=wrap) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        self.assertEqual((len(successes), len(failures)), (1, 1))
+        successes[0].publish("sim-robot1", order())
+        self.assertEqual(len(client.calls), 1)
+
+    def test_client_tracking_uses_identity_not_equality_and_does_not_keep_client_alive(self):
+        class EqualClient(FakeClient):
+            __hash__ = None
+            def __eq__(self, other):
+                return True
+        first, second = EqualClient(), EqualClient()
+        one = self.module.OrderPublisher(first, enabled=True)
+        two = self.module.OrderPublisher(second, enabled=True)
+        ref = weakref.ref(first)
+        first_id = id(first)
+        del first, one
+        gc.collect()
+        self.assertIsNone(ref())
+        self.assertNotIn(first_id, self.module._registered_clients)
+        two.publish("sim-robot1", order())
+
+    def test_disabled_wrapper_does_not_claim_client(self):
+        client = FakeClient()
+        self.module.OrderPublisher(client)
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        publisher.publish("sim-robot1", order())
+        self.assertEqual(len(client.calls), 1)
+
+    def test_untrackable_client_cannot_be_enabled(self):
+        class UntrackableClient:
+            __slots__ = ()
+            _reconnect_on_failure = False
+        with self.assertRaises(ValueError):
+            self.module.OrderPublisher(UntrackableClient(), enabled=True)
 
 
 if __name__ == "__main__":
