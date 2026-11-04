@@ -284,6 +284,18 @@ class ProgressTests(unittest.TestCase):
             progress.mark_attempted('T1', 2, 'boot-1', results[0]['payload'], self.new)
         self.assertEqual(progress.get_order('T1', 2)['state'], 'pending')
 
+    def test_verify_uncertain_fence_checks_proof_and_occupancy_without_mutation(self):
+        payload = self.progress.advance('sim-r1', self.event)['payload']
+        self.progress.mark_attempted('T1', 2, 'boot-1', payload, self.new)
+        with self.gate.transaction() as db:
+            self.progress.verify_uncertain_in_transaction(db, 'T1', 2, 'boot-1', payload, self.new)
+            with self.assertRaises(AllocationConflict):
+                self.progress.verify_uncertain_in_transaction(db, 'T1', 2, 'boot-1', payload, {('node','N3')})
+            with self.assertRaises(ValueError):
+                self.progress.verify_uncertain_in_transaction(db, 'T1', 2, 'old-session', payload, self.new)
+        self.assertEqual(self.progress.get_order('T1', 2)['state'], 'uncertain')
+        self.assertEqual(set(self.store.list_occupancy()), self.new)
+
 
 if __name__ == '__main__':
     unittest.main()

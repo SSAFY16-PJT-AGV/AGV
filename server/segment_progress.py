@@ -95,12 +95,17 @@ class SegmentProgress:
         if not self._enabled or self._gate is None:
             raise RuntimeError('simulation progress is disabled or not reconciled')
         with self._gate.transaction() as db:
-            paths = db.execute('PRAGMA database_list').fetchall()
-            main_path = next((row[2] for row in paths if row[1] == 'main'), None)
-            if (not main_path or os.path.normcase(os.path.realpath(main_path))
-                    != os.path.normcase(os.path.realpath(self.store.path))):
-                raise AllocationConflict('recovery and allocation must use the same database')
+            self._check_database(db)
             yield db
+
+    def _check_database(self, db):
+        if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+            raise AllocationConflict('an active recovery transaction is required')
+        paths = db.execute('PRAGMA database_list').fetchall()
+        main_path = next((row[2] for row in paths if row[1] == 'main'), None)
+        if (not main_path or os.path.normcase(os.path.realpath(main_path))
+                != os.path.normcase(os.path.realpath(self.store.path))):
+            raise AllocationConflict('recovery and allocation must use the same database')
 
     def _job(self, db, task_id, robot_id=None):
         row = db.execute('SELECT t.status,j.robot_id,j.map_id,j.nodes_json,j.released_until, '
@@ -261,25 +266,39 @@ class SegmentProgress:
                              (task_id, seq)).fetchone()
         return None if row is None else {'payload': row[0], 'state': row[1]}
 
-    def _transition(self, task_id, seq, robot_session, expected_payload, expected_resources, source, target):
+    def _verify_transition(self, db, task_id, seq, robot_session, expected_payload, expected_resources, source):
         _id(task_id, 'task id'); _id(robot_session, 'robot session')
         if type(seq) is not int or seq < 2 or not isinstance(expected_payload, str):
             raise ValueError('invalid order transition')
         expected = set(copy.deepcopy(expected_resources))
+        self._check_database(db)
+        robot, path, stop = self._job(db, task_id)
+        current_seq, payload, state, order = self._latest(db, task_id, robot, path, stop)
+        if current_seq != seq or payload != expected_payload or state != source:
+            raise AllocationConflict('order changed before transition')
+        current = set(self._segment(path, stop).resources)
+        if expected != current or self._occupancy(db, task_id) != current:
+            raise AllocationConflict('reserved resources changed before transition')
+        prior_row = db.execute('SELECT payload FROM progress_orders WHERE task_id=? AND seq=?',
+                               (task_id, seq - 1)).fetchone()
+        if prior_row is None:
+            raise AllocationConflict('previous order missing')
+        previous = _read_order(prior_row[0])
+        self._authorize(db, task_id, robot_session, seq - 1, previous['released_until'])
+
+    def verify_uncertain_in_transaction(self, db, task_id, seq, robot_session, expected_payload, expected_resources):
+        """Recheck an uncertain order in the caller's active gate transaction.
+
+        This does not mutate state or publish. The caller must hold this same
+        gate transaction through its single, nonblocking MQTT queue operation.
+        """
+        self._verify_transition(db, task_id, seq, robot_session, expected_payload,
+                                expected_resources, 'uncertain')
+
+    def _transition(self, task_id, seq, robot_session, expected_payload, expected_resources, source, target):
         with self._transaction() as db:
-            robot, path, stop = self._job(db, task_id)
-            current_seq, payload, state, order = self._latest(db, task_id, robot, path, stop)
-            if current_seq != seq or payload != expected_payload or state != source:
-                raise AllocationConflict('order changed before transition')
-            current = set(self._segment(path, stop).resources)
-            if expected != current or self._occupancy(db, task_id) != current:
-                raise AllocationConflict('reserved resources changed before transition')
-            prior_row = db.execute('SELECT payload FROM progress_orders WHERE task_id=? AND seq=?',
-                                   (task_id, seq - 1)).fetchone()
-            if prior_row is None:
-                raise AllocationConflict('previous order missing')
-            previous = _read_order(prior_row[0])
-            self._authorize(db, task_id, robot_session, seq - 1, previous['released_until'])
+            self._verify_transition(db, task_id, seq, robot_session, expected_payload,
+                                    expected_resources, source)
             updated = db.execute('UPDATE progress_orders SET state=? WHERE task_id=? AND seq=? AND state=?',
                                  (target, task_id, seq, source))
             if updated.rowcount != 1:
