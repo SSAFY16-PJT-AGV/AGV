@@ -1,0 +1,55 @@
+{
+  "map_id": "warehouse_01",
+  "coordinate_unit": "meter",
+  "nodes": [
+    {"id":"J01","x":1.5,"y":1.4,"type":"junction"},
+    {"id":"J02","x":6.5,"y":1.4,"type":"junction"},
+    {"id":"J03","x":9.5,"y":1.4,"type":"junction"},
+    {"id":"J04","x":14.5,"y":1.4,"type":"junction"},
+    {"id":"J05","x":14.5,"y":7.0,"type":"junction"},
+    {"id":"J06","x":9.5,"y":7.0,"type":"junction"},
+    {"id":"J07","x":6.5,"y":7.0,"type":"junction"},
+    {"id":"J08","x":1.5,"y":7.0,"type":"junction"},
+
+    {"id":"N01","x":4.5,"y":1.4,"type":"access","color":"orange","group":"G01"},
+    {"id":"N02","x":3.0,"y":7.0,"type":"access","color":"blue","group":"G02"},
+    {"id":"N03","x":6.0,"y":7.0,"type":"access","color":"red","group":"G02"},
+    {"id":"N04","x":11.0,"y":1.4,"type":"access","color":"purple","group":"G03"},
+    {"id":"N05","x":13.5,"y":1.4,"type":"access","color":"green","group":"G03"},
+    {"id":"N06","x":12.5,"y":7.0,"type":"access","color":"yellow","group":"G04"},
+
+    {"id":"D01","x":4.5,"y":0.0,"type":"destination"},
+    {"id":"D02","x":3.0,"y":8.5,"type":"destination"},
+    {"id":"D03","x":6.0,"y":8.5,"type":"destination"},
+    {"id":"D04","x":11.0,"y":0.0,"type":"destination"},
+    {"id":"D05","x":13.5,"y":0.0,"type":"destination"},
+    {"id":"D06","x":12.5,"y":8.5,"type":"destination"}
+  ],
+  "edges": [
+    {"from":"J01","to":"N01"},
+    {"from":"N01","to":"J02"},
+    {"from":"J02","to":"J03"},
+    {"from":"J03","to":"N04"},
+    {"from":"N04","to":"N05"},
+    {"from":"N05","to":"J04"},
+
+    {"from":"J04","to":"J05"},
+    {"from":"J05","to":"N06"},
+    {"from":"N06","to":"J06"},
+    {"from":"J06","to":"J07"},
+    {"from":"J07","to":"N03"},
+    {"from":"N03","to":"N02"},
+    {"from":"N02","to":"J08"},
+    {"from":"J08","to":"J01"},
+
+    {"from":"J02","to":"J07"},
+    {"from":"J03","to":"J06"},
+
+    {"from":"N01","to":"D01"},
+    {"from":"N02","to":"D02"},
+    {"from":"N03","to":"D03"},
+    {"from":"N04","to":"D04"},
+    {"from":"N05","to":"D05"},
+    {"from":"N06","to":"D06"}
+  ]
+}
