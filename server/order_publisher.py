@@ -123,6 +123,33 @@ class OrderPublisher:
         self._enabled = enabled
         self._attempted = False
         self._lock = threading.Lock()
+        self._claim_owner = None
+
+    def claim(self, owner):
+        """Reserve this one-shot publisher for one in-process operation."""
+        if not self._enabled:
+            raise OrderPublishingDisabled("simulation order publishing is disabled")
+        if owner is None:
+            raise ValueError("claim owner must be a non-None identity")
+        with self._lock:
+            if self._attempted or self._claim_owner is not None:
+                raise OrderPublishError("publisher is already claimed or used")
+            self._claim_owner = owner
+
+    def release_claim(self, owner):
+        """Release only before any attempt and only for the identical owner.
+
+        The caller must independently verify that no durable reservation or
+        uncertain order requires the claim before releasing it.
+        """
+        with self._lock:
+            if self._attempted or self._claim_owner is None or owner is not self._claim_owner:
+                raise OrderPublishError("publisher claim cannot be released")
+            self._claim_owner = None
+
+    def _check_owner(self, owner):
+        if self._claim_owner is not owner:
+            raise OrderPublishError("publisher claim belongs to another operation")
 
     def _check_transport(self):
         try:
@@ -135,7 +162,7 @@ class OrderPublisher:
         except Exception as exc:
             raise OrderPublishError("could not check MQTT connection") from exc
 
-    def validate(self, robot_id, order):
+    def validate(self, robot_id, order, *, owner=None):
         """Check current readiness without sending or consuming the one attempt.
 
         The connection may change immediately after this check; the caller
@@ -145,16 +172,18 @@ class OrderPublisher:
             raise OrderPublishingDisabled("simulation order publishing is disabled")
         validate_order(robot_id, order)
         with self._lock:
+            self._check_owner(owner)
             if self._attempted:
                 raise OrderPublishError("publisher is one-shot; create a new isolated client")
             self._check_transport()
 
-    def publish(self, robot_id, order):
+    def publish(self, robot_id, order, *, owner=None):
         if not self._enabled:
             raise OrderPublishingDisabled("simulation order publishing is disabled")
         topic = _topic(robot_id)
         payload = _payload(order)
         with self._lock:
+            self._check_owner(owner)
             if self._attempted:
                 raise OrderPublishError("publisher is one-shot; create a new isolated client")
             self._attempted = True

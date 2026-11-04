@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -182,6 +183,84 @@ class OrderPublisherTests(unittest.TestCase):
         invalid = order(); invalid["released_until"] = "missing"
         with self.assertRaises(ValueError):
             self.module.validate_order("sim-robot1", invalid)
+
+    def test_claim_blocks_other_owner_and_direct_unclaimed_publish(self):
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        owner = object()
+        publisher.claim(owner)
+        publisher.validate("sim-robot1", order(), owner=owner)
+        for other in (None, object()):
+            with self.subTest(other=other):
+                with self.assertRaises(self.module.OrderPublishError):
+                    publisher.validate("sim-robot1", order(), owner=other)
+                with self.assertRaises(self.module.OrderPublishError):
+                    publisher.publish("sim-robot1", order(), owner=other)
+        self.assertEqual(client.calls, [])
+        publisher.publish("sim-robot1", order(), owner=owner)
+        self.assertEqual(len(client.calls), 1)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.release_claim(owner)
+
+    def test_claim_and_release_require_same_owner_identity(self):
+        class EqualObjects:
+            def __eq__(self, other):
+                return True
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        owner, same_value = EqualObjects(), EqualObjects()
+        publisher.claim(owner)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.claim(same_value)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.release_claim(same_value)
+        publisher.release_claim(owner)
+        publisher.publish("sim-robot1", order())
+        self.assertEqual(len(client.calls), 1)
+
+    def test_claim_cannot_be_released_after_an_uncertain_attempt(self):
+        client = FakeClient(rc=4)
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        owner = object()
+        publisher.claim(owner)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.publish("sim-robot1", order(), owner=owner)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.release_claim(owner)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.claim(object())
+        self.assertEqual(len(client.calls), 1)
+
+    def test_two_simultaneous_coordinators_cannot_claim_same_publisher(self):
+        client = FakeClient()
+        publisher = self.module.OrderPublisher(client, enabled=True)
+        barrier = threading.Barrier(2)
+        successes, failures = [], []
+        def try_claim(owner):
+            barrier.wait()
+            try:
+                publisher.claim(owner)
+                successes.append(owner)
+            except self.module.OrderPublishError:
+                failures.append(owner)
+        threads = [threading.Thread(target=try_claim, args=(object(),)) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        self.assertEqual((len(successes), len(failures)), (1, 1))
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.publish("sim-robot1", order(), owner=failures[0])
+        publisher.publish("sim-robot1", order(), owner=successes[0])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_disabled_or_invalid_owner_cannot_claim(self):
+        publisher = self.module.OrderPublisher(FakeClient())
+        with self.assertRaises(self.module.OrderPublishingDisabled):
+            publisher.claim(object())
+        publisher = self.module.OrderPublisher(FakeClient(), enabled=True)
+        with self.assertRaises(ValueError):
+            publisher.claim(None)
+        with self.assertRaises(self.module.OrderPublishError):
+            publisher.release_claim(object())
 
 
 if __name__ == "__main__":
