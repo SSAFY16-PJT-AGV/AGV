@@ -327,6 +327,41 @@ class RecoveryGate:
         """Revoke a task's simulated proof after a disconnect or session change."""
         return self.invalidate_many((task_id,))
 
+    def reset_unallocated(self, task_id):
+        """Clear only a pre-allocation simulation block after an explicit check.
+
+        This is not a robot identity, connection, position or safety proof.
+        It cannot release reservations or authorize an already issued order.
+        """
+        _id(task_id, 'task_id')
+        with self._operation_lock:
+            generation = self._block(task_id)
+            if getattr(self._local, 'db', None) is not None or getattr(self._local, 'serializing', False):
+                raise RecoveryError('cannot reset inside a recovery operation')
+            with closing(self._connect()) as db:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    self._active(db)
+                    row = db.execute('SELECT status FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+                    if row != ('PENDING',):
+                        raise RecoveryError('task is not pending')
+                    for table in ('allocation_jobs', 'allocation_outbox', 'allocation_occupancy'):
+                        if db.execute('SELECT 1 FROM ' + table + ' WHERE task_id=? LIMIT 1', (task_id,)).fetchone():
+                            raise RecoveryError('task has existing allocation or order')
+                    for table in ('progress_orders', 'progress_events', 'sim_event_inbox'):
+                        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                        if exists and db.execute('SELECT 1 FROM ' + table + ' WHERE task_id=? LIMIT 1', (task_id,)).fetchone():
+                            raise RecoveryError('task has existing progress evidence')
+                    db.execute("UPDATE recovery_challenges SET status='revoked' WHERE task_id=?", (task_id,))
+                    db.execute('COMMIT')
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute('ROLLBACK')
+                    raise
+            with self._state_lock:
+                if self._generations.get(task_id) == generation:
+                    self._blocked.discard(task_id)
+
     def invalidate_many(self, task_ids):
         """Block all listed tasks locally before revoking them in one DB transaction.
 

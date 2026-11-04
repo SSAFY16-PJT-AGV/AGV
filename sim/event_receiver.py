@@ -61,7 +61,7 @@ class SimEventReceiver:
     """Bind a dedicated, non-reconnecting client to explicitly listed tasks."""
 
     def __init__(self, client, progress, *, inbox, recovery_gate, robot_tasks,
-                 simulation_enabled=False, on_result=None, on_error=None):
+                 simulation_enabled=False, on_result=None, on_error=None, robot_sessions=None):
         if simulation_enabled is not True:
             raise ValueError('isolated simulation must be explicitly enabled')
         if getattr(client, '_reconnect_on_failure', None) is not False:
@@ -94,11 +94,23 @@ class SimEventReceiver:
             raise ValueError('manual MQTT acknowledgement is required')
         if (on_result is not None and not callable(on_result)) or (on_error is not None and not callable(on_error)):
             raise ValueError('observers must be callable')
+        sessions = {}
+        if robot_sessions is not None:
+            if not isinstance(robot_sessions, dict) or set(robot_sessions) != set(mapping):
+                raise ValueError('sessions must match configured robots')
+            for robot, values in robot_sessions.items():
+                if not isinstance(values, dict) or set(values) != set(mapping[robot]):
+                    raise ValueError('sessions must match configured tasks')
+                sessions[robot] = {}
+                for task, session in values.items():
+                    _id(session, 'robot_session')
+                    sessions[robot][task] = session
         for name in ('on_connect', 'on_subscribe', 'on_message', 'on_disconnect'):
             if getattr(client, name, None) is not None:
                 raise ValueError('a dedicated client without existing callbacks is required')
         self.client, self.progress, self.gate, self.inbox = client, progress, recovery_gate, inbox
         self.robot_tasks = MappingProxyType(mapping)
+        self.robot_sessions = MappingProxyType({robot: MappingProxyType(values) for robot, values in sessions.items()})
         self.task_ids = frozenset(all_tasks)
         self.on_result, self.on_error = on_result, on_error
         self._lock = threading.RLock()
@@ -287,6 +299,20 @@ class SimEventReceiver:
             _validate_json(event)
             if event.get('order_id') not in tasks:
                 raise ValueError('event task is not explicitly allowed')
+            task_id = event['order_id']
+            expected_session = self.robot_sessions.get(parts[1], {}).get(task_id)
+            if expected_session is not None and event.get('robot_session') != expected_session:
+                failures = self._invalidate((task_id,))
+                if failures:
+                    self._close_and_invalidate(RuntimeError('session recovery invalidation failed'),
+                                               extra_errors=failures)
+                    return
+                if early:
+                    self._queue_ack(message)
+                elif not self._ack(client, message):
+                    return
+                self._report(RuntimeError('simulation session changed; recovery proof revoked'))
+                return
             try:
                 stored = self.inbox.store(parts[1], event)
             except Exception as exc:
