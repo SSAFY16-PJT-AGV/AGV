@@ -1,0 +1,25 @@
+
+# Unreal Engine
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+
+# Visual Studio
+.vs/
+*.sln
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Build outputs
+Build/*
+
+# Keep necessary build resources
+!Build/
+!Build/**/*.ico
+!Build/**/*.png
+
+# OS
+Thumbs.db
+.DS_Store
