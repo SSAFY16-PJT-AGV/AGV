@@ -54,6 +54,24 @@ def _within_json_depth(value):
     return True
 
 
+def _strings_are_utf8(value):
+    """Reject unpaired Unicode surrogates in JSON keys and string values."""
+    pending = [value]
+    try:
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                pending.extend(current.keys())
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+            elif isinstance(current, str):
+                current.encode('utf-8', errors='strict')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 class MqttService:
     """Background MQTT receiver; snapshots are copies protected by a lock."""
 
@@ -153,7 +171,8 @@ class MqttService:
             if parts[2] == 'state':
                 value = json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant,
                                    parse_float=_finite_float)
-                if not isinstance(value, dict) or not _within_json_depth(value):
+                if (not isinstance(value, dict) or not _within_json_depth(value)
+                        or not _strings_are_utf8(value)):
                     return
             else:
                 value = text

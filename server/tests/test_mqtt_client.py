@@ -98,6 +98,23 @@ class MqttServiceTest(unittest.TestCase):
             self.client.on_message(self.client, None, message('agv/r1/state', payload))
         self.assertEqual(self.service.snapshot()['robots']['r1']['state'], {'last_node': 'N1'})
 
+    def test_unpaired_surrogates_in_nested_keys_and_values_are_rejected(self):
+        self.client.on_connect(self.client, None, None, reason(), None)
+        valid = {'name': '로봇', 'values': ['정상']}
+        self.client.on_message(self.client, None, message('agv/r1/state', valid))
+        for payload in (b'{"name":"\\ud800"}', b'{"nested":{"\\udfff":1}}',
+                        b'{"nested":[{"x":"\\ud800"}]}'):
+            self.client.on_message(self.client, None, message('agv/r1/state', payload))
+            self.assertEqual(self.service.snapshot()['robots']['r1']['state'], valid)
+
+    def test_valid_unicode_and_surrogate_pairs_are_preserved(self):
+        self.client.on_connect(self.client, None, None, reason(), None)
+        payload = b'{"name":"\\uc548\\ub155", "symbol":"\\ud83d\\ude80"}'
+        self.client.on_message(self.client, None, message('agv/r1/state', payload))
+        state = self.service.snapshot()['robots']['r1']['state']
+        self.assertEqual(state, {'name': '안녕', 'symbol': '🚀'})
+        json.dumps(state, ensure_ascii=False).encode('utf-8')
+
     def test_bad_subscription_does_not_mark_ready(self):
         self.client.on_connect(self.client, None, None, reason(), None)
         self.client.on_subscribe(self.client, None, 17, [reason(), reason(True)], None)
