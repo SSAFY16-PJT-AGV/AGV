@@ -178,14 +178,20 @@ class RecoveryGate:
         return float(value)
 
     def _block(self, task_id):
+        return self._block_many((task_id,))[task_id]
+
+    def _block_many(self, task_ids):
         with self._state_lock:
-            generation = self._generations.get(task_id, 0) + 1
-            self._generations[task_id] = generation
-            self._blocked.add(task_id)
+            generations = {}
+            for task_id in task_ids:
+                generation = self._generations.get(task_id, 0) + 1
+                self._generations[task_id] = generation
+                self._blocked.add(task_id)
+                generations[task_id] = generation
             for old, identity in list(self._token_generations.items()):
-                if identity[0] == task_id:
+                if identity[0] in generations:
                     del self._token_generations[old]
-            return generation
+            return generations
 
     def initialize(self):
         """Start a new epoch; an older gate instance becomes invalid."""
@@ -319,25 +325,36 @@ class RecoveryGate:
 
     def invalidate(self, task_id):
         """Revoke a task's simulated proof after a disconnect or session change."""
-        with self._operation_lock:
-            if getattr(self._local, 'db', None) is not None:
-                _id(task_id, 'task_id')
-                self._block(task_id)
-                raise RecoveryError('cannot invalidate inside a recovery transaction')
-            return self._invalidate(task_id)
+        return self.invalidate_many((task_id,))
 
-    def _invalidate(self, task_id):
-        _id(task_id, 'task_id')
-        self._block(task_id)
-        with closing(self._connect()) as db:
-            db.execute('BEGIN IMMEDIATE')
-            try:
-                self._active(db)
-                db.execute("UPDATE recovery_challenges SET status='revoked' WHERE task_id=?", (task_id,))
-                db.execute('COMMIT')
-            except BaseException:
-                if db.in_transaction: db.execute('ROLLBACK')
-                raise
+    def invalidate_many(self, task_ids):
+        """Block all listed tasks locally before revoking them in one DB transaction.
+
+        Input must be a nonempty collection of unique task IDs. On failure,
+        all validated tasks remain locally blocked. This does not propagate a
+        local block to another gate instance if the database write fails.
+        """
+        if not isinstance(task_ids, (list, tuple, set, frozenset)) or not task_ids:
+            raise RecoveryError('task_ids must be a nonempty collection')
+        tasks = tuple(task_ids)
+        for task_id in tasks:
+            _id(task_id, 'task_id')
+        if len(set(tasks)) != len(tasks):
+            raise RecoveryError('duplicate task_id')
+        with self._operation_lock:
+            self._block_many(tasks)
+            if getattr(self._local, 'db', None) is not None:
+                raise RecoveryError('cannot invalidate inside a recovery transaction')
+            with closing(self._connect()) as db:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    self._active(db)
+                    db.executemany("UPDATE recovery_challenges SET status='revoked' WHERE task_id=?",
+                                   ((task_id,) for task_id in tasks))
+                    db.execute('COMMIT')
+                except BaseException:
+                    if db.in_transaction: db.execute('ROLLBACK')
+                    raise
 
     @contextmanager
     def serialized(self):
