@@ -14,6 +14,11 @@
 #include "AGVDisplayShelf.h"
 #include "EngineUtils.h"
 #include "AGVPlacementPreview.h"
+#include "WarehouseMapLoader.h"
+#include "Components/SplineComponent.h"
+#include "Algo/Reverse.h"
+#include "DrawDebugHelpers.h"
+#include "AGVPathActor.h"
 
 AAGVRobot::AAGVRobot()
 {
@@ -21,6 +26,10 @@ AAGVRobot::AAGVRobot()
 
     AutoPossessPlayer = EAutoReceiveInput::Player0;
 
+    SimulationSpline = CreateDefaultSubobject<USplineComponent>(TEXT("SimulationSpline"));
+    SimulationSpline->SetupAttachment(RootComponent);
+    // 로봇이 움직여도 월드 경로 자체는 움직이지 않도록 고정
+    SimulationSpline->SetAbsolute(true, true, true);
     // 컨트롤러의 좌우 회전을 AGV에 적용
     bUseControllerRotationYaw = true;
     bUseControllerRotationPitch = false;
@@ -125,33 +134,47 @@ void AAGVRobot::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // A/D 키로 AGV와 카메라 함께 회전
-    if (!FMath::IsNearlyZero(TurnInput) && Controller)
+    // 이동 방식에 따라 위치 제어 로직을 분리한다.
+    switch (MovementMode)
     {
-        FRotator ControlRotation =
-            Controller->GetControlRotation();
+    case EAGVMovementMode::Manual:
+        UpdateManualMovement(DeltaTime);
+        break;
 
-        ControlRotation.Yaw +=
-            TurnInput * TurnSpeed * DeltaTime;
+    case EAGVMovementMode::Simulation:
+        UpdateSimulationMovement(DeltaTime);
+        DrawPlannedRoute();
+        break;
 
-        Controller->SetControlRotation(ControlRotation);
-    }
+    case EAGVMovementMode::External:
+        // TODO: 중앙 서버에서 수신한 AGV 위치 반영
+        break;
 
-    // W/S 키로 전진 및 후진
-    if (!FMath::IsNearlyZero(MoveInput))
-    {
-        const FVector Direction =
-            GetActorForwardVector();
-
-        AddActorWorldOffset(
-            Direction * MoveInput * MoveSpeed * DeltaTime,
-            true
-        );
+    default:
+        break;
     }
 
     UpdatePlacementPreview();
 
     UpdateGrabTarget();
+}
+
+void AAGVRobot::UpdateManualMovement(float DeltaTime)
+{
+    // 기존 A/D 회전 로직 유지
+    if (!FMath::IsNearlyZero(TurnInput) && Controller)
+    {
+        FRotator ControlRotation = Controller->GetControlRotation();
+        ControlRotation.Yaw += TurnInput * TurnSpeed * DeltaTime;
+        Controller->SetControlRotation(ControlRotation);
+    }
+
+    // 기존 W/S 전진·후진 로직 유지
+    if (!FMath::IsNearlyZero(MoveInput))
+    {
+        const FVector Direction = GetActorForwardVector();
+        AddActorWorldOffset(Direction * MoveInput * MoveSpeed * DeltaTime, true);
+    }
 }
 
 void AAGVRobot::MoveForward(float Value)
@@ -203,7 +226,7 @@ void AAGVRobot::SetupPlayerInputComponent(
         &AAGVRobot::GrabObject
     );
 
-	// 마우스 우클릭 물체 놓기
+    // 마우스 우클릭 물체 놓기
     PlayerInputComponent->BindAction(
         "ReleaseObject",
         IE_Pressed,
@@ -496,4 +519,246 @@ void AAGVRobot::UpdatePlacementPreview()
         SlotTransform,
         bCanPlace
     );
+}
+
+
+
+bool AAGVRobot::StartSimulationRoute(const FString& StartId, const FString& DestinationId)
+{
+    StopSimulationRoute();
+    if (!IsValid(MapLoader))
+    {
+        for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
+        {
+            MapLoader = *It;
+            break;
+        }
+    }
+    if (!IsValid(MapLoader) || MapLoader->Nodes.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Simulation: map not loaded yet"));
+        return false;
+    }
+    if (!MapLoader->FindShortestRoute(StartId, DestinationId, RouteEdgeIndices, RouteReversed))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Simulation: route not found %s -> %s"), *StartId, *DestinationId);
+        return false;
+    }
+    const FWarehouseNode* StartNode = MapLoader->Nodes.FindByPredicate(
+        [&StartId](const FWarehouseNode& Node) { return Node.Id == StartId; });
+    if (!StartNode) return false;
+
+    SimulationHeight = GetActorLocation().Z;
+    FVector SpawnPosition = StartNode->Position;
+    SpawnPosition.Z = SimulationHeight;
+    SetActorLocation(SpawnPosition, false);
+    CurrentRouteStep = 0;
+    CurrentEdgeDistance = 0.0f;
+    bRouteActive = !RouteEdgeIndices.IsEmpty();
+    if (bRouteActive && !PrepareSimulationEdge())
+    {
+        StopSimulationRoute();
+        return false;
+    }
+    UE_LOG(LogTemp, Warning, TEXT("Simulation route started: %s -> %s (%d edges)"),
+        *StartId, *DestinationId, RouteEdgeIndices.Num());
+    return true;
+}
+
+void AAGVRobot::StopSimulationRoute()
+{
+    bRouteActive = false;
+    RouteEdgeIndices.Reset();
+    RouteReversed.Reset();
+    CurrentRouteStep = 0;
+    CurrentEdgeDistance = 0.0f;
+}
+
+bool AAGVRobot::PrepareSimulationEdge()
+{
+    if (!IsValid(MapLoader) || !SimulationSpline ||
+        !RouteEdgeIndices.IsValidIndex(CurrentRouteStep) ||
+        !RouteReversed.IsValidIndex(CurrentRouteStep)) return false;
+
+    const FWarehouseEdge& Edge = MapLoader->Edges[RouteEdgeIndices[CurrentRouteStep]];
+    const FWarehouseNode* From = MapLoader->Nodes.FindByPredicate(
+        [&Edge](const FWarehouseNode& Node) { return Node.Id == Edge.From; });
+    const FWarehouseNode* To = MapLoader->Nodes.FindByPredicate(
+        [&Edge](const FWarehouseNode& Node) { return Node.Id == Edge.To; });
+    if (!From || !To) return false;
+
+    TArray<FVector> Points;
+    Points.Add(From->Position);
+    Points.Append(Edge.Points);
+    Points.Add(To->Position);
+    if (RouteReversed[CurrentRouteStep]) Algo::Reverse(Points);
+
+    SimulationSpline->ClearSplinePoints(false);
+    for (FVector Point : Points)
+    {
+        Point.Z = SimulationHeight;
+        SimulationSpline->AddSplinePoint(Point, ESplineCoordinateSpace::World, false);
+    }
+    // 직선 구간은 Linear, 곡선 경유점이 있으면 Curve
+    if (Points.Num() == 2)
+    {
+        SimulationSpline->SetSplinePointType(0, ESplinePointType::Linear, false);
+        SimulationSpline->SetSplinePointType(1, ESplinePointType::Linear, false);
+    }
+    SimulationSpline->UpdateSpline();
+    CurrentEdgeDistance = 0.0f;
+    return true;
+}
+
+void AAGVRobot::UpdateSimulationMovement(float DeltaTime)
+{
+    if (!bRouteActive)
+    {
+        if (!bAutoRouteAttempted)
+        {
+            // Loader의 Blueprint BeginPlay에서 LoadMap()을 호출하므로
+            // 실제 데이터가 준비된 프레임에 자동 시작한다.
+            for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
+            {
+                MapLoader = *It;
+                break;
+            }
+            if (IsValid(MapLoader) && !MapLoader->Nodes.IsEmpty())
+            {
+                bAutoRouteAttempted = true;
+                StartSimulationRoute(SimulationStartNode, SimulationDestinationNode);
+            }
+        }
+        return;
+    }
+
+    float RemainingMove = FMath::Max(0.0f, SimulationSpeed) * DeltaTime;
+    // 긴 프레임에도 여러 Edge를 연속 통과할 수 있도록 처리
+    while (bRouteActive && RemainingMove > KINDA_SMALL_NUMBER)
+    {
+        const float EdgeLength = SimulationSpline->GetSplineLength();
+        const float RemainingEdge = FMath::Max(0.0f, EdgeLength - CurrentEdgeDistance);
+        const float Step = FMath::Min(RemainingMove, RemainingEdge);
+        const float NextDistance = CurrentEdgeDistance + Step;
+        const FVector Target = SimulationSpline->GetLocationAtDistanceAlongSpline(
+            NextDistance, ESplineCoordinateSpace::World);
+        const FVector Direction = SimulationSpline->GetDirectionAtDistanceAlongSpline(
+            NextDistance, ESplineCoordinateSpace::World);
+
+        FHitResult Hit;
+        SetActorLocation(Target, bSimulationSweep, &Hit);
+        if (bSimulationSweep && Hit.bBlockingHit)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Simulation blocked by collision: %s"),
+                *GetNameSafe(Hit.GetActor()));
+            StopSimulationRoute();
+            return;
+        }
+        if (!Direction.IsNearlyZero())
+        {
+            FRotator Desired = Direction.Rotation();
+            Desired.Pitch = 0.0f;
+            Desired.Roll = 0.0f;
+            SetActorRotation(Desired);
+            if (Controller) Controller->SetControlRotation(FRotator(
+                Controller->GetControlRotation().Pitch, Desired.Yaw, 0.0f));
+        }
+        CurrentEdgeDistance = NextDistance;
+        RemainingMove -= Step;
+        if (CurrentEdgeDistance + 0.01f >= EdgeLength)
+        {
+            ++CurrentRouteStep;
+            if (CurrentRouteStep >= RouteEdgeIndices.Num())
+            {
+                UE_LOG(LogTemp, Warning, TEXT("Simulation destination reached"));
+                StopSimulationRoute();
+                return;
+            }
+            if (!PrepareSimulationEdge())
+            {
+                StopSimulationRoute();
+                return;
+            }
+        }
+        else if (Step <= KINDA_SMALL_NUMBER) break;
+    }
+}
+
+void AAGVRobot::DrawPlannedRoute() const
+{
+    if (!bShowPlannedRoute || !GetWorld())
+    {
+        return;
+    }
+
+    // 현재 AGV가 참조하는 WarehouseMapLoader
+    // MapLoader는 실제 AGVRobot 코드의 변수명에 맞춰 사용
+    if (!IsValid(MapLoader))
+    {
+        return;
+    }
+
+    const FColor LineColor = PlannedRouteColor.ToFColor(true);
+
+    // 현재 최단 경로에 포함된 Edge 순회
+    for (int32 EdgeIndex : RouteEdgeIndices)
+    {
+        if (!MapLoader->SpawnedPaths.IsValidIndex(EdgeIndex))
+        {
+            continue;
+        }
+
+        AAGVPathActor* PathActor =
+            MapLoader->SpawnedPaths[EdgeIndex];
+
+        if (!IsValid(PathActor))
+        {
+            continue;
+        }
+
+        USplineComponent* Spline =
+            PathActor->FindComponentByClass<USplineComponent>();
+
+        if (!Spline)
+        {
+            continue;
+        }
+
+        const float Length = Spline->GetSplineLength();
+
+        // 20cm 간격으로 Spline을 샘플링
+        const int32 SegmentCount =
+            FMath::Max(1, FMath::CeilToInt(Length / 20.0f));
+
+        for (int32 i = 0; i < SegmentCount; ++i)
+        {
+            const float StartDistance =
+                Length * i / SegmentCount;
+
+            const float EndDistance =
+                Length * (i + 1) / SegmentCount;
+
+            FVector Start = Spline->GetLocationAtDistanceAlongSpline(
+                StartDistance,
+                ESplineCoordinateSpace::World);
+
+            FVector End = Spline->GetLocationAtDistanceAlongSpline(
+                EndDistance,
+                ESplineCoordinateSpace::World);
+
+            Start.Z += PlannedRouteZOffset;
+            End.Z += PlannedRouteZOffset;
+
+            DrawDebugLine(
+                GetWorld(),
+                Start,
+                End,
+                LineColor,
+                false,   // 매 프레임 새로 그림
+                0.0f,
+                0,
+                PlannedRouteThickness
+            );
+        }
+    }
 }
