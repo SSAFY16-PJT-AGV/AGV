@@ -44,6 +44,34 @@ class TestPerception(unittest.TestCase):
             got = pt.update(analyze(self.mat.camera_view((x, 232, 0), run_sim.CAM), DEFAULT_CONFIG)) or got
         self.assertEqual(got, "orange")
 
+    @staticmethod
+    def _vee_along(mat, way, sub):
+        """시뮬레이터 주행에서 뽑은 자세(x, y, 각도) 사이를 sub 프레임씩 이어 가며 vee 이벤트를 모은다."""
+        import math
+        jt = JunctionTracker(DEFAULT_CONFIG)
+        out = []
+        for (x0, y0, t0), (x1, y1, t1) in zip(way[:-1], way[1:]):
+            for k in range(sub):
+                f = float(k) / sub
+                pose = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, math.radians(t0 + (t1 - t0) * f))
+                out += [e for e in jt.update(analyze(mat.camera_view(pose, run_sim.CAM), DEFAULT_CONFIG))
+                        if e["type"] == "vee"]
+        return out
+
+    def test_vee_branch_on_curve(self):
+        v2 = Mat(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"))
+        # 오른쪽 고리 오른쪽 아래 모서리를 돌며: 안쪽(오른쪽)으로 급하게 꺾여 나가는 S자 가지
+        corner = [(1827.9, 474.3, -90.9), (1827.5, 444.3, -90.8), (1826.8, 414.1, -91.6),
+                  (1825.4, 384.9, -93.9), (1822.3, 356.5, -97.7), (1817.0, 329.5, -103.0),
+                  (1810.0, 304.0, -108.5), (1801.0, 280.0, -114.0)]
+        self.assertEqual([e["side"] for e in self._vee_along(v2, corner, 4)], ["right"])
+        # 왼쪽 고리 오른쪽 변이 빨강 앞에서 아래 선에 붙음: 옆(바깥쪽)에서 붙는 T자 합류는 V자가 아님
+        # (휨 조건이 없으면 여기서 왼쪽 V자로 잘못 잡힌다)
+        tee = [(855.7, 433.2, -91.2), (855.3, 418.1, -91.5), (854.8, 403.0, -92.3), (854.0, 388.6, -93.4),
+               (852.9, 374.2, -94.9), (851.4, 360.1, -96.9), (849.3, 346.2, -99.3), (846.4, 332.2, -102.4),
+               (842.9, 319.1, -105.7), (838.6, 306.4, -109.7), (833.4, 294.3, -113.9), (827.0, 283.0, -118.0)]
+        self.assertEqual(self._vee_along(v2, tee, 2), [])
+
     def test_fork_visible_before_split(self):
         import math
         jt = JunctionTracker(DEFAULT_CONFIG)
@@ -158,6 +186,14 @@ class TestDeadEndRecovery(unittest.TestCase):
         self.assertEqual(len([n for n in m["nodes"] if n["type"] == "patch"]), 6)
         self.assertIsNotNone(nodes["P_red"]["spur"]["length_mm"])
         self.assertTrue(m["explore"]["complete"])
+        # 오른쪽 아래 모서리의 급한 S자 가지(V자)에 들어가 S자 선과 두 교차까지 탐색
+        evs = read_events(ev)
+        self.assertIn("vee_done", [e.get("msg") for e in evs])
+        count = {}
+        for n in m["nodes"]:
+            count[n["type"]] = count.get(n["type"], 0) + 1
+        self.assertEqual((count.get("split"), count.get("merge"), count.get("cross")), (3, 3, 2),
+                         m["warnings"])
 
 
 if __name__ == "__main__":

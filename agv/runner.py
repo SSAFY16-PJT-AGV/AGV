@@ -24,6 +24,14 @@ X자 교차 처리
     탐색 정책은 그 갈림길을 막다른 길로 기억해, 다음에 만나면 다른 쪽으로 가고 "tee"로 기록한다.
     맵 빌더는 dead_end가 가리키는 갈림길(ref_seq)을 스퍼로 바꾼다.
 
+급한 가지(V자) 들어가기 (drive/ask 모드)
+    모서리 곡선 위에서 급하게 꺾여 나가는 가지는 조향 줄에서 갈라지는 모습이 보이지 않고,
+    옆에서 들어와 내 선과 한 점(J)에서 만나는 선으로 보인다(합류와 같은 모양). JunctionTracker가
+    "vee"(옆에서 들어와 빨리 붙고, 붙은 뒤 내 선이 그쪽으로 휨)를 내면 보통 갈림길처럼 탐색 정책이
+    고른다. 그 가지를 고르면 차체 중심이 J에 올 때까지 따라간 뒤 그쪽으로 제자리 회전해 그 선을
+    탄다. 안 고르면 J를 지날 때까지 갈림길 판정을 쉰다. 이 가지가 사실은 막다른 길이면 위의
+    되돌아 나오기가 그대로 처리한다.
+
 이벤트 위치
     odo_mm은 판정한 바닥 지점 위치다(차체 위치 + geom.*_ahead_mm). 확정이 몇 프레임 늦게 나도
     처음 감지한 프레임의 위치를 쓴다.
@@ -62,6 +70,8 @@ class ExploreRunner(object):
         self.patch = PatchTracker(cfg)
         self.junc = JunctionTracker(cfg)
         self.tee = TeeTracker(cfg)
+        self.v_plan = None          # 급한 가지로 들어갈 계획 {stop, side}
+        self.vee_mute_until = -1e9  # 급한 가지를 판정한 뒤 J를 지날 때까지 갈림길 판정 쉼
         self.follow = Follower(cfg)
         g = cfg.get("geom", {})
         self.ctrl_ahead = float(g.get("ctrl_ahead_mm", 0.0))
@@ -195,8 +205,13 @@ class ExploreRunner(object):
             self._emit(self._ev("tee", self._ago(self.cfg["tee"]["confirm_frames"]), self.ctrl_ahead,
                                 side=tee["side"], measure=self.tee.last))
 
+        muted = self.odo < self.vee_mute_until
+        if muted:
+            jevents = []
+            self.junc.in_split = False
+
         # 1 -> 2: 교차인지 갈림길인지 판단
-        if self.junc.just_changed and self.junc.state == "two":
+        if not muted and self.junc.just_changed and self.junc.state == "two":
             onset = self._ago(kc)
             ons = self.junc.last_onset or {}
             pend = self.pending
@@ -238,6 +253,12 @@ class ExploreRunner(object):
                                          "kind": "split", "seq": None}
 
         for je in jevents:
+            if je["type"] == "vee":
+                if (self.mode != "passive" and self.choice is None and self.v_plan is None
+                        and self.crossing is None and je["side"] is not None):
+                    self._flush_pending()
+                    self._on_vee(je)
+                continue
             if je["type"] == "split":
                 if self.crossing is not None:
                     self.crossing = None        # 교차를 다 지남(이미 cross로 기록)
@@ -266,7 +287,38 @@ class ExploreRunner(object):
         if self.mode != "passive" and self._dead_end_seen(an, dt):
             self._start_recover()
             return 0.0, 0.0
+        if self.v_plan is not None and self.odo >= self.v_plan["stop"]:
+            self.state = "pivot"
+            self._piv = {"t": 0.0, "away": False, "n": 0, "side": self.v_plan["side"], "kind": "vee"}
+            self.log.log("note", self._odo(), msg="vee_pivot", dir=self.v_plan["side"])
+            self.v_plan = None
+            return 0.0, 0.0
         return self._drive(an, dt)
+
+    def _on_vee(self, v):
+        """급한 가지를 찾음: 탐색 정책이 고르게 하고, 그 가지면 J에서 회전할 계획을 세운다."""
+        side = v["side"]
+        v = dict(v, j_mm=self.ctrl_ahead)     # 붙은 순간 만나는 점(J)이 조향 줄 위에 있었다
+        when = self._ago(self.cfg["junction"]["confirm_frames"])
+        j_pos = when[1] + v["j_mm"]
+        suggestion = self.ex.choose_split(j_pos)
+        dead = self.ex.known_dead()
+        if dead:
+            choice = suggestion
+        elif self.mode == "ask" and self.ask_fn is not None:
+            choice = self.ask_fn(suggestion) or suggestion
+        else:
+            choice = suggestion
+        self.vee_mute_until = j_pos + 120.0
+        if dead:
+            self._emit(self._ev("tee", when, v["j_mm"], side=dead, known_dead=True, vee=v))
+            return
+        ev = self._ev("split", when, v["j_mm"], choice=choice, cmd=choice, vee=v)
+        if choice == side:
+            self.v_plan = {"stop": j_pos, "side": side}
+            self.decision = {"pos": j_pos, "side": choice, "kind": "split", "seq": None}
+            ev["decision"] = self.decision
+        self._emit(ev)
 
     def _drive(self, an, dt):
         self.t += dt
@@ -389,6 +441,7 @@ class ExploreRunner(object):
         if self.odo <= r["target"]:
             self.state = "pivot"
             self._piv = {"t": 0.0, "away": False, "n": 0, "side": OPP[r["side"]]}
+            self._piv["kind"] = "recover"
             self.log.log("note", self._odo(), msg="recover_pivot", dir=self._piv["side"])
             return 0.0, 0.0
         if r["t"] > r["limit_s"]:
@@ -440,7 +493,7 @@ class ExploreRunner(object):
             self.patch.active = best
         self.suppress_until = self.odo + self.rc["suppress_mm"]
         self.lost_s = 0.0
-        self.log.log("note", self._odo(), msg="recover_done")
+        self.log.log("note", self._odo(), msg=self._piv.get("kind", "recover") + "_done")
 
     def _is_crossing(self, pend, ons):
         """보류 중인 merge 뒤 1->2가 X자 교차인지 판단한다.

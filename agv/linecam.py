@@ -15,6 +15,11 @@
   runner가 이 정보로 교차와 진짜 갈림길을 구분한다.
 - 스퍼(T자): 조향 줄에서 라인 조각이 한쪽으로만 아주 넓어지면(옆으로 뻗은 선이 지나가는 중)
   그쪽에 스퍼가 있다고 본다(TeeTracker). 라인 추종은 넓은 조각의 내 선 쪽 가장자리를 쓴다.
+- 급한 가지(V자): 모서리 곡선 위에서 급하게 꺾여 나가는 가지는 조향 줄에서 갈라지는 모습이
+  보이지 않고, 옆에서 들어와 내 선과 만나는 선(합류와 같은 모양)으로 보인다. 매끄러운 합류는
+  접선으로 붙어서 간격이 천천히 준다. 옆에서 가파르게 들어와 vee_max_frames 안에 붙었는데,
+  붙은 뒤 내 선이 그 선 쪽으로 휘어 나가면 "vee"(그쪽에 급한 가지), 반대쪽으로 휘면 옆에서 붙는
+  T자 합류라서 무시한다. "vee"가 나는 순간 그 만나는 점(J)이 조향 줄에 있다.
 - 색 패치: 화면 아래쪽 영역에서 색 비율이 임계값을 넘으면 진입 이벤트.
 
 Python 3.6 + numpy + OpenCV(Jetson 기본 이미지).
@@ -51,6 +56,8 @@ DEFAULT_CONFIG = {
         "fork_frames": 2,       # 앞쪽 갈래 모양이 이만큼 이어지면 fork_ahead
         "fork_gap_k": 3.0,      # 갈래 모양의 위쪽 두 조각 간격 상한(라인폭 배수)
         "cross_window_mm": 300, # merge 후 이 거리 안에서 반대편으로 갈라지면 X자 교차
+        "vee_max_frames": 5,    # 옆에서 들어온 선이 이 프레임 수 안에 붙으면 급한 가지(V자)
+        "vee_cont_px": 4.0,     # 그리고 붙은 뒤 내 선이 그 선 쪽으로 이만큼(줄당 px) 휘어 나가야 V자
     },
     "tee": {
         "width_k": 3.0,         # 조향 줄 조각 폭이 라인폭의 이 배수보다 넓고
@@ -216,6 +223,9 @@ class JunctionTracker(object):
         self._last_gap = None
         self._gaps = []             # two 상태에서 최근 간격들(합류 추세 판단)
         self._pair_slopes = []      # two 상태에서 (내 선, 다른 선) 기울기(교차 판단)
+        self._two_frames = 0        # 이번 two 상태가 이어진 프레임 수
+        self._side_entry = False    # 이번 two 상태가 옆에서 들어온 선으로 시작했는지
+        self._entry_gap = None
         self.last_onset = None      # 마지막 1->2 순간 정보 {ratio, trend, slanted}
         self.just_changed = False   # 이번 프레임에 조각 수 상태가 바뀜(confirm_frames 늦게 확정됨)
         self._fork_n = 0
@@ -313,6 +323,7 @@ class JunctionTracker(object):
                 self.just_changed = True
                 if obs == "two":
                     g0 = self._pend_gap
+                    self._entry_gap = g0
                     trend = self._pend_gaps[-1] - self._pend_gaps[0] if self._pend_gaps else 0.0
                     l0, r0 = self._pend_segs
                     slanted, slopes = self._slanted_side(self._pend_an, l0, r0)
@@ -328,6 +339,8 @@ class JunctionTracker(object):
                     self.side = {"left": 0, "right": 0}
                     self._gaps = []
                     self._pair_slopes = []
+                    self._two_frames = 0
+                    self._side_entry = not self.in_split
                 else:
                     side = None
                     if self.side["left"] != self.side["right"]:
@@ -343,12 +356,28 @@ class JunctionTracker(object):
                         if ps:
                             slopes = (sum(a for a, _ in ps) / len(ps), sum(b for _, b in ps) / len(ps))
                         events.append({"type": "merge", "side": side, "slopes": slopes})
+                    elif (not self.in_split and self._side_entry and self._last_gap is not None
+                          and self._two_frames <= self.c["vee_max_frames"]
+                          and self._last_gap < self.c["merge_conv_k"] * lw
+                          and (self._entry_gap is None or self._last_gap < self._entry_gap)):
+                        # 옆에서 가파르게 들어와 짧게 붙음. 붙은 뒤 내 선이 그 선 쪽으로 휘어 나가면
+                        # 급하게 꺾여 나가는 가지(V자), 반대쪽으로 휘면 옆에서 붙는 합류(T자)다.
+                        other = None if side is None else ("right" if side == "left" else "left")
+                        cont = self._slope(an, segs[0]) if segs else None
+                        th = self.c["vee_cont_px"]
+                        if other is not None and cont is not None and (
+                                cont >= th if other == "right" else cont <= -th):
+                            events.append({"type": "vee", "side": other, "frames": self._two_frames,
+                                           "cont": round(cont, 1),
+                                           "gaps": [round(self._entry_gap / lw, 2) if self._entry_gap else None,
+                                                    round(self._last_gap / lw, 2)]})
                     self.in_split = False
                 self.state = obs
                 self._pend = 0
         elif obs is not None:
             self._pend = 0
             if obs == "two":
+                self._two_frames += 1
                 # 간격이 갑자기 크게 벌어지면(교차 위 스퍼 띠 조각 등) 다른 선을 잘못 잡은 것으로 보고 무시
                 if not (self._gaps and gap > self._gaps[-1] + 0.8 * lw):
                     self._last_gap = gap

@@ -20,7 +20,7 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 
 `mats/ssafy_mat.json`은 `docs/images/track-mat.jpg` 사진을 눈대중으로 본뜬 매트다. 큰 루프 하나에 분기 두 곳(노랑 패치 위 갈라짐, 보라 패치 위 합쳐짐)이 있다. 실측 치수가 나오면 이 파일을 고친다. 경로는 점을 지나는 부드러운 곡선(Catmull-Rom)으로 그린다.
 
-`mats/ssafy_v2.json`은 매트 두 장을 이은 2m × 1m 도안(2026-11-06)이고, `mats/ssafy_v2_fix.json`은 도안에서 탐색이 막힌 지점을 옮긴 수정안이다. 둘 다 `mats/gen_ssafy_v2.py`로 만들고, 수정 내용은 그 파일 맨 위에 있다. 도안 그대로는 탐색이 끝나지 않는다(`agv/README.md`의 맵 배치 규칙 참고).
+`mats/ssafy_v2.json`은 매트 두 장을 이은 2m × 1m 도안(2026-11-06)이고, `mats/ssafy_v2_fix.json`은 도안에서 탐색이 막힌 지점을 옮긴 수정안이다. 둘 다 `mats/gen_ssafy_v2.py`로 만들고, 수정 내용은 그 파일 맨 위에 있다. 도안 그대로도 탐색이 끝나고 수정안과 같은 위상(패치 6, 갈라짐 3, 합류 3, 교차 2)이 나온다. S자 선 시작점은 V자 처리로, 빨강 스퍼는 되돌아 나오기로 들어간다. 다만 보라 스퍼가 렌즈 분기에 너무 가까워 가끔 렌즈를 스퍼로 보고 경고가 하나 남는다.
 
 ```
 python3 sim/run_sim.py --mat sim/mats/ssafy_v2_fix.json --out data/v2f --video
