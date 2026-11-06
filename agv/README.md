@@ -41,6 +41,8 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - 갈림길마다 안 가 본 쪽을 고르고, 모든 가지를 다 돈 뒤 같은 패치로 한 바퀴 깨끗하게 돌아오면 그 패치에서 멈춘다(`end` 이벤트의 `reason`이 `explore_explored`).
 8. **맵 만들기**: `python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json` → `mapping/viewer/index.html`에 끌어다 놓는다.
 
+**실시간 화면**: 어느 모드든 `--view`를 붙이면 로봇이 웹 서버를 띄운다. 터미널에 나온 주소(`http://<젯슨 IP>:8080`)를 같은 와이파이의 노트북·폰 브라우저로 연다. 검출 그림, 주행 상태(라인 추종/후진/회전), 최근 이벤트, **정지 버튼**이 나온다. 와이파이가 기기끼리 통신을 막으면 SSH로 포트를 넘겨 `ssh -L 8080:localhost:8080 <사용자>@<젯슨 IP>` 후 `http://localhost:8080`로 연다. 보는 사람이 없으면 그림을 만들지 않아 주행에 영향이 없다. 모니터가 연결돼 있으면 `--show`로 OpenCV 창을 띄울 수도 있지만, `ssh -X`로 원격 창을 띄우면 느려서 `--view`를 권한다. 녹화 영상 재생(`--camera video:...`)에 `--view`를 붙이면 실제 속도로 재생된다.
+
 Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다. ask·drive 모드는 `--enable-motors` 없이는 실행되지 않는다.
 
 ## 검출 방식과 조정 값

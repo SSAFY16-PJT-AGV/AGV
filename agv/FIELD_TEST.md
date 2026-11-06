@@ -23,6 +23,8 @@ python3 -m unittest discover -s agv/tests      # sim/이 없으면 시뮬레이�
 - **Ctrl+C**를 누르면 모터를 세우고 기록을 닫는다. 첫 주행은 손을 로봇 옆에 두고 한다.
 - 주피터 노트북 커널이 카메라를 잡고 있으면 먼저 끈다.
 
+**실시간 화면**: 아래 모든 `agv.explore` 명령에 `--view`를 붙이면, 터미널에 나온 `http://<젯슨 IP>:8080`을 노트북·폰 브라우저로 열어 검출 화면·주행 상태·이벤트를 실시간으로 볼 수 있다. 화면의 **정지** 버튼은 Ctrl+C와 같다. 접속이 안 되면 `ssh -L 8080:localhost:8080 <사용자>@<젯슨 IP>`로 접속한 뒤 `http://localhost:8080`을 연다. ask 모드의 갈림길 질문은 여전히 SSH 터미널에서 답한다(웹 화면에도 "질문 대기"가 뜬다).
+
 **방향 약속**: 이 문서에서 위·아래·왼쪽·오른쪽은 **도안을 본 방향**이다. 로봇은 도안에서 시계 방향으로 돈다.
 
 큰 바퀴 순서(시계 방향):
@@ -49,7 +51,7 @@ python3 -m unittest discover -s agv/tests      # sim/이 없으면 시뮬레이�
 ## 2. 검출만 확인 — 손으로 밀기 (모터 없음)
 
 ```
-python3 -m agv.explore --mode passive --record
+python3 -m agv.explore --mode passive --record --view
 ```
 
 주황 앞에 두고, 도안의 시계 방향으로 맵을 한 바퀴 손으로 민다. 한 바퀴를 7~10초쯤(초당 15cm 안팎)으로 실제 주행 속도와 비슷하게 민다.
@@ -73,7 +75,7 @@ python3 -m agv.tools.runlog data/runs/<시각>
 ## 3. 라인 추종 — 갈림길만 사람이 고르기
 
 ```
-python3 -m agv.explore --mode ask --enable-motors --record
+python3 -m agv.explore --mode ask --enable-motors --record --view
 ```
 
 갈림길에서 멈추고 `[l]왼쪽 / [r]오른쪽`을 묻는다. Enter를 누르면 추천 쪽으로 간다. 이 단계에서는 원래 길(큰 고리)만 고르면서 한 바퀴를 돈다.
@@ -89,7 +91,7 @@ python3 -m agv.explore --mode ask --enable-motors --record
 **시작 위치**: 왼쪽 고리 오른쪽 변의 중간쯤에 놓고, 아래(빨강 쪽)를 보게 한다.
 
 ```
-python3 -m agv.explore --mode ask --enable-motors --record
+python3 -m agv.explore --mode ask --enable-motors --record --view
 ```
 
 1. 빨강 근처에서 갈림길을 물으면 **`l`(스퍼 쪽)**을 고른다.
@@ -116,7 +118,7 @@ python3 -m agv.explore --mode ask --enable-motors --record
 **시작 위치**: 오른쪽 고리 오른쪽 변에서, 오른쪽 아래 모서리보다 40cm쯤 위에 놓고 아래를 보게 한다. 테이프로 표시해 두고 매번 같은 자리에서 시작한다.
 
 ```
-python3 -m agv.explore --mode ask --enable-motors --record
+python3 -m agv.explore --mode ask --enable-motors --record --view
 ```
 
 모서리에 다가가면 `갈림길이에요(급한 가지(V자)가 오른쪽에 있음)`이라고 묻는다.
@@ -144,7 +146,7 @@ python3 -m agv.explore --mode ask --enable-motors --record
 **시작 위치**: 주황 패치 조금 앞, 시계 방향을 보게 놓는다.
 
 ```
-python3 -m agv.explore --mode drive --enable-motors --record --max-time 400
+python3 -m agv.explore --mode drive --enable-motors --record --max-time 400 --view
 python3 -m agv.tools.runlog data/runs/<시각>
 python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field_v2.json --map-id field_v2
 ```
@@ -166,6 +168,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field_v2.js
 ```
 cp agv/config/explore.json /tmp/try.json            # junction.vee_cont_px 등을 고쳐 본다
 python3 -m agv.explore --camera video:data/runs/<시각>/camera.mp4 --config /tmp/try.json --out data/replay
+# --view를 붙이면 브라우저(http://localhost:8080)에서 실제 속도로 보면서 재생
 python3 -m agv.tools.runlog data/replay --all
 ```
 
