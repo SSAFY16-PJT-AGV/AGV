@@ -147,6 +147,43 @@ class TestBuildMap(unittest.TestCase):
         self.assertEqual([e["type"] for e in evs], ["start", "patch"])
 
 
+class TestDeadEnd(unittest.TestCase):
+    def test_dead_end_turns_split_into_spur(self):
+        """갈림길에서 고른 쪽이 막혀 되돌아 나왔으면 그 갈림길은 스퍼(패치 위면 패치 속성)."""
+        evs = [{"type": "start", "seq": 0, "ts": 0, "speed_mm_s": 150, "odo_mm": 0},
+               {"type": "patch", "seq": 1, "ts": 1, "odo_mm": 100, "color": "red"},
+               {"type": "split", "seq": 2, "ts": 2, "odo_mm": 160, "choice": "left"},
+               {"type": "dead_end", "seq": 3, "ts": 3, "odo_mm": 330, "side": "left", "ref_seq": 2,
+                "ref_kind": "split", "spur_mm": 170.0},
+               {"type": "patch", "seq": 4, "ts": 5, "odo_mm": 500, "color": "blue"},
+               {"type": "split", "seq": 5, "ts": 6, "odo_mm": 900, "choice": "right"},
+               {"type": "dead_end", "seq": 6, "ts": 7, "odo_mm": 1100, "side": "right", "ref_seq": 5,
+                "ref_kind": "split", "spur_mm": 200.0},
+               {"type": "patch", "seq": 7, "ts": 9, "odo_mm": 1300, "color": "green"},
+               {"type": "end", "seq": 8, "ts": 10}]
+        m = build_map([evs])
+        nodes = dict((n["id"], n) for n in m["nodes"])
+        self.assertEqual(nodes["P_red"]["spur"], {"side": "left", "seen": 1, "length_mm": 170.0})
+        tee = [n for n in m["nodes"] if n["type"] == "tee"]
+        self.assertEqual(len(tee), 1)
+        self.assertEqual((tee[0]["side"], tee[0]["length_mm"]), ("right", 200.0))
+        self.assertFalse([n for n in m["nodes"] if n["type"] == "split"])
+        self.assertEqual([(e["from"], e["to"]) for e in m["edges"]],
+                         [("P_red", "P_blue"), ("P_blue", tee[0]["id"]), (tee[0]["id"], "P_green")])
+
+    def test_explorer_remembers_dead_end(self):
+        ex = Explorer()
+        ex.on_patch("red", 0)
+        self.assertEqual(ex.choose_split(50), "left")
+        ex.on_split("left", 50)
+        ex.on_dead_end("left", 200)
+        self.assertTrue(ex.splits_complete())
+        ex.on_patch("blue", 400)
+        ex.on_patch("red", 2000)
+        self.assertEqual(ex.choose_split(2050), "right")    # 아는 막다른 길은 반대쪽
+        self.assertEqual(ex.known_dead(), "left")
+
+
 class TestExplorer(unittest.TestCase):
     def test_explorer_covers_all_branches_and_stops(self):
         ex = Explorer()

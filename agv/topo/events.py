@@ -7,7 +7,7 @@
 공통 필드
     ts      float  UNIX 시각(초)
     seq     int    로그 안 순번
-    type    str    start | patch | split | merge | cross | tee | gap | end | note
+    type    str    start | patch | split | merge | cross | tee | dead_end | gap | end | note
     odo_mm  float  주행 시작부터 누적 이동거리 추정(mm). 모터 명령 x 실측 속도로 적분.
                    수동으로 밀거나 조종해서 모터 명령을 모르면 null.
 
@@ -21,7 +21,11 @@ type별 필드
                                       onset은 갈라질 때 간격/라인폭 비율과 간격 변화(px)
     merge   from_side(left|right)     합쳐지는 곳을 지난 순간. 내가 들어온 쪽
     cross   from_side(left|right)     X자 교차를 직진으로 지난 순간. 다른 선이 들어온 쪽
-    tee     side(left|right)          옆으로 뻗은 막다른 선(스퍼)의 T자를 지난 순간
+    tee     side(left|right)          옆으로 뻗은 막다른 선(스퍼)의 T자를 지난 순간.
+            known_dead                이미 막다른 길로 아는 갈림길을 지났으면 true
+    dead_end side, ref_seq, ref_kind  고른 쪽 선이 끝남(막다른 길). ref_seq는 그때 고른 갈림길(split)이나
+             spur_mm                  교차(cross) 이벤트의 seq, spur_mm은 갈림길에서 선 끝까지 거리.
+                                      이 뒤로 후진·회전해 갈림길로 돌아오며, 이후 odo_mm은 갈림길부터 이어진다
     gap     reason                    라인을 놓치는 등 경로 연속성이 끊긴 지점.
                                       빌더는 여기서 노드 순서를 끊는다.
     end     reason, explorer          종료 이유(explore_explored, max_time, user_stop ...)

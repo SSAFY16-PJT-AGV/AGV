@@ -24,6 +24,9 @@ class Explorer(object):
         self.tokens = []
         self.token_pos = []
         self._choose_key = None
+        self._last_split = None    # (서명, 고른 쪽) 마지막으로 지난 갈림길
+        self.dead = {}             # 서명 -> 막다른 쪽(스퍼)
+        self._dead_now = None
         self.tried = {}            # split 서명 -> [가 본 쪽]
         self.seen = set()          # 노드 서명
         self.patch_odo = {}        # 색 -> 마지막 통과 odo
@@ -45,7 +48,7 @@ class Explorer(object):
         return (self.last_patch, tuple(self.tokens))
 
     def splits_complete(self):
-        return all(len(set(v)) >= len(self.branch_order) for v in self.tried.values())
+        return all(len(set(v)) >= len(self.branch_order) for k, v in self.tried.items())
 
     # --- 이벤트 ---
     def on_patch(self, color, odo):
@@ -71,6 +74,10 @@ class Explorer(object):
         """갈림길을 만났을 때 갈 쪽을 고른다. 아직 안 가 본 쪽 우선."""
         key = self._key()
         self._choose_key = key
+        self._dead_now = self.dead.get(key)
+        if self._dead_now:
+            # 이미 아는 막다른 길(스퍼): 반대쪽으로 간다
+            return "right" if self._dead_now == "left" else "left"
         self._discover(("S",) + key, odo)
         tried = self.tried.setdefault(key, [])
         choice = None
@@ -88,12 +95,39 @@ class Explorer(object):
         고를 때 쓴 서명이 있으면 그것을 쓴다(그사이 패치 이벤트가 끼어도 같은 갈림길로 기록)."""
         key = self._choose_key if self._choose_key is not None else self._key()
         self._choose_key = None
+        self._last_split = (key, choice)
         self._discover(("S",) + key, odo)
         tried = self.tried.setdefault(key, [])
         if choice in self.branch_order and choice not in tried:
             tried.append(choice)
             self.last_discovery_odo = odo
         self._add("S" + (choice or "?")[0].upper(), odo)
+
+    def known_dead(self):
+        """방금 choose_split한 갈림길이 아는 막다른 길이면 스퍼 쪽, 아니면 None."""
+        d, self._dead_now = self._dead_now, None
+        if d:
+            self._choose_key = None
+        return d
+
+    def on_dead_end(self, side, odo):
+        """방금 고른 쪽이 막다른 길(스퍼)이었다. 그 갈림길을 스퍼로 기억한다."""
+        if self._last_split is None:
+            return
+        key, choice = self._last_split
+        self._last_split = None
+        self.dead[key] = choice or side
+        tried = self.tried.setdefault(key, [])
+        for b in self.branch_order:
+            if b not in tried:
+                tried.append(b)
+        # 갈림길 토큰을 스퍼 토큰으로 바꾼다(맵 빌더와 같은 규칙: 패치 위면 흡수)
+        if self.tokens and self.tokens[-1].startswith("S"):
+            pos = self.token_pos[-1]
+            self.tokens.pop()
+            self.token_pos.pop()
+            if not self._near_patch(pos):
+                self._add("T", pos)
 
     def on_merge(self, odo):
         self._discover(("M",) + self._key(), odo)

@@ -125,5 +125,40 @@ class TestSimV2(unittest.TestCase):
         self.assertTrue(any(e["from"] == "P_red" and e["to"] == t["id"] for e in m["edges"]))
 
 
+@unittest.skipIf(run_sim is None, "sim/ 없음")
+class TestDeadEndRecovery(unittest.TestCase):
+    """도안 그대로(ssafy_v2): 곡선에서 합류한 직후의 스퍼를 갈림길로 착각해 들어가도 되돌아 나온다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_back_out_of_red_spur(self):
+        # 왼쪽 고리 오른쪽 변을 내려가다 빨강 스퍼로 들어감 -> 후진 -> 회전 -> 파랑으로 계속
+        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"), self.tmp, seed=1,
+                             max_time_s=12, start_pose=[853.4, 549, -90])
+        evs = read_events(ev)
+        types = [e["type"] for e in evs]
+        self.assertIn("dead_end", types)
+        de = [e for e in evs if e["type"] == "dead_end"][0]
+        self.assertAlmostEqual(de["spur_mm"], 188, delta=50)    # 도안 스퍼 길이 약 188mm
+        after = types[types.index("dead_end"):]
+        self.assertIn("patch", after)
+        self.assertEqual([e for e in evs if e["type"] == "patch"][-1]["color"], "blue")
+        self.assertNotIn("line_lost", [e.get("reason") for e in evs])
+
+    def test_explore_drawn_map(self):
+        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"), self.tmp, seed=0,
+                             max_time_s=300)
+        self.assertEqual(gt["finish_reason"], "explore_explored")
+        m = build_map([read_events(ev)])
+        nodes = dict((n["id"], n) for n in m["nodes"])
+        self.assertEqual(len([n for n in m["nodes"] if n["type"] == "patch"]), 6)
+        self.assertIsNotNone(nodes["P_red"]["spur"]["length_mm"])
+        self.assertTrue(m["explore"]["complete"])
+
+
 if __name__ == "__main__":
     unittest.main()

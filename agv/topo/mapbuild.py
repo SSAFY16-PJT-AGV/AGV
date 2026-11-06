@@ -13,6 +13,8 @@
   앞으로는 분기를 만나기 전까지 경로가 하나뿐이므로 같은 노드라면 그 구간 토큰이 같아야 한다.
   (예: 노랑 교차 뒤 합류가 두 개 - 하나는 빨강으로, 하나는 보라로 이어짐 - 를 구분)
   여기에 직전/다음 패치까지 거리가 비슷한지도 확인해서 검출 누락으로 인한 오결합을 막는다.
+- 막다른 길(dead_end): 로봇이 갈림길에서 고른 쪽이 막혀 되돌아 나왔으면, dead_end가 가리키는
+  갈림길(ref_seq)을 그쪽 스퍼(tee, 길이 spur_mm)로 바꾼다. 교차에서 막혔으면 그 자리에 스퍼를 더한다.
 - 교차(X)를 지나는 길은 직진만 된다. 실제로 지나간 (들어온 엣지, 나간 엣지) 쌍을 노드의
   through에 남겨, 경로 계획이 교차에서 꺾지 않게 한다.
 
@@ -85,6 +87,38 @@ def _mean_std(xs):
     return m, math.sqrt(v)
 
 
+def _apply_dead_ends(events, warnings):
+    """dead_end 이벤트로 갈림길을 스퍼로 바꾼다. 같은 로그 안에서 seq로 찾는다."""
+    by_seq = dict((e.get("seq"), e) for e in events)
+    out = []
+    extra = []
+    for e in events:
+        if e.get("type") != "dead_end":
+            continue
+        ref = by_seq.get(e.get("ref_seq"))
+        if ref is None:
+            warnings.append(u"막다른 길(seq %s)이 가리키는 갈림길을 못 찾음" % e.get("seq"))
+            continue
+        if ref["type"] == "split":
+            ref["type"] = "tee"
+            ref["side"] = ref.get("choice") or e.get("side")
+            ref["spur_mm"] = e.get("spur_mm")
+        elif ref["type"] == "cross":
+            t = dict(ref)
+            t.update({"type": "tee", "side": e.get("side"), "spur_mm": e.get("spur_mm"),
+                      "seq": None})
+            extra.append(t)
+    for e in events:
+        if e.get("type") != "dead_end":
+            out.append(e)
+    # 교차에 붙은 스퍼는 교차 바로 뒤에 둔다
+    for t in extra:
+        i = next((k for k, e in enumerate(out) if e is not t and e.get("ts") == t.get("ts")
+                  and e.get("type") == "cross"), len(out) - 1)
+        out.insert(i + 1, t)
+    return out
+
+
 def _prepare_run(run_events, meta, reorder_mm, absorb_mm):
     """구간 이벤트에 거리 d(mm)를 붙이고, 패치 위 교차·스퍼를 흡수하고, 근접 이벤트 순서를 정리한다."""
     speed = meta.get("speed_mm_s") or 0.0
@@ -113,6 +147,8 @@ def _prepare_run(run_events, meta, reorder_mm, absorb_mm):
                     p["_crossing"] = True
                 else:
                     p.setdefault("_spur", []).append(o.get("side"))
+                    if o.get("spur_mm") is not None:
+                        p.setdefault("_spur_len", []).append(o["spur_mm"])
                 continue
         kept.append(o)
     obs = kept
@@ -201,6 +237,7 @@ def build_map(event_lists, map_id="map", version=0, origin_node=None,
     length_src = set()
     for li, events in enumerate(event_lists):
         name = run_names[li] if run_names else "run%d" % li
+        events = _apply_dead_ends([dict(e) for e in events], warnings)
         for ri, (rev, meta) in enumerate(split_runs(events)):
             prepared, src = _prepare_run(rev, meta, reorder_mm, absorb_mm)
             length_src.add(src)
@@ -274,23 +311,34 @@ def build_map(event_lists, map_id="map", version=0, origin_node=None,
                 n["spur"] = None
                 n["crossing"] = False
                 n["_spur_votes"] = []
+                n["_spur_len"] = []
             if o["type"] == "split":
                 n["branches"] = {}
             if o["type"] in ("tee", "cross"):
                 n["side"] = o.get("side") or o.get("from_side")
+            if o["type"] == "tee":
+                n["_len"] = []
             nodes[nid] = n
         n["visits"] += 1
+        if o["type"] == "tee" and o.get("spur_mm") is not None:
+            n["_len"].append(o["spur_mm"])
         if o["type"] == "patch":
+            n["_spur_len"].extend(o.get("_spur_len", []))
             n["_spur_votes"].extend(o.get("_spur", []))
             n["crossing"] = n["crossing"] or bool(o.get("_crossing"))
     for n in nodes.values():
+        if n["type"] == "tee":
+            ls = n.pop("_len", [])
+            n["length_mm"] = round(sum(ls) / len(ls), 1) if ls else None
         if n["type"] == "patch":
+            ls = n.pop("_spur_len", [])
             votes = [v for v in n.pop("_spur_votes") if v]
             if votes:
                 side = max(set(votes), key=votes.count)
                 seen = votes.count(side)
-                if seen >= SPUR_MIN_RATIO * n["visits"]:
-                    n["spur"] = {"side": side, "seen": seen, "length_mm": None}
+                if seen >= SPUR_MIN_RATIO * n["visits"] or ls:
+                    n["spur"] = {"side": side, "seen": seen,
+                                 "length_mm": round(sum(ls) / len(ls), 1) if ls else None}
                 else:
                     warnings.append(u"%s: 스퍼를 %d/%d회만 봐서 스퍼 없음으로 둠(오검출 의심)"
                                     % (n["id"], seen, n["visits"]))

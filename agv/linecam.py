@@ -349,8 +349,10 @@ class JunctionTracker(object):
         elif obs is not None:
             self._pend = 0
             if obs == "two":
-                self._last_gap = gap
-                self._gaps = (self._gaps + [gap])[-5:]
+                # 간격이 갑자기 크게 벌어지면(교차 위 스퍼 띠 조각 등) 다른 선을 잘못 잡은 것으로 보고 무시
+                if not (self._gaps and gap > self._gaps[-1] + 0.8 * lw):
+                    self._last_gap = gap
+                    self._gaps = (self._gaps + [gap])[-5:]
 
         if self._fork(an):
             self._fork_n += 1
