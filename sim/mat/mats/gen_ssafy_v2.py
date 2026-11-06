@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """2026-11-06 팀 도안(매트 두 장을 이은 2m x 1m 맵)을 가상 매트 JSON으로 만든다.
 
-    python3 sim/mats/gen_ssafy_v2.py   ->  sim/mats/ssafy_v2.json      (도안 그대로)
-                                       sim/mats/ssafy_v2_fix.json  (문제 지점을 옮긴 수정안)
+    python3 sim/mat/mats/gen_ssafy_v2.py   ->  sim/mat/mats/ssafy_v2.json      (도안 그대로)
+                                           sim/mat/mats/ssafy_v2_fix.json  (문제 지점을 옮긴 수정안)
 
 수정안(fix)에서 바꾼 것 - 시뮬레이터에서 탐색이 막힌 지점들이다.
 - S자 선이 오른쪽 아래 모서리에서 약 70도로 꺾여 갈라지던 것을, 오른쪽 변 직선 구간에서 20도로 갈라지게

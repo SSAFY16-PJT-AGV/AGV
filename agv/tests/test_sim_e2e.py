@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """가상 매트에서 실물과 같은 인식·탐색 코드를 돌려 맵을 끝까지 만드는 테스트.
 
-실제 카메라·모터는 쓰지 않는다. sim/ 폴더가 필요하다(노트북에서 실행).
+실제 카메라·모터는 쓰지 않는다. sim/mat/ 폴더가 필요하다(노트북에서 실행).
 """
 import os
 import shutil
@@ -11,22 +11,22 @@ import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "sim"))
+sys.path.insert(0, os.path.join(ROOT, "sim", "mat"))
 
 try:
     import run_sim  # noqa: E402
     from mat import Mat  # noqa: E402
-except ImportError:  # Jetson에 sim/이 없으면 건너뜀
+except ImportError:  # Jetson에 sim/mat/이 없으면 건너뜀
     run_sim = None
 
 from agv.linecam import DEFAULT_CONFIG, JunctionTracker, PatchTracker, analyze  # noqa: E402
 from agv.topo import build_map, read_events  # noqa: E402
 
-MAT = os.path.join(ROOT, "sim", "mats", "ssafy_mat.json")
-MAT_V2 = os.path.join(ROOT, "sim", "mats", "ssafy_v2_fix.json")
+MAT = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_mat.json")
+MAT_V2 = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2_fix.json")
 
 
-@unittest.skipIf(run_sim is None, "sim/ 없음")
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
 class TestPerception(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -59,7 +59,7 @@ class TestPerception(unittest.TestCase):
         return out
 
     def test_vee_branch_on_curve(self):
-        v2 = Mat(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"))
+        v2 = Mat(os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"))
         # 오른쪽 고리 오른쪽 아래 모서리를 돌며: 안쪽(오른쪽)으로 급하게 꺾여 나가는 S자 가지
         corner = [(1827.9, 474.3, -90.9), (1827.5, 444.3, -90.8), (1826.8, 414.1, -91.6),
                   (1825.4, 384.9, -93.9), (1822.3, 356.5, -97.7), (1817.0, 329.5, -103.0),
@@ -85,7 +85,7 @@ class TestPerception(unittest.TestCase):
         self.assertTrue(seen)
 
 
-@unittest.skipIf(run_sim is None, "sim/ 없음")
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
 class TestSimExploration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -114,7 +114,7 @@ class TestSimExploration(unittest.TestCase):
         self._check(7)
 
 
-@unittest.skipIf(run_sim is None, "sim/ 없음")
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
 class TestSimV2(unittest.TestCase):
     """2m x 1m 이은 맵(수정안): X자 교차 2곳, 스퍼, 렌즈, 갈림길 3곳."""
 
@@ -153,7 +153,7 @@ class TestSimV2(unittest.TestCase):
         self.assertTrue(any(e["from"] == "P_red" and e["to"] == t["id"] for e in m["edges"]))
 
 
-@unittest.skipIf(run_sim is None, "sim/ 없음")
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
 class TestDeadEndRecovery(unittest.TestCase):
     """도안 그대로(ssafy_v2): 곡선에서 합류한 직후의 스퍼를 갈림길로 착각해 들어가도 되돌아 나온다."""
 
@@ -165,7 +165,7 @@ class TestDeadEndRecovery(unittest.TestCase):
 
     def test_back_out_of_red_spur(self):
         # 왼쪽 고리 오른쪽 변을 내려가다 빨강 스퍼로 들어감 -> 후진 -> 회전 -> 파랑으로 계속
-        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"), self.tmp, seed=1,
+        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"), self.tmp, seed=1,
                              max_time_s=12, start_pose=[853.4, 549, -90])
         evs = read_events(ev)
         types = [e["type"] for e in evs]
@@ -178,7 +178,7 @@ class TestDeadEndRecovery(unittest.TestCase):
         self.assertNotIn("line_lost", [e.get("reason") for e in evs])
 
     def test_explore_drawn_map(self):
-        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mats", "ssafy_v2.json"), self.tmp, seed=0,
+        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"), self.tmp, seed=0,
                              max_time_s=300)
         self.assertEqual(gt["finish_reason"], "explore_explored")
         m = build_map([read_events(ev)])
@@ -196,7 +196,7 @@ class TestDeadEndRecovery(unittest.TestCase):
                          m["warnings"])
 
 
-@unittest.skipIf(run_sim is None, "sim/ 없음")
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
 class TestAutoColor(unittest.TestCase):
     """노란 조명(백열등) 아래: 기본 HSV로는 바탕이 주황으로 잡혀 탐색이 망가지지만,
     한 바퀴 영상에서 자동으로 잡은 색으로는 끝까지 탐색한다."""

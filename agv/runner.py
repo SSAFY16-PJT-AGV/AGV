@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """탐색 주행 한 스텝: 프레임 -> 인식 -> 이벤트 기록·탐색 결정 -> 모터 명령.
 
-실물(explore.py)과 시뮬레이터(sim/run_sim.py)가 같은 이 코드를 쓴다.
+실물(explore.py)과 시뮬레이터(sim/mat/run_sim.py)가 같은 이 코드를 쓴다.
 
 모드
     drive    라인을 따라 자율 주행하고 갈림길은 Explorer가 고른다.

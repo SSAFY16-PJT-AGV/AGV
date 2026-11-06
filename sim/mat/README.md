@@ -1,10 +1,10 @@
-# sim/ — 가상 매트 시뮬레이터
+# sim/mat/ — 가상 매트 시뮬레이터
 
 실물 없이 탐색 주행부터 맵 생성까지 시험하는 도구다. 위에서 본 매트 그림에서 로봇 카메라 시점 영상(원근 포함)을 잘라 만들고, 실물과 똑같은 `agv/runner.py`에 넣어 모터 명령을 받는다. 그 명령으로 궤도형 차체를 움직이며, 미끄러짐과 속도 오차도 넣는다.
 
 ```
 pip install opencv-python numpy        # 노트북
-python3 sim/run_sim.py --out data/sim_run --video
+python3 sim/mat/run_sim.py --out data/sim_run --video
 python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 ```
 
@@ -23,7 +23,7 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 `mats/ssafy_v2.json`은 매트 두 장을 이은 2m × 1m 도안(2026-11-06)이고, `mats/ssafy_v2_fix.json`은 도안에서 탐색이 막힌 지점을 옮긴 수정안이다. 둘 다 `mats/gen_ssafy_v2.py`로 만들고, 수정 내용은 그 파일 맨 위에 있다. 도안 그대로도 탐색이 끝나고 수정안과 같은 위상(패치 6, 갈라짐 3, 합류 3, 교차 2)이 나온다. S자 선 시작점은 V자 처리로, 빨강 스퍼는 되돌아 나오기로 들어간다. 다만 보라 스퍼가 렌즈 분기에 너무 가까워 가끔 렌즈를 스퍼로 보고 경고가 하나 남는다.
 
 ```
-python3 sim/run_sim.py --mat sim/mats/ssafy_v2_fix.json --out data/v2f --video
+python3 sim/mat/run_sim.py --mat sim/mat/mats/ssafy_v2_fix.json --out data/v2f --video
 ```
 
 카메라 시야는 `run_sim.py`의 `CAM`이다(앞 90~380mm, 폭 180~460mm). 실물 카메라 자세를 정한 뒤 실제 시야로 맞추면 시뮬레이션이 더 실물에 가까워진다.

@@ -15,7 +15,7 @@ git remote set-url origin https://github.com/SSAFY16-PJT-AGV/AGV.git   # 저장�
 git fetch origin
 git checkout feature/topo-mapping
 git pull
-python3 -m unittest discover -s agv/tests      # sim/이 없으면 시뮬레이션 테스트는 건너뜀
+python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레이션 테스트는 건너뜀
 ```
 
 **안전**

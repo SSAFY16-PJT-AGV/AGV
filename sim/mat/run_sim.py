@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """가상 매트에서 실물과 같은 탐색 코드(agv/runner.py)를 돌려 이벤트 로그를 만든다.
 
-    python3 sim/run_sim.py --out data/sim_run --video
+    python3 sim/mat/run_sim.py --out data/sim_run --video
     python3 mapping/build_map.py data/sim_run/events.jsonl -o maps/sim.json
 
 산출물: events.jsonl(실물과 같은 형식), gt.json(정답 노드 위치·경로 길이·궤적),
@@ -16,7 +16,7 @@ import sys
 import cv2
 import numpy as np
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(__file__))
 

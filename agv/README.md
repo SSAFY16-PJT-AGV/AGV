@@ -9,7 +9,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | 파일 | 내용 |
 | --- | --- |
 | `explore.py` | 실행 진입점. 카메라 → 인식 → 이벤트 기록 → 모터 |
-| `runner.py` | 한 프레임 처리 로직. 시뮬레이터(`sim/`)도 같은 코드를 쓴다 |
+| `runner.py` | 한 프레임 처리 로직. 시뮬레이터(`sim/mat/`)도 같은 코드를 쓴다 |
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더 |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
@@ -111,4 +111,4 @@ Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다.
 python3 -m unittest discover -s agv/tests -v
 ```
 
-실제 모터·카메라는 쓰지 않는다. `test_sim_e2e.py`는 가상 매트(`sim/`)에서 탐색부터 맵 생성까지 돌린다.
+실제 모터·카메라는 쓰지 않는다. `test_sim_e2e.py`는 가상 매트(`sim/mat/`)에서 탐색부터 맵 생성까지 돌린다.
