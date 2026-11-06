@@ -26,16 +26,17 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - 이 자세를 주행 자세로 정하고, 서보 각도를 `config/explore.json`의 `arm.servo_angles`에 적어 두면 `--set-arm`으로 다시 맞출 수 있다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
    - **캘리브레이션 사진**(다음 단계인 실제 축척 형상·AprilTag용, 지금 맵 생성에는 필요 없음): `python3 -m agv.tools.camtool snap --count 25 --out data/calib`로 원본 해상도 25장을 1.5초 간격으로 찍는다. 그동안 체커보드(노트북 화면에 띄워도 됨)를 화면 가운데·귀퉁이·가장자리로, 기울기도 바꿔 가며 옮긴다. 계산은 나중에 노트북에서 한다.
-2. **색 재기**: 패치 4개와 라인 위에서 각각 `snap`을 찍고 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`로 HSV를 잰다. 결과로 `patch.colors`(H 범위)와 `line.v_max`를 고친다. 주황(H 0~18)과 노랑(19~38)이 가까우니 특히 확인한다.
+2. **색 재기**: 패치마다(지금 맵은 6색) 그리고 라인 위에서 각각 `snap`을 찍고 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`로 HSV를 잰다. 결과로 `patch.colors`(H 범위)와 `line.v_max`를 고친다. 빨강(H 0~6, 170~180)·주황(7~18)·노랑(19~38)이 가깝고, 짙은 보라는 어두워서 라인으로 잡힐 수 있으니 특히 확인한다.
 3. **검출만 확인(모터 없음)**: `python3 -m agv.explore --mode passive --record`
    - 로봇을 손으로 밀어 한 바퀴 돌린다. 터미널에 `patch`(4색), `split`, `merge` 이벤트가 찍혀야 한다.
    - 결과 폴더의 `debug/*.jpg`에서 검출 상태를, `camera.mp4`로는 노트북에서 다시 돌려 볼 수 있다: `python3 -m agv.explore --camera video:<폴더>/camera.mp4`
 4. **속도 재기**: `python3 -m agv.tools.camtool speed --enable-motors` → 간 거리를 입력해 나온 값을 `robot.speed_mm_s`에 넣는다. 방향이 반대면 `robot.invert_left/right`를 고친다.
-5. **갈림길만 사람이 고르는 주행**: `python3 -m agv.explore --mode ask --enable-motors`
+5. **판정 지점 거리 재기**: `snap`의 `debug.png`에서 파란 가로줄이 바닥 어디에 해당하는지 자로 재서 `geom.ctrl_ahead_mm`에 넣는다(차체 궤도 가운데 기준).
+6. **갈림길만 사람이 고르는 주행**: `python3 -m agv.explore --mode ask --enable-motors`
    - 갈라지는 곳에서 멈추고 왼쪽/오른쪽을 묻는다. 라인 추종이 흔들리면 `follow.base_speed`를 낮추고 `follow.kp`를 조정한다.
-6. **자율 탐색**: `python3 -m agv.explore --mode drive --enable-motors --record`
+7. **자율 탐색**: `python3 -m agv.explore --mode drive --enable-motors --record`
    - 갈림길마다 안 가 본 쪽을 고르고, 모든 가지를 다 돈 뒤 같은 패치로 한 바퀴 깨끗하게 돌아오면 그 패치에서 멈춘다(`end` 이벤트의 `reason`이 `explore_explored`).
-7. **맵 만들기**: `python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json` → `mapping/viewer/index.html`에 끌어다 놓는다.
+8. **맵 만들기**: `python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json` → `mapping/viewer/index.html`에 끌어다 놓는다.
 
 Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다. ask·drive 모드는 `--enable-motors` 없이는 실행되지 않는다.
 
@@ -51,6 +52,17 @@ Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다.
   - 옆에서 다른 선이 들어오거나 나가는 경우(간격이 좁아지거나 처음부터 멂)는 무시한다.
   - 갈라짐 이벤트의 `onset`(간격/라인폭 비율, 간격 변화 px)을 보고 `junction.split_*` 값을 조정한다. 시뮬레이션에서 갈라짐은 비율 1.2~1.7·변화 +15 이상, 옆 선 진입은 비율 1.8 이상·변화 음수였다.
 - 앞쪽에 갈래 모양이 보이는 것(`fork_ahead`)만으로는 방향을 정하지 않는다. 합류 지점에 옆 가지로 들어갈 때도 화면상 똑같이 보여서, 그걸 믿으면 반대 가지로 역주행한다(시뮬레이터에서 실제로 겪음).
+- **X자 교차**: 합류가 나면 바로 기록하지 않고 `junction.cross_window_mm`(300mm) 동안 보류한다. 그 안에 선이 다시 갈라지는데 다른 선이 내가 있던 쪽으로 빠져나가면 교차다. 판단은 두 가지로 한다. 하나는 그쪽 조각이 더 비스듬한지, 다른 하나는 그 조각 기울기가 합류 직전 다른 선 기울기와 이어지는지다. 교차면 `cross` 이벤트를 남기고 곧은 선을 따라간다. 아니면 보류한 합류를 기록하고 보통 갈림길로 처리한다. 보라 패치 뒤 렌즈처럼 합류 직후 같은 쪽으로 다시 갈라지는 경우가 여기에 해당한다.
+- **스퍼(T자)**: 조향 줄의 선 조각이 한쪽으로만 라인폭의 3배 넘게 넓어지고, 조향 줄에서 3줄 위·아래는 보통 폭 선 하나뿐일 때 `tee`로 기록한다. 띠가 얇은지 보는 이 조건으로 곡선 합류를 스퍼로 잘못 보는 것을 거른다. 라인 추종은 넓은 조각에서 내 선 쪽 가장자리를 쓰므로 스퍼 쪽으로 끌려가지 않는다.
+- **이벤트 위치**: `geom.ctrl_ahead_mm`·`geom.patch_ahead_mm`만큼 앞당겨, 차체 위치가 아니라 판정한 바닥 지점으로 기록한다. 확정이 몇 프레임 늦어도 처음 감지한 프레임 기준이다.
+
+## 맵(테이프) 배치 규칙
+
+시뮬레이터에서 탐색이 막혔던 경우를 바탕으로 정했다. 카메라는 차체 앞 약 12cm를 보고 따라가므로, 곡선을 도는 중에는 차체가 선보다 늦게 돈다.
+
+- **스퍼**는 직선 구간에 직각으로 붙이고, 모서리·합류·분기·교차에서 15cm 이상 띄운다. 곡선에서 합류한 직후의 스퍼는 아직 꺾는 중인 로봇에게 비스듬한 가지로 보여서, 탐색이 그쪽을 골라 매트 밖으로 나간다.
+- **갈림길**은 진행 방향에서 30도 이내로 완만하게 갈라지게 한다. 모서리 곡선 위에서 60~70도로 꺾여 나가는 가지는 카메라에 뒤쪽으로 뻗은 선(합류)처럼 보여서 들어갈 수 없다.
+- **교차**는 30도 이상 각도로 지나가게 하고, 교차 위에 스퍼를 두지 않는다.
 
 ## 이벤트 로그
 
@@ -62,7 +74,7 @@ Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다.
 {"ts": 1730700014.10, "seq": 5, "type": "merge", "odo_mm": 2013.4, "from_side": "left"}
 ```
 
-`odo_mm`은 모터 명령 × `speed_mm_s`를 적분한 추정 이동거리다. passive 모드에서는 `null`이고, 이때 빌더가 시간 × 속도로 대신 계산한다.
+`odo_mm`은 모터 명령 × `speed_mm_s`를 적분한 추정 이동거리에 판정 지점까지 거리(`geom`)를 더한 값이다. passive 모드에서는 `null`이고, 이때 빌더가 시간 × 속도로 대신 계산한다. 교차는 `cross`(다른 선이 들어온 쪽 `from_side`), 스퍼는 `tee`(`side`)로 남는다.
 
 ## 테스트
 

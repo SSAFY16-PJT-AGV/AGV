@@ -7,7 +7,7 @@
 공통 필드
     ts      float  UNIX 시각(초)
     seq     int    로그 안 순번
-    type    str    start | patch | split | merge | gap | end
+    type    str    start | patch | split | merge | cross | tee | gap | end | note
     odo_mm  float  주행 시작부터 누적 이동거리 추정(mm). 모터 명령 x 실측 속도로 적분.
                    수동으로 밀거나 조종해서 모터 명령을 모르면 null.
 
@@ -20,10 +20,14 @@ type별 필드
                                       따라간 쪽, cmd는 명령한 쪽(passive면 null),
                                       onset은 갈라질 때 간격/라인폭 비율과 간격 변화(px)
     merge   from_side(left|right)     합쳐지는 곳을 지난 순간. 내가 들어온 쪽
+    cross   from_side(left|right)     X자 교차를 직진으로 지난 순간. 다른 선이 들어온 쪽
+    tee     side(left|right)          옆으로 뻗은 막다른 선(스퍼)의 T자를 지난 순간
     gap     reason                    라인을 놓치는 등 경로 연속성이 끊긴 지점.
                                       빌더는 여기서 노드 순서를 끊는다.
     end     reason, explorer          종료 이유(explore_explored, max_time, user_stop ...)
     note    msg                       디버깅 메모. 빌더는 무시한다.
+
+odo_mm·ts는 판정한 바닥 지점 기준이라 파일 순서와 다를 수 있다(빌더가 위치순으로 정렬).
 
 Python 3.6 호환(Jetson Nano). 표준 라이브러리만 쓴다.
 """
@@ -31,7 +35,7 @@ import io
 import json
 import time
 
-NODE_TYPES = ("patch", "split", "merge")
+NODE_TYPES = ("patch", "split", "merge", "cross", "tee")
 BREAK_TYPES = ("start", "gap", "end")
 
 
@@ -45,8 +49,9 @@ class EventLogger(object):
         self.seq = 0
         self._f = io.open(path, "a", encoding="utf-8")
 
-    def log(self, type_, odo_mm=None, **fields):
-        ev = {"ts": round(self.clock(), 3), "seq": self.seq, "type": type_,
+    def log(self, type_, odo_mm=None, ts=None, **fields):
+        """ts를 주면 그 시각으로 기록한다(판정이 늦게 확정된 이벤트의 실제 시각)."""
+        ev = {"ts": round(self.clock() if ts is None else ts, 3), "seq": self.seq, "type": type_,
               "odo_mm": None if odo_mm is None else round(float(odo_mm), 1)}
         ev.update(fields)
         self.seq += 1

@@ -14,7 +14,16 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 | `--video` | `run.mp4`: 왼쪽은 검출 결과를 그린 카메라 시점, 오른쪽은 위에서 본 궤적 |
 | `--raw-video` | `camera.mp4`: 원본 카메라 영상. `python3 -m agv.explore --camera video:...`로 재생 시험할 때 쓴다 |
 | `--seed N` | 노이즈·미끄러짐 난수 |
+| `--mat 파일` | 매트 선택. 기본은 `mats/ssafy_mat.json`(첫 매트 한 장) |
+| `--start x,y,각도` | 시작 자세(mm, 도). 특정 구간만 시험할 때 |
+| `--right-first` | 갈림길에서 오른쪽부터 탐색 |
 
 `mats/ssafy_mat.json`은 `docs/images/track-mat.jpg` 사진을 눈대중으로 본뜬 매트다. 큰 루프 하나에 분기 두 곳(노랑 패치 위 갈라짐, 보라 패치 위 합쳐짐)이 있다. 실측 치수가 나오면 이 파일을 고친다. 경로는 점을 지나는 부드러운 곡선(Catmull-Rom)으로 그린다.
+
+`mats/ssafy_v2.json`은 매트 두 장을 이은 2m × 1m 도안(2026-11-06)이고, `mats/ssafy_v2_fix.json`은 도안에서 탐색이 막힌 지점을 옮긴 수정안이다. 둘 다 `mats/gen_ssafy_v2.py`로 만들고, 수정 내용은 그 파일 맨 위에 있다. 도안 그대로는 탐색이 끝나지 않는다(`agv/README.md`의 맵 배치 규칙 참고).
+
+```
+python3 sim/run_sim.py --mat sim/mats/ssafy_v2_fix.json --out data/v2f --video
+```
 
 카메라 시야는 `run_sim.py`의 `CAM`이다(앞 90~380mm, 폭 180~460mm). 실물 카메라 자세를 정한 뒤 실제 시야로 맞추면 시뮬레이션이 더 실물에 가까워진다.

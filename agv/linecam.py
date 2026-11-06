@@ -7,11 +7,14 @@
 - 라인: HSV에서 어둡고(V 낮음) 채도 낮은(S 낮음) 픽셀. 색 패치 위에 인쇄된 검은 선도 잡힌다.
 - 갈림길: 조향 줄(control row, 차체 바로 앞)에서 라인 조각 수가 바뀌는 순간을 본다.
     1개 -> 2개로 바뀔 때 두 조각이 붙어 있었으면 split(방금 갈라짐)
-    2개 -> 1개로 바뀔 때 두 조각이 붙어 있었으면 merge(방금 합쳐짐)
+    2개 -> 1개로 바뀔 때 두 조각이 붙어 있었거나 빠르게 좁혀지던 중이면 merge(방금 합쳐짐)
     떨어진 채로 바뀌면 다른 가지가 화면 옆으로 들어오거나 나간 것이라 무시한다.
   짧은 분기(갈라짐과 합쳐짐이 한 화면에 다 보이는 경우)도 순서대로 두 이벤트가 나온다.
-  갈 쪽은 미리 정해야 하므로, 위쪽 줄에서 "아래 1개 + 위 2개" 갈래 모양이 보이면
-  fork_ahead를 켠다.
+  1 -> 2가 될 때마다 두 조각을 위쪽 줄로 따라가 어느 쪽이 비스듬한지(slanted) 기록한다.
+  X자 교차는 "merge 직후, merge 때 다른 선이 들어온 쪽의 반대편으로 비스듬한 선이 갈라짐"이라
+  runner가 이 정보로 교차와 진짜 갈림길을 구분한다.
+- 스퍼(T자): 조향 줄에서 라인 조각이 한쪽으로만 아주 넓어지면(옆으로 뻗은 선이 지나가는 중)
+  그쪽에 스퍼가 있다고 본다(TeeTracker). 라인 추종은 넓은 조각의 내 선 쪽 가장자리를 쓴다.
 - 색 패치: 화면 아래쪽 영역에서 색 비율이 임계값을 넘으면 진입 이벤트.
 
 Python 3.6 + numpy + OpenCV(Jetson 기본 이미지).
@@ -42,8 +45,27 @@ DEFAULT_CONFIG = {
         "split_sure_k": 1.5,    # 1->2 순간 간격이 이보다 좁으면 무조건 split
         "split_max_k": 2.6,     # 이 사이면 간격이 벌어지는지(split) 좁아지는지(옆 선 진입)로 판단
         "split_trend_px": 1.0,  # 확인 프레임 동안 간격이 이만큼 이상 벌어져야 split
+        "merge_conv_k": 3.2,    # 빠르게 좁혀지던 두 조각은 간격이 이 배수 안이면 합류로 본다(가파른 교차용)
+        "slant_rows": 4,        # 1->2 순간 각 조각을 위로 따라가 기울기를 잴 줄 수
+        "slant_min_px": 3.0,    # 줄당 x 변화 차이가 이보다 작으면 어느 쪽이 비스듬한지 모름
         "fork_frames": 2,       # 앞쪽 갈래 모양이 이만큼 이어지면 fork_ahead
         "fork_gap_k": 3.0,      # 갈래 모양의 위쪽 두 조각 간격 상한(라인폭 배수)
+        "cross_window_mm": 300, # merge 후 이 거리 안에서 반대편으로 갈라지면 X자 교차
+    },
+    "tee": {
+        "width_k": 3.0,         # 조향 줄 조각 폭이 라인폭의 이 배수보다 넓고
+        "ext_k": 1.8,           # 한쪽으로 라인폭의 이 배수 이상 뻗고
+        "other_k": 1.0,         # 반대쪽은 이 배수 이하일 때 스퍼
+        "confirm_frames": 2,
+        "rearm_frames": 4,
+        "clear_rows": 3,        # 조향 줄에서 이만큼 위·아래 줄은 보통 폭 선 하나여야 함(스퍼 띠는 얇다)
+    },
+    "geom": {
+        # 차체 회전 중심에서 각 판정 지점까지 바닥 거리(mm). 이벤트 위치(odo_mm)를 실제 지점으로 맞춘다.
+        # ctrl_ahead_mm: camtool snap의 debug.png 파란 가로줄(조향 줄)이 바닥에서 차체 앞 몇 mm인지 잰 값
+        # patch_ahead_mm: 패치 진입 이벤트가 날 때 패치 앞 가장자리까지 거리(대략 조향 줄과 비슷)
+        "ctrl_ahead_mm": 116,
+        "patch_ahead_mm": 125,
     },
     "patch": {
         "region_top": 0.55,     # 패치 판정 영역(화면 아래쪽)
@@ -52,10 +74,12 @@ DEFAULT_CONFIG = {
         "on_frames": 3, "off_frames": 5,
         # OpenCV HSV의 H 범위(0~180). 실제 조명에서 tools/hsv_stats.py로 재서 고칠 것
         "colors": {
-            "orange": [[0, 18]],
+            "red": [[0, 6], [170, 180]],
+            "orange": [[7, 18]],
             "yellow": [[19, 38]],
             "green": [[40, 90]],
-            "purple": [[115, 165]],
+            "blue": [[95, 124]],
+            "purple": [[125, 169]],
         },
     },
     "follow": {
@@ -100,6 +124,7 @@ class Analysis(object):
         self.w = self.h = 0
         self.rows = []          # [(y, [xc, ...]), ...] 위(먼 곳)부터
         self.widths = []        # rows와 같은 순서의 조각 폭 [[w, ...], ...]
+        self.raw = []           # rows와 같은 순서, 폭 필터 전 조각 [(x0, x1), ...] (스퍼 판정용)
         self.ctrl_idx = 0
         self.patch_fracs = {}
         self.line_mask = None
@@ -122,10 +147,11 @@ def analyze(bgr, cfg):
     for y in ys:
         y0, y1 = max(0, y - 1), min(h, y + 2)
         band = mask[y0:y1].mean(axis=0) > 0.5
-        runs = [(a, b) for a, b in _runs(band, lc["gap_close_px"])
-                if min_w <= (b - a + 1) <= max_w]
+        allruns = [(a, b) for a, b in _runs(band, lc["gap_close_px"]) if (b - a + 1) >= min_w]
+        runs = [(a, b) for a, b in allruns if (b - a + 1) <= max_w]
         an.rows.append((int(y), [(a + b) / 2.0 for a, b in runs]))
         an.widths.append([float(b - a + 1) for a, b in runs])
+        an.raw.append(allruns)
     an.ctrl_idx = int(np.argmin(np.abs(ys - lc["control_row"] * h)))
 
     pc = cfg["patch"]
@@ -188,16 +214,21 @@ class JunctionTracker(object):
         self._pend_gap = None
         self._pend_gaps = []
         self._last_gap = None
-        self.last_onset = None
+        self._gaps = []             # two 상태에서 최근 간격들(합류 추세 판단)
+        self._pair_slopes = []      # two 상태에서 (내 선, 다른 선) 기울기(교차 판단)
+        self.last_onset = None      # 마지막 1->2 순간 정보 {ratio, trend, slanted}
         self.just_changed = False   # 이번 프레임에 조각 수 상태가 바뀜(confirm_frames 늦게 확정됨)
         self._fork_n = 0
-        self.fork_ahead = False     # 앞에 갈래(split)가 보임 -> 갈 쪽을 미리 정할 때
+        self.fork_ahead = False     # 앞에 갈래(split)가 보임(디버그 표시용)
         self.in_split = False       # 갈라진 직후 두 가지 사이를 지나는 중
         self.side = {"left": 0, "right": 0}
 
     @property
     def active(self):
         return self.state == "two" or self.fork_ahead
+
+    def lw_or(self, an):
+        return self.lw or 0.06 * an.w
 
     def _pick_two(self, segs, w):
         if len(segs) == 2:
@@ -218,6 +249,30 @@ class JunctionTracker(object):
                     return True
         return False
 
+    def _slope(self, an, x0):
+        """조향 줄의 x0 조각을 위쪽(먼) 줄로 따라가 줄당 x 변화(px)를 잰다. 못 따라가면 None."""
+        lw = self.lw_or(an)
+        n = self.c["slant_rows"]
+        x, k = x0, 0
+        for i in range(an.ctrl_idx - 1, max(-1, an.ctrl_idx - 1 - n), -1):
+            cand = an.rows[i][1]
+            if not cand:
+                break
+            nx = min(cand, key=lambda v: abs(v - x))
+            if abs(nx - x) > 3.0 * lw:
+                break
+            x, k = nx, k + 1
+        return (x - x0) / k if k else None
+
+    def _slanted_side(self, an, l, r):
+        """조향 줄의 두 조각 중 화면에서 더 비스듬한 쪽(left/right)과 두 기울기."""
+        slopes = [self._slope(an, l), self._slope(an, r)]
+        if None in slopes:
+            return None, slopes
+        if abs(abs(slopes[0]) - abs(slopes[1])) < self.c["slant_min_px"]:
+            return None, slopes
+        return ("left" if abs(slopes[0]) > abs(slopes[1]) else "right"), slopes
+
     def update(self, an, tracked_x=None):
         """프레임마다 호출. 반환: 이벤트 목록 [{"type": split|merge, "side": left|right|None}]
         side는 내가 지난(들어온) 쪽 가지."""
@@ -234,26 +289,36 @@ class JunctionTracker(object):
             obs = "two"
             l, r = self._pick_two(segs, an.w)
             gap = r - l
-        join = self.c["join_k"] * (self.lw or 0.06 * an.w)
+        lw = self.lw_or(an)
+        join = self.c["join_k"] * lw
 
         if self.state == "two" and obs == "two":
             l, r = self._pick_two(segs, an.w)
-            ref = an.w / 2.0
-            self.side["left" if abs(l - ref) <= abs(r - ref) else "right"] += 1
+            ref = tracked_x if tracked_x is not None else an.w / 2.0
+            mine_left = abs(l - ref) <= abs(r - ref)
+            self.side["left" if mine_left else "right"] += 1
+            sm, so = self._slope(an, l if mine_left else r), self._slope(an, r if mine_left else l)
+            if sm is not None and so is not None:
+                self._pair_slopes = (self._pair_slopes + [(sm, so)])[-4:]
         if obs is not None and obs != self.state:
             self._pend += 1
             if self._pend == 1:
                 self._pend_gap = gap
                 self._pend_gaps = []
+                self._pend_segs = self._pick_two(segs, an.w) if obs == "two" else None
+                self._pend_an = an
             if gap is not None:
                 self._pend_gaps.append(gap)
             if self._pend >= self.c["confirm_frames"]:
                 self.just_changed = True
                 if obs == "two":
-                    lw = self.lw or 0.06 * an.w
                     g0 = self._pend_gap
                     trend = self._pend_gaps[-1] - self._pend_gaps[0] if self._pend_gaps else 0.0
-                    self.last_onset = {"ratio": round(g0 / lw, 2), "trend": round(trend, 1)}
+                    l0, r0 = self._pend_segs
+                    slanted, slopes = self._slanted_side(self._pend_an, l0, r0)
+                    self.last_onset = {"ratio": round(g0 / lw, 2), "trend": round(trend, 1),
+                                       "slanted": slanted,
+                                       "slopes": [None if v is None else round(v, 1) for v in slopes]}
                     if g0 < self.c["split_sure_k"] * lw:
                         self.in_split = True
                     elif g0 < self.c["split_max_k"] * lw:
@@ -261,14 +326,23 @@ class JunctionTracker(object):
                     else:
                         self.in_split = False
                     self.side = {"left": 0, "right": 0}
+                    self._gaps = []
+                    self._pair_slopes = []
                 else:
                     side = None
                     if self.side["left"] != self.side["right"]:
                         side = "left" if self.side["left"] > self.side["right"] else "right"
                     if self.in_split:
                         events.append({"type": "split", "side": side})
-                    if self._last_gap is not None and self._last_gap < join:
-                        events.append({"type": "merge", "side": side})
+                    converging = (len(self._gaps) >= 3 and self._gaps[-1] < self._gaps[0] - 0.3 * lw)
+                    if self._last_gap is not None and (
+                            self._last_gap < join
+                            or (converging and self._last_gap < self.c["merge_conv_k"] * lw)):
+                        ps = self._pair_slopes
+                        slopes = None
+                        if ps:
+                            slopes = (sum(a for a, _ in ps) / len(ps), sum(b for _, b in ps) / len(ps))
+                        events.append({"type": "merge", "side": side, "slopes": slopes})
                     self.in_split = False
                 self.state = obs
                 self._pend = 0
@@ -276,6 +350,7 @@ class JunctionTracker(object):
             self._pend = 0
             if obs == "two":
                 self._last_gap = gap
+                self._gaps = (self._gaps + [gap])[-5:]
 
         if self._fork(an):
             self._fork_n += 1
@@ -283,6 +358,74 @@ class JunctionTracker(object):
             self._fork_n = 0
         self.fork_ahead = self._fork_n >= self.c["fork_frames"]
         return events
+
+
+def _line_x(run, ref, lw, wide_k=2.2):
+    """조각 하나에서 라인 중심 x. 넓은 조각(스퍼·교차가 붙은 것)은 ref 쪽 가장자리에서 반 라인폭 안쪽."""
+    a, b = run
+    if lw is None or (b - a + 1) <= wide_k * lw:
+        return (a + b) / 2.0
+    if abs(a - ref) <= abs(b - ref):
+        return a + lw / 2.0
+    return b - lw / 2.0
+
+
+class TeeTracker(object):
+    """조향 줄에서 라인 조각이 한쪽으로만 넓어지는 순간(옆으로 뻗은 스퍼가 지나감)을 잡는다."""
+
+    def __init__(self, cfg):
+        self.c = cfg["tee"]
+        self.armed = True
+        self._n = 0
+        self._side = None
+        self._off = 0
+        self.last = None
+
+    def _clear(self, an, x, lw):
+        """조향 줄 위·아래(clear_rows 떨어진 줄)에는 내 선만 보통 폭으로 있어야 스퍼 띠로 본다.
+        합류하며 넓어진 선이나 교차는 여러 줄에 걸쳐 넓거나 두 갈래라 여기서 걸러진다."""
+        k = self.c["clear_rows"]
+        for i in (an.ctrl_idx - k, an.ctrl_idx + k):
+            if i < 0 or i >= len(an.raw):
+                continue
+            runs = an.raw[i]
+            if len(runs) != 1:
+                return False
+            a, b = runs[0]
+            if (b - a + 1) > 2.0 * lw or not (a - lw <= x <= b + lw):
+                return False
+        return True
+
+    def update(self, an, tracked_x, lw):
+        """반환: None 또는 {"type": "tee", "side": left|right}"""
+        if lw is None or tracked_x is None:
+            return None
+        runs = an.raw[an.ctrl_idx]
+        hit = None
+        if runs:
+            a, b = min(runs, key=lambda r: 0 if r[0] <= tracked_x <= r[1] else min(abs(r[0] - tracked_x), abs(r[1] - tracked_x)))
+            width = b - a + 1
+            ext_l = (tracked_x - a) - lw / 2.0
+            ext_r = (b - tracked_x) - lw / 2.0
+            if width > self.c["width_k"] * lw and self._clear(an, tracked_x, lw):
+                big, small = max(ext_l, ext_r), min(ext_l, ext_r)
+                if big > self.c["ext_k"] * lw and small < self.c["other_k"] * lw:
+                    hit = "left" if ext_l > ext_r else "right"
+                    self.last = {"width_k": round(width / lw, 1), "ext_k": round(big / lw, 1)}
+        if hit:
+            self._off = 0
+            if self.armed:
+                self._n = self._n + 1 if hit == self._side else 1
+                self._side = hit
+                if self._n >= self.c["confirm_frames"]:
+                    self.armed = False
+                    return {"type": "tee", "side": hit}
+        else:
+            self._n = 0
+            self._off += 1
+            if self._off >= self.c["rearm_frames"]:
+                self.armed = True
+        return None
 
 
 class Follower(object):
@@ -293,8 +436,9 @@ class Follower(object):
         self.last_x = None
         self.prev_err = 0.0
 
-    def target(self, an, choice=None):
-        """조향 목표 x(px). choice가 left/right면 갈림길에서 그쪽 가지를 택한다."""
+    def target(self, an, choice=None, lw=None):
+        """조향 목표 x(px). choice가 left/right면 갈림길에서 그쪽 가지를 택한다.
+        lw(라인폭 px)를 주면 스퍼·교차로 넓어진 조각에서 내 선 쪽 가장자리를 쓴다."""
         if self.last_x is None:
             self.last_x = an.w / 2.0
         ctrl_segs = an.rows[an.ctrl_idx][1]
@@ -306,7 +450,7 @@ class Follower(object):
             order = [an.ctrl_idx] + list(range(an.ctrl_idx + 1, len(an.rows))) \
                 + list(range(an.ctrl_idx - 1, -1, -1))
             for i in order:
-                cand = an.rows[i][1]
+                cand = [_line_x(r, self.last_x, lw) for r in an.raw[i]] if an.raw else an.rows[i][1]
                 if cand:
                     x = min(cand, key=lambda s: abs(s - self.last_x))
                     break
@@ -328,7 +472,7 @@ class Follower(object):
         return left, right
 
 
-def draw_debug(bgr, an, follower=None, junction=None, patch=None, text=None):
+def draw_debug(bgr, an, follower=None, junction=None, patch=None, text=None, tee=None):
     """검출 결과를 그린 디버그 이미지."""
     img = bgr.copy()
     for i, (y, segs) in enumerate(an.rows):
@@ -346,6 +490,8 @@ def draw_debug(bgr, an, follower=None, junction=None, patch=None, text=None):
     if junction is not None:
         lines.append("ctrl:%s%s%s" % (junction.state, " FORK" if junction.fork_ahead else "",
                                        " in_split" if junction.in_split else ""))
+    if tee is not None and not tee.armed:
+        lines.append("tee:" + str(tee._side))
     if text:
         lines.append(text)
     for i, t in enumerate(lines):

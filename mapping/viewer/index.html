@@ -176,6 +176,8 @@ g.node, g.edge { cursor: pointer; }
         <span><svg viewBox="0 0 14 14"><rect x="1" y="1" width="12" height="12" rx="2" fill="var(--patch-orange)"/></svg>색 패치</span>
         <span><svg viewBox="0 0 14 14"><path d="M7 1L13 7L7 13L1 7Z" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.6"/></svg>갈라짐</span>
         <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.5" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.6"/><circle cx="7" cy="7" r="2" fill="var(--ink)"/></svg>합쳐짐</span>
+        <span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.5" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.4"/><path d="M4.5 4.5L9.5 9.5M9.5 4.5L4.5 9.5" stroke="var(--ink)" stroke-width="1.6"/></svg>X자 교차</span>
+        <span><svg viewBox="0 0 14 14"><path d="M1 10H13M7 10V2" stroke="var(--ink)" stroke-width="1.8"/></svg>스퍼(T자)</span>
         <span><svg viewBox="0 0 14 14"><path d="M1 7H13" stroke="var(--muted)" stroke-width="1.6" stroke-dasharray="3 2"/></svg>미탐색</span>
       </span>
       <span class="scalebar"><i id="sbar"></i><span id="sbarText"></span></span>
@@ -219,7 +221,7 @@ g.node, g.edge { cursor: pointer; }
     </section>
   </aside>
 </main>
-<script type="application/json" id="sample-map">{"map_id":"sim_ssafy_mat","version":0,"schema":"topo-v0","unit":"mm","created_at":"2026-11-04T15:36:05","origin_node":"P_orange","nodes":[{"id":"P_green","type":"patch","pos":null,"visits":3,"color":"green"},{"id":"P_orange","type":"patch","pos":null,"visits":4,"color":"orange"},{"id":"P_purple","type":"patch","pos":null,"visits":3,"color":"purple"},{"id":"P_yellow","type":"patch","pos":null,"visits":3,"color":"yellow"},{"id":"M1","type":"merge","pos":null,"visits":2},{"id":"M2","type":"merge","pos":null,"visits":3},{"id":"S1","type":"split","pos":null,"visits":3,"branches":{"left":"E3","right":"E9"}},{"id":"S2","type":"split","pos":null,"visits":3,"branches":{"left":"E7","right":"E10"}}],"edges":[{"id":"E1","from":"P_orange","to":"P_green","branch":null,"length_mm":1060.1,"length_std_mm":3.6,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E2","from":"P_green","to":"S1","branch":null,"length_mm":548.1,"length_std_mm":4.1,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E3","from":"S1","to":"P_purple","branch":"left","length_mm":270.7,"length_std_mm":5.0,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E4","from":"P_purple","to":"M1","branch":null,"length_mm":24.2,"length_std_mm":0.0,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E5","from":"M1","to":"P_yellow","branch":null,"length_mm":1048.9,"length_std_mm":4.3,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E6","from":"P_yellow","to":"S2","branch":null,"length_mm":156.9,"length_std_mm":4.2,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E7","from":"S2","to":"M2","branch":"left","length_mm":830.0,"length_std_mm":4.9,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E8","from":"M2","to":"P_orange","branch":null,"length_mm":675.9,"length_std_mm":6.3,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E9","from":"S1","to":"P_purple","branch":"right","length_mm":209.1,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E10","from":"S2","to":"M2","branch":"right","length_mm":937.8,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1}],"explore":{"complete":true,"unexplored":[]},"warnings":["P_purple→P_yellow 엣지(1회)는 M1 검출 누락으로 보고 제외함"],"debug":{"dropped_edges":[{"from":"P_purple","to":"P_yellow","branch":null,"length_mm":1112.5,"traversals":1,"via":"M1"}],"runs":["sim_s0"],"events":[{"run":"sim_s0","seg":0,"seq":1,"ts":1700000000.85,"type":"patch","d_mm":127.0,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":2,"ts":1700000008.2,"type":"patch","d_mm":1191.3,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":3,"ts":1700000013.05,"type":"split","d_mm":1734.7,"detail":"left","node":"S1"},{"run":"sim_s0","seg":0,"seq":4,"ts":1700000014.0,"type":"patch","d_mm":2008.9,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":5,"ts":1700000014.2,"type":"merge","d_mm":2033.1,"detail":"left","node":"M1"},{"run":"sim_s0","seg":0,"seq":6,"ts":1700000021.7,"type":"patch","d_mm":3085.0,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":7,"ts":1700000023.4,"type":"split","d_mm":3239.6,"detail":"left","node":"S2"},{"run":"sim_s0","seg":0,"seq":8,"ts":1700000028.6,"type":"merge","d_mm":4066.1,"detail":"left","node":"M2"},{"run":"sim_s0","seg":0,"seq":9,"ts":1700000033.5,"type":"patch","d_mm":4739.0,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":10,"ts":1700000040.8,"type":"patch","d_mm":5797.4,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":11,"ts":1700000045.6,"type":"split","d_mm":6347.8,"detail":"right","node":"S1"},{"run":"sim_s0","seg":0,"seq":12,"ts":1700000046.1,"type":"patch","d_mm":6556.9,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":13,"ts":1700000053.9,"type":"patch","d_mm":7669.4,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":14,"ts":1700000055.5,"type":"split","d_mm":7823.8,"detail":"right","node":"S2"},{"run":"sim_s0","seg":0,"seq":15,"ts":1700000061.7,"type":"merge","d_mm":8761.6,"detail":"right","node":"M2"},{"run":"sim_s0","seg":0,"seq":16,"ts":1700000066.55,"type":"patch","d_mm":9444.8,"detail":"orange","node":"P_orange"},{"run":"sim_s0","seg":0,"seq":17,"ts":1700000073.85,"type":"patch","d_mm":10502.5,"detail":"green","node":"P_green"},{"run":"sim_s0","seg":0,"seq":18,"ts":1700000078.7,"type":"split","d_mm":11053.0,"detail":"left","node":"S1"},{"run":"sim_s0","seg":0,"seq":19,"ts":1700000079.65,"type":"patch","d_mm":11320.1,"detail":"purple","node":"P_purple"},{"run":"sim_s0","seg":0,"seq":20,"ts":1700000079.85,"type":"merge","d_mm":11344.3,"detail":"left","node":"M1"},{"run":"sim_s0","seg":0,"seq":21,"ts":1700000087.3,"type":"patch","d_mm":12390.1,"detail":"yellow","node":"P_yellow"},{"run":"sim_s0","seg":0,"seq":22,"ts":1700000089.05,"type":"split","d_mm":12551.8,"detail":"left","node":"S2"},{"run":"sim_s0","seg":0,"seq":23,"ts":1700000094.3,"type":"merge","d_mm":13385.3,"detail":"left","node":"M2"},{"run":"sim_s0","seg":0,"seq":24,"ts":1700000099.2,"type":"patch","d_mm":14057.0,"detail":"orange","node":"P_orange"}]}}</script>
+<script type="application/json" id="sample-map">{"map_id":"sim_ssafy_v2_fix","version":0,"schema":"topo-v0","unit":"mm","created_at":"2026-11-06T09:38:26","origin_node":"P_orange","nodes":[{"id":"P_blue","type":"patch","pos":null,"visits":2,"color":"blue","spur":{"side":"left","seen":2,"length_mm":null},"crossing":false},{"id":"P_green","type":"patch","pos":null,"visits":3,"color":"green","spur":{"side":"left","seen":2,"length_mm":null},"crossing":false},{"id":"P_orange","type":"patch","pos":null,"visits":3,"color":"orange","spur":{"side":"left","seen":3,"length_mm":null},"crossing":false},{"id":"P_purple","type":"patch","pos":null,"visits":3,"color":"purple","spur":null,"crossing":false},{"id":"P_red","type":"patch","pos":null,"visits":2,"color":"red","spur":null,"crossing":false},{"id":"P_yellow","type":"patch","pos":null,"visits":3,"color":"yellow","spur":null,"crossing":true,"through":[["E17","E18"],["E8","E9"]]},{"id":"S1","type":"split","pos":null,"visits":3,"branches":{"left":"E2","right":"E15"}},{"id":"S2","type":"split","pos":null,"visits":3,"branches":{"left":"E5","right":"E16"}},{"id":"S3","type":"split","pos":null,"visits":3,"branches":{"left":"E8","right":"E17"}},{"id":"M1","type":"merge","pos":null,"visits":2},{"id":"M2","type":"merge","pos":null,"visits":3},{"id":"M3","type":"merge","pos":null,"visits":1},{"id":"X1","type":"cross","pos":null,"visits":1,"side":"left","same_spot":["X2"]},{"id":"X2","type":"cross","pos":null,"visits":1,"side":"right","same_spot":["X1"]},{"id":"T1","type":"tee","pos":null,"visits":1,"side":"left"}],"edges":[{"id":"E1","from":"P_orange","to":"S1","branch":null,"length_mm":360.0,"length_std_mm":15.9,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E2","from":"S1","to":"M1","branch":"left","length_mm":349.2,"length_std_mm":1.1,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E3","from":"M1","to":"P_purple","branch":null,"length_mm":34.5,"length_std_mm":5.4,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E4","from":"P_purple","to":"S2","branch":null,"length_mm":195.0,"length_std_mm":4.0,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E5","from":"S2","to":"M2","branch":"left","length_mm":100.2,"length_std_mm":0.8,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E6","from":"M2","to":"P_green","branch":null,"length_mm":39.4,"length_std_mm":2.4,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E7","from":"P_green","to":"S3","branch":null,"length_mm":649.0,"length_std_mm":3.1,"length_src":"odo","traversals":3,"shape":null,"bidirectional":false,"lanes":1},{"id":"E8","from":"S3","to":"P_yellow","branch":"left","length_mm":430.1,"length_std_mm":1.0,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E9","from":"P_yellow","to":"X1","branch":null,"length_mm":351.7,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E10","from":"X1","to":"M3","branch":null,"length_mm":371.9,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E11","from":"M3","to":"P_red","branch":null,"length_mm":30.4,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E12","from":"P_red","to":"T1","branch":null,"length_mm":229.1,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E13","from":"T1","to":"P_blue","branch":null,"length_mm":106.3,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E14","from":"P_blue","to":"P_orange","branch":null,"length_mm":992.0,"length_std_mm":0.2,"length_src":"odo","traversals":2,"shape":null,"bidirectional":false,"lanes":1},{"id":"E15","from":"S1","to":"P_red","branch":"right","length_mm":611.3,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E16","from":"S2","to":"M2","branch":"right","length_mm":97.6,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E17","from":"S3","to":"P_yellow","branch":"right","length_mm":341.7,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E18","from":"P_yellow","to":"X2","branch":null,"length_mm":353.9,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1},{"id":"E19","from":"X2","to":"P_purple","branch":null,"length_mm":675.8,"length_std_mm":0.0,"length_src":"odo","traversals":1,"shape":null,"bidirectional":false,"lanes":1}],"explore":{"complete":true,"unexplored":[]},"warnings":["P_red→P_blue 엣지(1회)는 T1 검출 누락으로 보고 제외함"],"debug":{"dropped_edges":[{"from":"P_red","to":"P_blue","branch":null,"length_mm":343.5,"traversals":1,"via":"T1"}],"runs":["v2f"],"events":[{"run":"v2f","seg":0,"seq":1,"ts":1700000000.833,"type":"patch","d_mm":125.0,"detail":"orange","node":"P_orange"},{"run":"v2f","seg":0,"seq":3,"ts":1700000003.123,"type":"split","d_mm":466.6,"detail":"left","node":"S1"},{"run":"v2f","seg":0,"seq":4,"ts":1700000005.473,"type":"merge","d_mm":816.6,"detail":"left","node":"M1"},{"run":"v2f","seg":0,"seq":5,"ts":1700000005.733,"type":"patch","d_mm":854.9,"detail":"purple","node":"P_purple"},{"run":"v2f","seg":0,"seq":6,"ts":1700000007.023,"type":"split","d_mm":1045.3,"detail":"left","node":"S2"},{"run":"v2f","seg":0,"seq":7,"ts":1700000007.723,"type":"merge","d_mm":1144.9,"detail":"left","node":"M2"},{"run":"v2f","seg":0,"seq":8,"ts":1700000007.983,"type":"patch","d_mm":1183.1,"detail":"green","node":"P_green"},{"run":"v2f","seg":0,"seq":10,"ts":1700000012.623,"type":"split","d_mm":1830.0,"detail":"left","node":"S3"},{"run":"v2f","seg":0,"seq":11,"ts":1700000015.783,"type":"patch","d_mm":2260.8,"detail":"yellow","node":"P_yellow"},{"run":"v2f","seg":0,"seq":13,"ts":1700000018.223,"type":"cross","d_mm":2612.5,"detail":"left","node":"X1"},{"run":"v2f","seg":0,"seq":14,"ts":1700000020.773,"type":"merge","d_mm":2984.4,"detail":"left","node":"M3"},{"run":"v2f","seg":0,"seq":15,"ts":1700000020.983,"type":"patch","d_mm":3014.8,"detail":"red","node":"P_red"},{"run":"v2f","seg":0,"seq":16,"ts":1700000022.523,"type":"tee","d_mm":3243.9,"detail":"left","node":"T1"},{"run":"v2f","seg":0,"seq":17,"ts":1700000023.233,"type":"patch","d_mm":3350.2,"detail":"blue","node":"P_blue"},{"run":"v2f","seg":0,"seq":19,"ts":1700000030.383,"type":"patch","d_mm":4342.0,"detail":"orange","node":"P_orange"},{"run":"v2f","seg":0,"seq":21,"ts":1700000032.923,"type":"split","d_mm":4710.7,"detail":"right","node":"S1"},{"run":"v2f","seg":0,"seq":22,"ts":1700000037.333,"type":"patch","d_mm":5322.0,"detail":"red","node":"P_red"},{"run":"v2f","seg":0,"seq":23,"ts":1700000039.883,"type":"patch","d_mm":5665.5,"detail":"blue","node":"P_blue"},{"run":"v2f","seg":0,"seq":25,"ts":1700000047.033,"type":"patch","d_mm":6657.6,"detail":"orange","node":"P_orange"},{"run":"v2f","seg":0,"seq":27,"ts":1700000049.573,"type":"split","d_mm":7027.2,"detail":"left","node":"S1"},{"run":"v2f","seg":0,"seq":28,"ts":1700000051.923,"type":"merge","d_mm":7375.7,"detail":"left","node":"M1"},{"run":"v2f","seg":0,"seq":29,"ts":1700000052.133,"type":"patch","d_mm":7406.3,"detail":"purple","node":"P_purple"},{"run":"v2f","seg":0,"seq":30,"ts":1700000053.473,"type":"split","d_mm":7603.9,"detail":"right","node":"S2"},{"run":"v2f","seg":0,"seq":31,"ts":1700000054.173,"type":"merge","d_mm":7701.5,"detail":"right","node":"M2"},{"run":"v2f","seg":0,"seq":32,"ts":1700000054.483,"type":"patch","d_mm":7743.7,"detail":"green","node":"P_green"},{"run":"v2f","seg":0,"seq":33,"ts":1700000059.223,"type":"split","d_mm":8396.3,"detail":"right","node":"S3"},{"run":"v2f","seg":0,"seq":34,"ts":1700000061.733,"type":"patch","d_mm":8738.0,"detail":"yellow","node":"P_yellow"},{"run":"v2f","seg":0,"seq":36,"ts":1700000064.273,"type":"cross","d_mm":9091.9,"detail":"right","node":"X2"},{"run":"v2f","seg":0,"seq":37,"ts":1700000069.133,"type":"patch","d_mm":9767.7,"detail":"purple","node":"P_purple"},{"run":"v2f","seg":0,"seq":38,"ts":1700000070.673,"type":"split","d_mm":9964.8,"detail":"left","node":"S2"},{"run":"v2f","seg":0,"seq":39,"ts":1700000071.373,"type":"merge","d_mm":10065.5,"detail":"left","node":"M2"},{"run":"v2f","seg":0,"seq":40,"ts":1700000071.633,"type":"patch","d_mm":10103.4,"detail":"green","node":"P_green"},{"run":"v2f","seg":0,"seq":42,"ts":1700000076.273,"type":"split","d_mm":10751.0,"detail":"left","node":"S3"},{"run":"v2f","seg":0,"seq":43,"ts":1700000079.433,"type":"patch","d_mm":11180.4,"detail":"yellow","node":"P_yellow"}]}}</script>
 <script>
 (function () {
   "use strict";
@@ -427,20 +429,58 @@ g.node, g.edge { cursor: pointer; }
       var t = el("text", { x: Q.x + vx * 50, y: Q.y - vy * 50 + 12, "text-anchor": "middle", "class": "e-label br" }, LS);
       t.textContent = "? " + (u.branch === "left" ? "왼쪽" : "오른쪽");
     });
+    // 같은 자리 교차 잇기(선마다 따로 생긴 교차 노드)
+    var pairsDone = {};
+    S.map.nodes.forEach(function (n) {
+      (n.same_spot || []).forEach(function (o) {
+        var k = [n.id, o].sort().join("|"); if (pairsDone[k] || !S.pos[n.id] || !S.pos[o]) return; pairsDone[k] = 1;
+        var A = sv(S.pos[n.id]), B = sv(S.pos[o]);
+        el("line", { x1: A.x, y1: A.y, x2: B.x, y2: B.y, stroke: "var(--warn)", "stroke-width": 7, "stroke-dasharray": "18 14" }, LD);
+        var t = el("text", { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 - 18, "text-anchor": "middle", "class": "e-label" }, LD);
+        t.textContent = "같은 자리";
+      });
+    });
+    // 노드에서 진행 방향(들어오는 엣지 기준, 화면 좌표)
+    function travelDir(id) {
+      var p = S.pos[id], e = S.map.edges.filter(function (x) { return x.to === id && S.pos[x.from]; })[0];
+      if (!p || !e) return { x: 1, y: 0 };
+      var q = S.pos[e.from], dx = p.x - q.x, dy = p.y - q.y, l = Math.hypot(dx, dy) || 1;
+      return { x: dx / l, y: -dy / l };
+    }
+    function spurStub(g, side, len, isSel) {
+      // 화면 좌표(y 아래)에서 진행 방향의 왼쪽/오른쪽
+      var d = travelDir(g.getAttribute("data-node")), nx, ny;
+      if (side === "left") { nx = d.y; ny = -d.x; } else { nx = -d.y; ny = d.x; }
+      el("line", { x1: 0, y1: 0, x2: nx * len, y2: ny * len, stroke: isSel ? "var(--accent)" : "var(--track)", "stroke-width": 20, "stroke-linecap": "butt" }, g);
+      el("line", { x1: nx * len - ny * 26, y1: ny * len + nx * 26, x2: nx * len + ny * 26, y2: ny * len - nx * 26, stroke: isSel ? "var(--accent)" : "var(--track)", "stroke-width": 9 }, g);
+    }
     // 노드
     S.map.nodes.forEach(function (n) {
       var p = S.pos[n.id]; if (!p) return;
       var P = sv(p), isSel = sel && sel.kind === "node" && sel.id === n.id;
       var g = el("g", { "class": "node", "data-node": n.id, transform: "translate(" + P.x + " " + P.y + ")" }, LN);
       if (S.map.origin_node === n.id) el("circle", { r: 118, fill: "none", stroke: "var(--accent)", "stroke-width": 6, "stroke-dasharray": "14 10" }, g);
+      var ink = isSel ? "var(--accent)" : "var(--ink)";
       if (n.type === "patch") {
+        if (n.spur) spurStub(g, n.spur.side, 210, isSel);
         el("rect", { x: -70, y: -70, width: 140, height: 140, rx: 10, fill: patchVar(n.color),
                      stroke: isSel ? "var(--accent)" : "var(--mat)", "stroke-width": isSel ? 14 : 6 }, g);
-        el("rect", { x: -11, y: -70, width: 22, height: 140, fill: "var(--track)", opacity: 0.85 }, g);
+        if (n.crossing) {
+          el("path", { d: "M-58 -58L58 58M58 -58L-58 58", stroke: "var(--track)", "stroke-width": 20, opacity: 0.85 }, g);
+        } else {
+          var d = travelDir(n.id);
+          el("line", { x1: -d.x * 70, y1: -d.y * 70, x2: d.x * 70, y2: d.y * 70, stroke: "var(--track)", "stroke-width": 22, opacity: 0.85 }, g);
+        }
       } else if (n.type === "split") {
-        el("path", { d: "M0 -52L52 0L0 52L-52 0Z", fill: "var(--panel)", stroke: isSel ? "var(--accent)" : "var(--ink)", "stroke-width": isSel ? 14 : 9 }, g);
+        el("path", { d: "M0 -52L52 0L0 52L-52 0Z", fill: "var(--panel)", stroke: ink, "stroke-width": isSel ? 14 : 9 }, g);
+      } else if (n.type === "cross") {
+        el("circle", { r: 46, fill: "var(--panel)", stroke: ink, "stroke-width": isSel ? 12 : 8 }, g);
+        el("path", { d: "M-24 -24L24 24M24 -24L-24 24", stroke: ink, "stroke-width": 10 }, g);
+      } else if (n.type === "tee") {
+        spurStub(g, n.side || "left", 120, isSel);
+        el("circle", { r: 26, fill: "var(--panel)", stroke: ink, "stroke-width": isSel ? 12 : 8 }, g);
       } else {
-        el("circle", { r: 44, fill: "var(--panel)", stroke: isSel ? "var(--accent)" : "var(--ink)", "stroke-width": isSel ? 14 : 9 }, g);
+        el("circle", { r: 44, fill: "var(--panel)", stroke: ink, "stroke-width": isSel ? 14 : 9 }, g);
         el("circle", { r: 15, fill: isSel ? "var(--accent)" : "var(--ink)" }, g);
       }
       var lab = el("text", { x: 0, y: n.type === "patch" ? 118 : 100, "text-anchor": "middle", "class": "n-label" }, g);
@@ -527,7 +567,7 @@ g.node, g.edge { cursor: pointer; }
   // ---------- 패널 ----------
   function esc(s) { return String(s === null || s === undefined ? "-" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
   function kv(rows) { return rows.map(function (r) { return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>"; }).join(""); }
-  var TYPE_KO = { patch: "색 패치", split: "갈라짐", merge: "합쳐짐" };
+  var TYPE_KO = { patch: "색 패치", split: "갈라짐", merge: "합쳐짐", cross: "X자 교차", tee: "스퍼(T자)" };
 
   function renderSummary() {
     var m = S.map;
@@ -537,12 +577,13 @@ g.node, g.edge { cursor: pointer; }
       ["형식", m.schema || "-"], ["생성", m.created_at || "-"], ["원점", m.origin_node || "-"],
       ["단위", m.unit || "mm"], ["주행 로그", ((m.debug && m.debug.runs) || []).join(", ") || "-"]
     ]);
-    var c = { patch: 0, split: 0, merge: 0 };
+    var c = { patch: 0, split: 0, merge: 0, cross: 0, tee: 0 };
     m.nodes.forEach(function (n) { c[n.type] = (c[n.type] || 0) + 1; });
     var ex = m.explore || {}, un = (ex.unexplored || []).length;
     $("counts").innerHTML =
       '<span class="pill info">노드 ' + m.nodes.length + "</span>" +
-      '<span class="pill info">패치 ' + c.patch + " · 갈라짐 " + c.split + " · 합쳐짐 " + c.merge + "</span>" +
+      '<span class="pill info">패치 ' + c.patch + " · 갈라짐 " + c.split + " · 합쳐짐 " + c.merge +
+        (c.cross ? " · 교차 " + c.cross : "") + (c.tee ? " · 스퍼 " + c.tee : "") + "</span>" +
       '<span class="pill info">엣지 ' + m.edges.length + "</span>" +
       (un ? '<span class="pill warn">미탐색 가지 ' + un + "</span>" : '<span class="pill ok">모든 가지 탐색함</span>');
     var w = m.warnings || [];
@@ -597,6 +638,10 @@ g.node, g.edge { cursor: pointer; }
               ["지난 횟수", obj.visits], ["좌표", obj.pos ? obj.pos.join(", ") + " mm" : "없음"],
               ["들어오는 엣지", ins.map(function (e) { return e.id + "(" + e.from + ")"; }).join(", ") || "-"],
               ["나가는 엣지", outs.map(function (e) { return e.id + "→" + e.to + (e.branch ? "[" + e.branch + "]" : ""); }).join(", ") || "-"]];
+      if (obj.type === "patch") rows.push(["스퍼", obj.spur ? (obj.spur.side === "left" ? "왼쪽" : "오른쪽") + " (" + obj.spur.seen + "/" + obj.visits + "회 봄)" : "없음"]);
+      if (obj.crossing) rows.push(["X자 교차", "패치 위"]);
+      if (obj.through) rows.push(["직진 통과", obj.through.map(function (t) { return t[0] + "→" + t[1]; }).join(", ")]);
+      if (obj.same_spot) rows.push(["같은 자리", obj.same_spot.join(", ")]);
       S.evNode = obj.id;
     } else {
       obj = S.map.edges.filter(function (e) { return e.id === sel.id; })[0]; if (!obj) { d.innerHTML = ""; return; }

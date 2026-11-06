@@ -38,7 +38,8 @@ class SimClock(object):
 
 def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         mode="drive", speed_err=0.05, slip=0.03, vmax_mm_s=500.0, track_mm=140.0,
-        cfg_override=None, quiet=True, max_laps=8, raw_video=False):
+        cfg_override=None, quiet=True, max_laps=8, raw_video=False, start_pose=None,
+        branch_order=("left", "right")):
     rnd = np.random.RandomState(seed)
     os.makedirs(out_dir, exist_ok=True)
     mat = Mat(mat_path)
@@ -49,19 +50,22 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         os.remove(ev_path)
     logger = EventLogger(ev_path, echo=not quiet, clock=clock)
     base = cfg["follow"]["base_speed"]
-    runner = ExploreRunner(cfg, logger, mode=mode, explorer=Explorer(max_laps=max_laps),
+    runner = ExploreRunner(cfg, logger, mode=mode,
+                           explorer=Explorer(max_laps=max_laps, branch_order=branch_order),
                            speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"])
     # 실제 속도는 설정값과 조금 다르다(속도 실측 오차 재현)
     true_scale = 1.0 + speed_err * (2 * rnd.rand() - 1)
     bias = 1.0 + 0.02 * (2 * rnd.rand() - 1)
-    x, y, th = mat.d["start_pose"]
+    x, y, th = start_pose or mat.d["start_pose"]
     th = math.radians(th)
     traj = []
     vw = None
     if video:
+        sx = 480.0 / mat.image.shape[1]
+        top_small = cv2.resize(mat.image, (480, int(round(mat.image.shape[0] * sx))))
+        ch = max(240, top_small.shape[0])
         vw = cv2.VideoWriter(os.path.join(out_dir, "run.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
-                             20, (320 + 480, 360))
-        top_small = cv2.resize(mat.image, (480, 360))
+                             20, (320 + 480, ch))
     raw = None
     if raw_video:   # 로봇 --record와 같은 원본 카메라 영상
         raw = cv2.VideoWriter(os.path.join(out_dir, "camera.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -87,19 +91,18 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
             traj.append([round(x, 1), round(y, 1)])
         if vw is not None:
             dbg = draw_debug(frame, runner.last_an, runner.follow, runner.junc, runner.patch,
-                             "t=%.1fs odo=%.0f" % (t, runner.odo))
+                             "t=%.1fs odo=%.0f" % (t, runner.odo), tee=runner.tee)
             dbg = cv2.resize(dbg, (320, 240))
             top = top_small.copy()
-            sx = 480.0 / mat.image.shape[1]
             for a, b in zip(traj[:-1], traj[1:]):
                 pa, pb = mat.to_px(a), mat.to_px(b)
                 cv2.line(top, (int(pa[0] * sx), int(pa[1] * sx)), (int(pb[0] * sx), int(pb[1] * sx)),
                          (255, 0, 0), 1)
             p = mat.to_px((x, y))
             cv2.circle(top, (int(p[0] * sx), int(p[1] * sx)), 5, (0, 0, 255), -1)
-            canvas = np.full((360, 800, 3), 255, np.uint8)
+            canvas = np.full((ch, 800, 3), 255, np.uint8)
             canvas[:240, :320] = dbg
-            canvas[:, 320:] = top
+            canvas[:top.shape[0], 320:] = top
             vw.write(canvas)
     if not runner.finished:
         runner.stop("sim_timeout")
@@ -129,9 +132,13 @@ def main():
     ap.add_argument("--video", action="store_true", help="카메라 시점+궤적 디버그 영상(run.mp4)")
     ap.add_argument("--raw-video", action="store_true", help="원본 카메라 영상(camera.mp4) - explore.py 재생 시험용")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--start", default=None, help="시작 자세 x,y,각도(도) mm. 기본은 매트 파일의 start_pose")
+    ap.add_argument("--right-first", action="store_true", help="갈림길에서 오른쪽부터 탐색")
     a = ap.parse_args()
+    start = [float(v) for v in a.start.split(",")] if a.start else None
     ev, gt = run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, video=a.video, quiet=not a.verbose,
-                 raw_video=a.raw_video)
+                 raw_video=a.raw_video, start_pose=start,
+                 branch_order=("right", "left") if a.right_first else ("left", "right"))
     print("events:", ev)
     print("finish:", gt["finish_reason"], "sim time %.1fs" % gt["sim_time_s"])
 

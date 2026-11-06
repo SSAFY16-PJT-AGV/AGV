@@ -19,9 +19,11 @@ WORLD_LEN = {
 }
 
 
-def drive_world(policy_choices=None, explorer=None, laps=3, noise=0.0, start_odo=0.0):
+def drive_world(policy_choices=None, explorer=None, laps=3, noise=0.0, start_odo=0.0, lens=None):
     """세계를 따라가며 이벤트를 만든다. explorer가 있으면 갈림길 선택을 맡긴다."""
     import random
+    WORLD = dict(WORLD_LEN)
+    WORLD.update(lens or {})
     rnd = random.Random(1)
     evs = [{"type": "start", "ts": 0, "speed_mm_s": 150, "odo_mm": 0}]
     odo = start_odo
@@ -39,30 +41,30 @@ def drive_world(policy_choices=None, explorer=None, laps=3, noise=0.0, start_odo
     if explorer:
         explorer.on_patch("orange", nonlocal_odo[0])
     for _ in range(laps):
-        add("patch", WORLD_LEN[("orange", "green")], color="green")
+        add("patch", WORLD[("orange", "green")], color="green")
         if explorer:
             explorer.on_patch("green", nonlocal_odo[0])
         c2 = explorer.choose_split(nonlocal_odo[0]) if explorer else choices.pop(0)
-        add("split", WORLD_LEN[("green", "S2")], choice=c2, cmd=c2)
+        add("split", WORLD[("green", "S2")], choice=c2, cmd=c2)
         if explorer:
             explorer.on_split(c2, nonlocal_odo[0])
-        add("patch", WORLD_LEN[("S2", c2, "purple")], color="purple")
+        add("patch", WORLD[("S2", c2, "purple")], color="purple")
         if explorer:
             explorer.on_patch("purple", nonlocal_odo[0])
-        add("merge", WORLD_LEN[("purple", "M2")], from_side="left" if c2 == "right" else "right")
+        add("merge", WORLD[("purple", "M2")], from_side="left" if c2 == "right" else "right")
         if explorer:
             explorer.on_merge(nonlocal_odo[0])
-        add("patch", WORLD_LEN[("M2", "yellow")], color="yellow")
+        add("patch", WORLD[("M2", "yellow")], color="yellow")
         if explorer:
             explorer.on_patch("yellow", nonlocal_odo[0])
         c1 = explorer.choose_split(nonlocal_odo[0]) if explorer else choices.pop(0)
-        add("split", WORLD_LEN[("yellow", "S1")], choice=c1, cmd=c1)
+        add("split", WORLD[("yellow", "S1")], choice=c1, cmd=c1)
         if explorer:
             explorer.on_split(c1, nonlocal_odo[0])
-        add("merge", WORLD_LEN[("S1", c1, "M1")], from_side=c1)
+        add("merge", WORLD[("S1", c1, "M1")], from_side=c1)
         if explorer:
             explorer.on_merge(nonlocal_odo[0])
-        add("patch", WORLD_LEN[("M1", "orange")], color="orange")
+        add("patch", WORLD[("M1", "orange")], color="orange")
         if explorer:
             explorer.on_patch("orange", nonlocal_odo[0])
             if explorer.done:
@@ -96,15 +98,19 @@ class TestBuildMap(unittest.TestCase):
         self.assertEqual(sorted(u["branch"] for u in m["explore"]["unexplored"]), ["right", "right"])
 
     def test_patch_merge_order_swap_is_normalized(self):
-        """보라 패치 위 합류: 들어오는 가지에 따라 merge가 patch보다 먼저 찍혀도 같은 그래프."""
-        evs = drive_world(["left", "left", "right", "right"], laps=2)
-        # 두 번째 바퀴의 purple/merge 순서를 뒤집고 거리도 살짝 앞당김
+        """보라 패치 위 합류: 바퀴마다 merge와 patch의 기록 순서가 뒤바뀌어도(거리 차 < reorder_mm)
+        같은 그래프. 합류가 패치보다 앞으로 고정된다."""
+        evs = drive_world(["left", "left", "right", "right"], laps=2, lens={("purple", "M2"): 15})
         idx = [i for i, e in enumerate(evs) if e.get("color") == "purple"][1]
         p, mg = evs[idx], evs[idx + 1]
-        mg["odo_mm"], p["odo_mm"] = p["odo_mm"] - 20, p["odo_mm"]
+        mg["odo_mm"], p["odo_mm"] = p["odo_mm"] - 15, p["odo_mm"]
         evs[idx], evs[idx + 1] = mg, p
         m = build_map([evs])
         self.assertEqual(len([n for n in m["nodes"] if n["type"] == "merge"]), 2, m["warnings"])
+        self.assertEqual(m["warnings"], [])
+        mp = [e for e in m["edges"] if e["to"] == "P_purple"]
+        self.assertEqual(len(mp), 1)                 # 합류 노드 -> 보라 (한 길)
+        self.assertEqual(mp[0]["from"][0], "M")
 
     def test_missing_detection_warns(self):
         evs = drive_world(["left", "left", "right", "right", "left", "left"], laps=3)
