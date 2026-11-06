@@ -196,5 +196,64 @@ class TestDeadEndRecovery(unittest.TestCase):
                          m["warnings"])
 
 
+@unittest.skipIf(run_sim is None, "sim/ 없음")
+class TestAutoColor(unittest.TestCase):
+    """노란 조명(백열등) 아래: 기본 HSV로는 바탕이 주황으로 잡혀 탐색이 망가지지만,
+    한 바퀴 영상에서 자동으로 잡은 색으로는 끝까지 탐색한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_warm_light(self):
+        import cv2
+        import numpy as np
+        from agv.tools import autocolor as ac
+        gain = np.array((0.70, 0.92, 1.12), np.float32)   # B, G, R
+        orig = Mat.camera_view
+
+        def warm(mat, pose, cam, w=320, h=240):
+            return np.clip(orig(mat, pose, cam, w, h).astype(np.float32) * gain, 0, 255).astype(np.uint8)
+        Mat.camera_view = warm
+        try:
+            lap = os.path.join(self.tmp, "lap")
+            run_sim.run(MAT_V2, lap, seed=3, max_time_s=75, raw_video=True)
+            cap = cv2.VideoCapture(os.path.join(lap, "camera.mp4"))
+            frames = []
+            while True:
+                ok, f = cap.read()
+                if not ok:
+                    break
+                frames.append(f)
+            frames = frames[::2]
+            col = ac.Collector(DEFAULT_CONFIG, ac.base_stats(frames, DEFAULT_CONFIG))
+            for f in frames:
+                col.add(f)
+            res, info = ac.solve(col, DEFAULT_CONFIG)
+            self.assertEqual(sorted(c["name"] for c in info["clusters"]),
+                             sorted(DEFAULT_CONFIG["patch"]["colors"]), info["warnings"])
+            ev, gt = run_sim.run(MAT_V2, os.path.join(self.tmp, "run"), seed=3, max_time_s=300,
+                                 cfg_override=res)
+        finally:
+            Mat.camera_view = orig
+        self.assertEqual(gt["finish_reason"], "explore_explored")
+        m = build_map([read_events(ev)])
+        self.assertEqual(len([n for n in m["nodes"] if n["type"] == "patch"]), 6)
+        self.assertTrue(m["explore"]["complete"])
+
+    def test_names_follow_hue_order(self):
+        from agv.tools.autocolor import _assign_names, _range_center
+        nominal = dict((k, _range_center(v)) for k, v in DEFAULT_CONFIG["patch"]["colors"].items())
+        # 조명 때문에 전부 8 정도 밀려도 순서대로 이름이 붙는다
+        got = _assign_names([8, 20, 36, 73, 117, 155], nominal)
+        self.assertEqual([got[h] for h in [8, 20, 36, 73, 117, 155]],
+                         ["red", "orange", "yellow", "green", "blue", "purple"])
+        # 하나가 빠져도(초록 없음) 나머지는 맞게
+        got = _assign_names([2, 13, 28, 110, 147], nominal)
+        self.assertEqual(sorted(got.values()), ["blue", "orange", "purple", "red", "yellow"])
+
+
 if __name__ == "__main__":
     unittest.main()

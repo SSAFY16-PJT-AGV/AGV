@@ -42,7 +42,7 @@ python3 -m unittest discover -s agv/tests      # sim/이 없으면 시뮬레이�
 | 순서 | 명령 | 통과 기준 |
 | --- | --- | --- |
 | 카메라 자세 | `python3 -m agv.tools.camtool snap` | `data/snap/debug.png`에서 가로줄마다 초록 점이 하나씩 찍힘 |
-| 색 6개 | 패치마다 `snap` 후 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h` | 여섯 색의 H 범위가 서로 안 겹치게 `patch.colors`에 적힘. 빨강·주황·노랑, 짙은 보라를 특히 확인 |
+| 색 6개 (자동) | `python3 -m agv.explore --mode passive --record --view`로 손으로 밀어 한 바퀴 → `python3 -m agv.tools.autocolor data/runs/<시각>` → 확인 후 `--write` | 여섯 색이 다 잡히고, `autocolor.png` 이름표가 실제 패치와 맞고, "새 설정" 패치 순서가 실제로 지나간 순서와 같음 |
 | 속도 | `python3 -m agv.tools.camtool speed --enable-motors` | 나온 값을 `robot.speed_mm_s`에 적음 |
 | 판정 지점 거리 | `snap`의 파란 가로줄이 바닥 어디인지 줄자로 잼 | 그 값을 `geom.ctrl_ahead_mm`에 적음(궤도 가운데 기준) |
 

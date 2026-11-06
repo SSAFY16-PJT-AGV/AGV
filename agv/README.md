@@ -14,6 +14,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더 |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
 | `tools/camtool.py` | 현장 보정: 화면 저장, HSV 측정, 속도 측정 |
+| `tools/autocolor.py` | 한 바퀴 영상에서 패치 색 범위·문턱 자동 보정 |
 | `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
 | `config/explore.json` | 현장 값(속도, HSV, 카메라). `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
 
@@ -29,7 +30,13 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - 이 자세를 주행 자세로 정하고, 서보 각도를 `config/explore.json`의 `arm.servo_angles`에 적어 두면 `--set-arm`으로 다시 맞출 수 있다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
    - **캘리브레이션 사진**(다음 단계인 실제 축척 형상·AprilTag용, 지금 맵 생성에는 필요 없음): `python3 -m agv.tools.camtool snap --count 25 --out data/calib`로 원본 해상도 25장을 1.5초 간격으로 찍는다. 그동안 체커보드(노트북 화면에 띄워도 됨)를 화면 가운데·귀퉁이·가장자리로, 기울기도 바꿔 가며 옮긴다. 계산은 나중에 노트북에서 한다.
-2. **색 재기**: 패치마다(지금 맵은 6색) 그리고 라인 위에서 각각 `snap`을 찍고 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`로 HSV를 잰다. 결과로 `patch.colors`(H 범위)와 `line.v_max`를 고친다. 빨강(H 0~6, 170~180)·주황(7~18)·노랑(19~38)이 가깝고, 짙은 보라는 어두워서 라인으로 잡힐 수 있으니 특히 확인한다.
+2. **색 자동으로 잡기**: 맵을 한 바퀴 도는 영상에서 패치 색 범위를 자동으로 잡는다.
+   - `python3 -m agv.explore --mode passive --record --view`로 로봇을 손으로 밀어 모든 패치를 한 번씩 지나게 한 바퀴 돈다(검출이 틀려도 상관없음, 영상만 있으면 됨).
+   - `python3 -m agv.tools.autocolor data/runs/<시각>` → 색마다 새 H 범위, 바꿀 문턱, **그 영상에서 잡히는 패치 순서(기존 설정 vs 새 설정)**가 나온다. `autocolor.png`에서 이름표와 실제 패치 사진이 맞는지 본다.
+   - 괜찮으면 `--write`를 붙여 다시 실행한다. `config/explore.json`에 쓰고 원래 파일은 `.bak-<시각>`으로 남는다. 라인 문턱(`line.v_max` 등)은 지금 값이 안전한 범위면 그대로 둔다.
+   - 조명이 바뀌면(낮/밤, 다른 강의실) 한 바퀴 다시 찍어 돌리면 된다. 녹화 없이 `--camera gst --seconds 60`으로 카메라에서 바로 찍을 수도 있다.
+   - 이름은 무지개 순서(빨강→주황→노랑→초록→파랑→보라)로 붙인다. 매트에 일부 색만 있으면 `--colors red,blue,...`로 알려 준다. 바닥·신발 같은 다른 색이 잡히면 화면에 안 들어오게 다시 찍는다.
+   - 손으로 재야 할 때: `snap` 후 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`.
 3. **검출만 확인(모터 없음)**: `python3 -m agv.explore --mode passive --record`
    - 로봇을 손으로 밀어 한 바퀴 돌린다. 터미널에 `patch`(맵의 색 전부), `split`, `merge` 이벤트가 찍혀야 한다.
    - 결과 폴더의 `debug/*.jpg`에서 검출 상태를, `camera.mp4`로는 노트북에서 다시 돌려 볼 수 있다: `python3 -m agv.explore --camera video:<폴더>/camera.mp4`
