@@ -43,10 +43,11 @@ def load_config(path):
 
 
 def make_ask_fn(motors):
-    def ask(suggestion):
+    def ask(suggestion, hint=None):
         motors.stop()
         try:
-            ans = input(u"\n갈림길이에요. [l]왼쪽 / [r]오른쪽 (Enter = 추천 %s): " % suggestion).strip().lower()
+            ans = input(u"\n갈림길이에요%s. [l]왼쪽 / [r]오른쪽 (Enter = 추천 %s): " % (
+                u"(%s)" % hint if hint else u"", suggestion)).strip().lower()
         except EOFError:
             ans = ""
         if ans.startswith("l"):

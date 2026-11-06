@@ -254,6 +254,9 @@ class ExploreRunner(object):
 
         for je in jevents:
             if je["type"] == "vee":
+                # 현장 확인용: 모드와 상관없이 본 것은 남긴다(passive·영상 재생에서도 값 확인 가능)
+                self.log.log("note", self._odo(), msg="vee_seen", side=je["side"], cont=je.get("cont"),
+                             frames=je.get("frames"), gaps=je.get("gaps"))
                 if (self.mode != "passive" and self.choice is None and self.v_plan is None
                         and self.crossing is None and je["side"] is not None):
                     self._flush_pending()
@@ -306,7 +309,11 @@ class ExploreRunner(object):
         if dead:
             choice = suggestion
         elif self.mode == "ask" and self.ask_fn is not None:
-            choice = self.ask_fn(suggestion) or suggestion
+            try:
+                choice = self.ask_fn(suggestion, hint=u"급한 가지(V자)가 %s에 있음" % (
+                    u"오른쪽" if side == "right" else u"왼쪽")) or suggestion
+            except TypeError:
+                choice = self.ask_fn(suggestion) or suggestion
         else:
             choice = suggestion
         self.vee_mute_until = j_pos + 120.0

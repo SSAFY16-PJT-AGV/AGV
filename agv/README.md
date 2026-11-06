@@ -14,9 +14,12 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더 |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
 | `tools/camtool.py` | 현장 보정: 화면 저장, HSV 측정, 속도 측정 |
+| `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
 | `config/explore.json` | 현장 값(속도, HSV, 카메라). `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
 
 ## 현장 순서
+
+막다른 길·V자까지 단계별로 시험하는 체크리스트는 [FIELD_TEST.md](FIELD_TEST.md)에 있다. 주행 결과 요약은 `python3 -m agv.tools.runlog data/runs/<시각>`으로 본다.
 
 저장소 루트에서 실행한다. 주피터 노트북이 카메라를 잡고 있으면 먼저 그 커널을 끈다.
 
@@ -28,7 +31,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - **캘리브레이션 사진**(다음 단계인 실제 축척 형상·AprilTag용, 지금 맵 생성에는 필요 없음): `python3 -m agv.tools.camtool snap --count 25 --out data/calib`로 원본 해상도 25장을 1.5초 간격으로 찍는다. 그동안 체커보드(노트북 화면에 띄워도 됨)를 화면 가운데·귀퉁이·가장자리로, 기울기도 바꿔 가며 옮긴다. 계산은 나중에 노트북에서 한다.
 2. **색 재기**: 패치마다(지금 맵은 6색) 그리고 라인 위에서 각각 `snap`을 찍고 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`로 HSV를 잰다. 결과로 `patch.colors`(H 범위)와 `line.v_max`를 고친다. 빨강(H 0~6, 170~180)·주황(7~18)·노랑(19~38)이 가깝고, 짙은 보라는 어두워서 라인으로 잡힐 수 있으니 특히 확인한다.
 3. **검출만 확인(모터 없음)**: `python3 -m agv.explore --mode passive --record`
-   - 로봇을 손으로 밀어 한 바퀴 돌린다. 터미널에 `patch`(4색), `split`, `merge` 이벤트가 찍혀야 한다.
+   - 로봇을 손으로 밀어 한 바퀴 돌린다. 터미널에 `patch`(맵의 색 전부), `split`, `merge` 이벤트가 찍혀야 한다.
    - 결과 폴더의 `debug/*.jpg`에서 검출 상태를, `camera.mp4`로는 노트북에서 다시 돌려 볼 수 있다: `python3 -m agv.explore --camera video:<폴더>/camera.mp4`
 4. **속도 재기**: `python3 -m agv.tools.camtool speed --enable-motors` → 간 거리를 입력해 나온 값을 `robot.speed_mm_s`에 넣는다. 방향이 반대면 `robot.invert_left/right`를 고친다.
 5. **판정 지점 거리 재기**: `snap`의 `debug.png`에서 파란 가로줄이 바닥 어디에 해당하는지 자로 재서 `geom.ctrl_ahead_mm`에 넣는다(차체 궤도 가운데 기준).
