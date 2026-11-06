@@ -1,0 +1,466 @@
+{
+ "map_id": "sim_ssafy_mat",
+ "version": 0,
+ "schema": "topo-v0",
+ "unit": "mm",
+ "created_at": "2026-11-04T15:36:05",
+ "origin_node": "P_orange",
+ "nodes": [
+  {
+   "id": "P_green",
+   "type": "patch",
+   "pos": null,
+   "visits": 3,
+   "color": "green"
+  },
+  {
+   "id": "P_orange",
+   "type": "patch",
+   "pos": null,
+   "visits": 4,
+   "color": "orange"
+  },
+  {
+   "id": "P_purple",
+   "type": "patch",
+   "pos": null,
+   "visits": 3,
+   "color": "purple"
+  },
+  {
+   "id": "P_yellow",
+   "type": "patch",
+   "pos": null,
+   "visits": 3,
+   "color": "yellow"
+  },
+  {
+   "id": "M1",
+   "type": "merge",
+   "pos": null,
+   "visits": 2
+  },
+  {
+   "id": "M2",
+   "type": "merge",
+   "pos": null,
+   "visits": 3
+  },
+  {
+   "id": "S1",
+   "type": "split",
+   "pos": null,
+   "visits": 3,
+   "branches": {
+    "left": "E3",
+    "right": "E9"
+   }
+  },
+  {
+   "id": "S2",
+   "type": "split",
+   "pos": null,
+   "visits": 3,
+   "branches": {
+    "left": "E7",
+    "right": "E10"
+   }
+  }
+ ],
+ "edges": [
+  {
+   "id": "E1",
+   "from": "P_orange",
+   "to": "P_green",
+   "branch": null,
+   "length_mm": 1060.1,
+   "length_std_mm": 3.6,
+   "length_src": "odo",
+   "traversals": 3,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E2",
+   "from": "P_green",
+   "to": "S1",
+   "branch": null,
+   "length_mm": 548.1,
+   "length_std_mm": 4.1,
+   "length_src": "odo",
+   "traversals": 3,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E3",
+   "from": "S1",
+   "to": "P_purple",
+   "branch": "left",
+   "length_mm": 270.7,
+   "length_std_mm": 5.0,
+   "length_src": "odo",
+   "traversals": 2,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E4",
+   "from": "P_purple",
+   "to": "M1",
+   "branch": null,
+   "length_mm": 24.2,
+   "length_std_mm": 0.0,
+   "length_src": "odo",
+   "traversals": 2,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E5",
+   "from": "M1",
+   "to": "P_yellow",
+   "branch": null,
+   "length_mm": 1048.9,
+   "length_std_mm": 4.3,
+   "length_src": "odo",
+   "traversals": 2,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E6",
+   "from": "P_yellow",
+   "to": "S2",
+   "branch": null,
+   "length_mm": 156.9,
+   "length_std_mm": 4.2,
+   "length_src": "odo",
+   "traversals": 3,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E7",
+   "from": "S2",
+   "to": "M2",
+   "branch": "left",
+   "length_mm": 830.0,
+   "length_std_mm": 4.9,
+   "length_src": "odo",
+   "traversals": 2,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E8",
+   "from": "M2",
+   "to": "P_orange",
+   "branch": null,
+   "length_mm": 675.9,
+   "length_std_mm": 6.3,
+   "length_src": "odo",
+   "traversals": 3,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E9",
+   "from": "S1",
+   "to": "P_purple",
+   "branch": "right",
+   "length_mm": 209.1,
+   "length_std_mm": 0.0,
+   "length_src": "odo",
+   "traversals": 1,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  },
+  {
+   "id": "E10",
+   "from": "S2",
+   "to": "M2",
+   "branch": "right",
+   "length_mm": 937.8,
+   "length_std_mm": 0.0,
+   "length_src": "odo",
+   "traversals": 1,
+   "shape": null,
+   "bidirectional": false,
+   "lanes": 1
+  }
+ ],
+ "explore": {
+  "complete": true,
+  "unexplored": []
+ },
+ "warnings": [
+  "P_purple→P_yellow 엣지(1회)는 M1 검출 누락으로 보고 제외함"
+ ],
+ "debug": {
+  "dropped_edges": [
+   {
+    "from": "P_purple",
+    "to": "P_yellow",
+    "branch": null,
+    "length_mm": 1112.5,
+    "traversals": 1,
+    "via": "M1"
+   }
+  ],
+  "runs": [
+   "sim_s0"
+  ],
+  "events": [
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 1,
+    "ts": 1700000000.85,
+    "type": "patch",
+    "d_mm": 127.0,
+    "detail": "orange",
+    "node": "P_orange"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 2,
+    "ts": 1700000008.2,
+    "type": "patch",
+    "d_mm": 1191.3,
+    "detail": "green",
+    "node": "P_green"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 3,
+    "ts": 1700000013.05,
+    "type": "split",
+    "d_mm": 1734.7,
+    "detail": "left",
+    "node": "S1"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 4,
+    "ts": 1700000014.0,
+    "type": "patch",
+    "d_mm": 2008.9,
+    "detail": "purple",
+    "node": "P_purple"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 5,
+    "ts": 1700000014.2,
+    "type": "merge",
+    "d_mm": 2033.1,
+    "detail": "left",
+    "node": "M1"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 6,
+    "ts": 1700000021.7,
+    "type": "patch",
+    "d_mm": 3085.0,
+    "detail": "yellow",
+    "node": "P_yellow"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 7,
+    "ts": 1700000023.4,
+    "type": "split",
+    "d_mm": 3239.6,
+    "detail": "left",
+    "node": "S2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 8,
+    "ts": 1700000028.6,
+    "type": "merge",
+    "d_mm": 4066.1,
+    "detail": "left",
+    "node": "M2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 9,
+    "ts": 1700000033.5,
+    "type": "patch",
+    "d_mm": 4739.0,
+    "detail": "orange",
+    "node": "P_orange"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 10,
+    "ts": 1700000040.8,
+    "type": "patch",
+    "d_mm": 5797.4,
+    "detail": "green",
+    "node": "P_green"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 11,
+    "ts": 1700000045.6,
+    "type": "split",
+    "d_mm": 6347.8,
+    "detail": "right",
+    "node": "S1"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 12,
+    "ts": 1700000046.1,
+    "type": "patch",
+    "d_mm": 6556.9,
+    "detail": "purple",
+    "node": "P_purple"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 13,
+    "ts": 1700000053.9,
+    "type": "patch",
+    "d_mm": 7669.4,
+    "detail": "yellow",
+    "node": "P_yellow"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 14,
+    "ts": 1700000055.5,
+    "type": "split",
+    "d_mm": 7823.8,
+    "detail": "right",
+    "node": "S2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 15,
+    "ts": 1700000061.7,
+    "type": "merge",
+    "d_mm": 8761.6,
+    "detail": "right",
+    "node": "M2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 16,
+    "ts": 1700000066.55,
+    "type": "patch",
+    "d_mm": 9444.8,
+    "detail": "orange",
+    "node": "P_orange"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 17,
+    "ts": 1700000073.85,
+    "type": "patch",
+    "d_mm": 10502.5,
+    "detail": "green",
+    "node": "P_green"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 18,
+    "ts": 1700000078.7,
+    "type": "split",
+    "d_mm": 11053.0,
+    "detail": "left",
+    "node": "S1"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 19,
+    "ts": 1700000079.65,
+    "type": "patch",
+    "d_mm": 11320.1,
+    "detail": "purple",
+    "node": "P_purple"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 20,
+    "ts": 1700000079.85,
+    "type": "merge",
+    "d_mm": 11344.3,
+    "detail": "left",
+    "node": "M1"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 21,
+    "ts": 1700000087.3,
+    "type": "patch",
+    "d_mm": 12390.1,
+    "detail": "yellow",
+    "node": "P_yellow"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 22,
+    "ts": 1700000089.05,
+    "type": "split",
+    "d_mm": 12551.8,
+    "detail": "left",
+    "node": "S2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 23,
+    "ts": 1700000094.3,
+    "type": "merge",
+    "d_mm": 13385.3,
+    "detail": "left",
+    "node": "M2"
+   },
+   {
+    "run": "sim_s0",
+    "seg": 0,
+    "seq": 24,
+    "ts": 1700000099.2,
+    "type": "patch",
+    "d_mm": 14057.0,
+    "detail": "orange",
+    "node": "P_orange"
+   }
+  ]
+ }
+}

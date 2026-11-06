@@ -1,0 +1,48 @@
+{
+  "_note": "agv/linecam.py DEFAULT_CONFIG를 덮어쓰는 값만 적는다. 현장에서 tools/camtool.py로 재서 고칠 것.",
+  "robot": {
+    "id": "agv1",
+    "speed_mm_s": 150,
+    "_speed_note": "follow.base_speed로 직진할 때 실제 속도(mm/s)의 처음 짐작값. patch.length_mm를 넣으면 패치를 지날 때마다 자동으로 다시 재므로 대충 둬도 된다. 패치 길이를 안 넣을 때만 camtool speed로 잰다.",
+    "invert_left": false,
+    "invert_right": false,
+    "trim": 0.0
+  },
+  "camera": {
+    "width": 320,
+    "height": 240,
+    "capture_width": 1280,
+    "capture_height": 720,
+    "fps": 30,
+    "flip": 0,
+    "lock_exposure": true
+  },
+  "arm": {
+    "_note": "--set-arm일 때만 적용. 1번=카메라 좌우, 5번=카메라 상하(+가 아래). 주행 자세를 실물에서 정한 뒤 적을 것.",
+    "servo_angles": {
+      "1": 0,
+      "5": 25
+    }
+  },
+  "patch": {
+    "_length_note": "색 패치의 진행 방향 길이(mm, 자로 한 번 잼). 넣으면 패치를 지날 때마다 실제 속도를 다시 재서 이동거리를 보정한다(배터리·바닥 차이). null이면 끔.",
+    "length_mm": null
+  },
+  "follow": {
+    "base_speed": 0.3,
+    "kp": 0.35,
+    "kd": 0.04
+  },
+  "geom": {
+    "_note": "차체 회전 중심(궤도 가운데)에서 바닥 판정 지점까지 거리(mm). camtool snap의 debug.png 파란 가로줄이 바닥 어디인지 자를 대고 잰 값을 ctrl_ahead_mm에 넣는다. patch_ahead_mm은 우선 같은 값으로 둔다.",
+    "ctrl_ahead_mm": 116,
+    "patch_ahead_mm": 125
+  },
+  "recover": {
+    "_note": "막다른 길(스퍼)로 잘못 들어갔을 때 되돌아 나오기. 후진은 모터 명령 x speed_mm_s로 거리를 재므로, 후진 속도가 전진과 많이 다르면 back_extra_mm로 보정한다.",
+    "window_mm": 600,
+    "reverse_speed": 0.18,
+    "pivot_speed": 0.22,
+    "back_extra_mm": 10
+  }
+}
