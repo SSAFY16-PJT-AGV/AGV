@@ -255,5 +255,63 @@ class TestAutoColor(unittest.TestCase):
         self.assertEqual(sorted(got.values()), ["blue", "orange", "purple", "red", "yellow"])
 
 
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestSpeedCal(unittest.TestCase):
+    """실제 속도가 설정보다 20% 느리고 1분에 5%씩 더 느려져도(배터리), 패치로 속도를 다시 재서
+    패치 사이 거리가 맞게 나온다. 보정이 없으면 25~30% 길게 나온다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_battery_drift(self):
+        import numpy as np
+        ev, gt = run_sim.run(MAT_V2, self.tmp, seed=3, max_time_s=300, speed_scale=0.8, speed_drift=0.05,
+                             cfg_override={"patch": {"length_mm": 159.3}})   # 도안 패치 진행 방향 길이 평균
+        self.assertEqual(gt["finish_reason"], "explore_explored")
+        evs = read_events(ev)
+        ot = np.array(gt["odo_true"])
+        pts = [e for e in evs if e["type"] == "patch"]
+        errs = []
+        for a, b in zip(pts[1:-1], pts[2:]):      # 첫 패치를 지나 첫 측정이 들어간 뒤부터
+            true = np.interp(b["ts"], ot[:, 0], ot[:, 1]) - np.interp(a["ts"], ot[:, 0], ot[:, 1])
+            errs.append((b["odo_mm"] - a["odo_mm"]) / true - 1)
+        self.assertLess(abs(np.median(errs)), 0.04, errs)
+        self.assertLess(np.percentile(np.abs(errs), 90), 0.12, errs)
+        cal = [e for e in evs if e.get("msg") == "speed_cal" and "reject" not in e]
+        self.assertGreaterEqual(len(cal), 4)
+        # 마지막 보정값이 그 시점 실제 속도와 6% 안
+        t_last = cal[-1]["ts"] - evs[0]["ts"]
+        true_k = 150.0 * 0.8 * (1 - 0.05 * t_last / 60.0)
+        self.assertLess(abs(cal[-1]["k"] / true_k - 1), 0.06, (cal[-1], true_k))
+
+
+class TestSpeedCalUnit(unittest.TestCase):
+    def test_exact_on_synthetic_patch(self):
+        import numpy as np
+        from agv.speedcal import SpeedCal
+        from agv.linecam import merge_config
+
+        class An(object):
+            pass
+        cfg = merge_config(DEFAULT_CONFIG, {"patch": {"length_mm": 150.0}})
+        cal = SpeedCal(cfg, k0=200.0)
+        k_true, du = 120.0, 0.05                     # 기본 속도 1초 = 120mm, 프레임마다 0.05초어치
+        rows = np.linspace(400, 120, 10)             # 줄마다 바닥 거리(mm), 위 줄이 멀다
+        res = None
+        for i in range(120):
+            u = i * du
+            front = 450 - k_true * u                 # 패치 앞 가장자리 위치(로봇 기준 mm)
+            an = An()
+            an.sat_rows = [float(np.clip((r - front) / 8.0 + 0.5, 0, 1) * np.clip((front + 150 - r) / 8.0 + 0.5, 0, 1)) * 0.6
+                           for r in rows]
+            res = cal.update(an, u, (0.3, 0.3)) or res
+        self.assertIsNotNone(res)
+        self.assertEqual(res["rows"], 10)
+        self.assertAlmostEqual(cal.k, k_true, delta=1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,10 +43,10 @@ python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레
 | --- | --- | --- |
 | 카메라 자세 | `python3 -m agv.tools.camtool snap` | `data/snap/debug.png`에서 가로줄마다 초록 점이 하나씩 찍힘 |
 | 색 6개 (자동) | `python3 -m agv.explore --mode passive --record --view`로 손으로 밀어 한 바퀴 → `python3 -m agv.tools.autocolor data/runs/<시각>` → 확인 후 `--write` | 여섯 색이 다 잡히고, `autocolor.png` 이름표가 실제 패치와 맞고, "새 설정" 패치 순서가 실제로 지나간 순서와 같음 |
-| 속도 | `python3 -m agv.tools.camtool speed --enable-motors` | 나온 값을 `robot.speed_mm_s`에 적음 |
+| 패치 길이 | 패치의 진행 방향 길이를 자로 잼 | 그 값을 `patch.length_mm`에 적음. 주행 중 패치마다 속도를 자동으로 다시 잰다(속도 측정 불필요) |
 | 판정 지점 거리 | `snap`의 파란 가로줄이 바닥 어디인지 줄자로 잼 | 그 값을 `geom.ctrl_ahead_mm`에 적음(궤도 가운데 기준) |
 
-> `robot.speed_mm_s`와 `geom.ctrl_ahead_mm`은 막다른 길에서 후진하는 거리와 V자에서 회전을 시작하는 지점을 정한다. 대충 넣으면 4·5단계가 어긋난다.
+> 속도(`patch.length_mm`로 자동 보정)와 `geom.ctrl_ahead_mm`은 막다른 길에서 후진하는 거리와 V자에서 회전을 시작하는 지점을 정한다. `ctrl_ahead_mm`을 대충 넣으면 4·5단계가 어긋난다.
 
 ## 2. 검출만 확인 — 손으로 밀기 (모터 없음)
 
@@ -84,7 +84,9 @@ python3 -m agv.explore --mode ask --enable-motors --record --view
 - [ ] 곡선과 교차에서 선을 놓치지 않고 한 바퀴를 돈다. `runlog`에 `gap reason=line_lost`가 없어야 한다.
 - [ ] 노랑 위 교차를 지날 때 꺾이지 않고 직진한다.
 
-**안 되면**: 흔들리면 `follow.base_speed`를 0.3에서 0.25로 낮추고 `follow.kp`를 조정한다. 속도를 바꿨으면 1단계 속도 측정을 다시 한다.
+- [ ] `runlog`의 "속도 보정(패치)" 칸에서 받아들인 측정이 한 바퀴에 3번 이상이고, 잰 값들이 서로 10% 안이다.
+
+**안 되면**: 흔들리면 `follow.base_speed`를 0.3에서 0.25로 낮추고 `follow.kp`를 조정한다. 속도 보정이 계속 `[버림: turn]`이면 패치 근처에서 흔들리는 것이니 위 조정을 먼저 하고, `[버림: spread]`면 패치 색이 고르게 안 잡히는 것이니 1단계 색 보정을 다시 한다. 줄자로 잰 패치 사이 거리와 맵 엣지 길이가 통째로 몇 % 어긋나면 `patch.length_mm`를 다시 잰다.
 
 ## 4. 막다른 길 되돌아 나오기 (빨강 스퍼)
 
@@ -136,7 +138,7 @@ python3 -m agv.explore --mode ask --enable-motors --record --view
 | 증상 | 원인·고칠 값 |
 | --- | --- |
 | 아예 묻지 않음 | `vee_seen`이 없으면 7절 방법으로 `junction.vee_max_frames`(5)·`vee_cont_px`(4)를 맞춘다 |
-| 만나는 점보다 일찍 또는 늦게 회전 | `geom.ctrl_ahead_mm`, `robot.speed_mm_s` 측정을 다시 한다 |
+| 만나는 점보다 일찍 또는 늦게 회전 | `geom.ctrl_ahead_mm` 측정을 다시 한다. 속도 보정이 아직 한 번도 안 됐으면(`runlog`) 패치를 하나 지난 뒤 시험한다 |
 | 회전 뒤 원래 곡선을 탐 | `recover.pivot_speed`를 낮추고 `pivot_center`를 0.10으로 줄인다 |
 | 회전 뒤 S자 선을 지나쳐 계속 돎 | `pivot_center`를 0.20으로 늘린다 |
 | 그래도 불안정 | 이 가지만 시작 각도를 20~30도로 완만하게 다시 붙이면 일반 갈림길로 처리된다(시뮬레이션 수정안 `ssafy_v2_fix`) |

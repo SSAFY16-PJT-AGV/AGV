@@ -39,6 +39,7 @@ X자 교차 처리
 import collections
 
 from .linecam import Follower, JunctionTracker, PatchTracker, TeeTracker, analyze
+from .speedcal import SpeedCal
 from .topo import Explorer
 
 MODES = ("drive", "ask", "passive")
@@ -66,7 +67,11 @@ class ExploreRunner(object):
         self.mode = mode
         self.ex = explorer or Explorer()
         self.ask_fn = ask_fn
-        self.speed_mm_s = float(speed_mm_s)
+        self.speed_mm_s = float(speed_mm_s)   # 기본 속도의 실제 mm/s. 패치 길이를 알면 지날 때마다 다시 잼
+        self.cal = SpeedCal(cfg, speed_mm_s)
+        if mode == "passive":
+            self.cal.enabled = False          # 손으로 밀 때는 모터 명령이 없음
+        self.u = 0.0                          # 적분한 모터 명령(기본 속도로 달린 초)
         self.patch = PatchTracker(cfg)
         self.junc = JunctionTracker(cfg)
         self.tee = TeeTracker(cfg)
@@ -100,7 +105,8 @@ class ExploreRunner(object):
         self.last_an = None
         self.last_cmd = (0.0, 0.0)
         self.log.log("start", self._odo(), robot=robot_id, mode=mode,
-                     speed_mm_s=self.speed_mm_s, base_speed=cfg["follow"]["base_speed"],
+                     speed_mm_s=self.speed_mm_s, speedcal=self.cal.enabled,
+                     base_speed=cfg["follow"]["base_speed"],
                      geom={"ctrl_ahead_mm": self.ctrl_ahead, "patch_ahead_mm": self.patch_ahead},
                      map_hint=map_hint)
 
@@ -176,6 +182,13 @@ class ExploreRunner(object):
         self.last_an = an
         self._hist.append((self.t, self.odo))
         kc = self.cfg["junction"]["confirm_frames"]
+        if self.state != "follow":
+            self.cal.reset()
+        else:
+            res = self.cal.update(an, self.u, self.last_cmd)
+            if res is not None:
+                self.speed_mm_s = self.cal.k
+                self.log.log("note", self._odo(), msg="speed_cal", color=self.patch.active, **res)
         if self.state == "reverse":
             return self._step_reverse(an, dt)
         if self.state == "pivot":
@@ -359,7 +372,9 @@ class ExploreRunner(object):
     def _integrate(self, left, right, dt):
         """모터 명령으로 이동거리를 적분한다(후진은 뺀다)."""
         base = self.cfg["follow"]["base_speed"]
-        self.odo += self.speed_mm_s * ((left + right) / 2.0) / base * dt
+        du = ((left + right) / 2.0) / base * dt
+        self.u += du
+        self.odo += self.speed_mm_s * du
         self.last_cmd = (left, right)
 
     # ---------- 갈림길 기록 ----------

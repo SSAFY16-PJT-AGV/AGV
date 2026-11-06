@@ -75,6 +75,8 @@ def _status_rows(a, runner, elapsed, left, right, fps):
         (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)),
         (u"패치", runner.patch.active or u"-"),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
+        (u"속도 보정", (u"%.0f mm/s (패치 %d번 보정)" % (runner.speed_mm_s, runner.cal.n)) if runner.cal.enabled
+         else u"꺼짐 (%.0f mm/s 고정)" % runner.speed_mm_s),
         (u"처리 속도", u"%.1f fps" % fps if fps else u"-"),
     ]
 

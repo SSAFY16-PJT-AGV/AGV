@@ -14,6 +14,8 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 | `--video` | `run.mp4`: 왼쪽은 검출 결과를 그린 카메라 시점, 오른쪽은 위에서 본 궤적 |
 | `--raw-video` | `camera.mp4`: 원본 카메라 영상. `python3 -m agv.explore --camera video:...`로 재생 시험할 때 쓴다 |
 | `--seed N` | 노이즈·미끄러짐 난수 |
+| `--speed-scale 0.8 --speed-drift 0.05` | 실제 속도를 설정보다 20% 느리게, 1분마다 5%씩 더 느리게(배터리 흉내) |
+| `--patch-length 159.3` | 패치 길이로 속도 보정을 켬(`ssafy_v2` 도안 패치의 진행 방향 길이 평균) |
 | `--mat 파일` | 매트 선택. 기본은 `mats/ssafy_mat.json`(첫 매트 한 장) |
 | `--start x,y,각도` | 시작 자세(mm, 도). 특정 구간만 시험할 때 |
 | `--right-first` | 갈림길에서 오른쪽부터 탐색 |

@@ -62,7 +62,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     evs = load(a.run)
     t0 = next((e["ts"] for e in evs if e.get("ts") is not None), None)
-    show_notes = ("vee_seen", "vee_pivot", "vee_done", "recover_reverse", "recover_pivot", "recover_done")
+    show_notes = ("speed_cal", "vee_seen", "vee_pivot", "vee_done", "recover_reverse", "recover_pivot", "recover_done")
     count = {}
     for e in evs:
         count[e["type"]] = count.get(e["type"], 0) + 1
@@ -91,6 +91,17 @@ def main(argv=None):
         for e in vs:
             print(u"  side=%s cont=%s frames=%s gaps=%s" % (e.get("side"), e.get("cont"), e.get("frames"), e.get("gaps")))
         print(u"  들어가기 완료 %d / 회전 시작 %d" % (notes.count("vee_done"), notes.count("vee_pivot")))
+    sc = [e for e in evs if e["type"] == "note" and e.get("msg") == "speed_cal"]
+    st = next((e for e in evs if e["type"] == "start"), {})
+    if sc or st.get("speedcal"):
+        print(u"\n== 속도 보정(패치) ==")
+        print(u"  처음 짐작값 %s mm/s" % st.get("speed_mm_s"))
+        for e in sc:
+            print(u"  %-7s 잰 값 %6s  흩어짐 %5s  회전 %5s  -> %s%s" % (
+                e.get("color"), e.get("k_obs"), e.get("spread"), e.get("turn"), e.get("k"),
+                (u"  [버림: %s]" % e["reject"]) if e.get("reject") else u""))
+        ok = [e for e in sc if not e.get("reject")]
+        print(u"  받아들임 %d / %d%s" % (len(ok), len(sc), (u", 마지막 %s mm/s" % ok[-1]["k"]) if ok else u""))
     end = [e for e in evs if e["type"] == "end"]
     print(u"\n종료 이유: %s" % (end[-1].get("reason") if end else u"(end 없음 - 비정상 종료)"))
     return 0

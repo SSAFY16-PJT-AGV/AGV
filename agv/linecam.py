@@ -74,8 +74,22 @@ DEFAULT_CONFIG = {
         "ctrl_ahead_mm": 116,
         "patch_ahead_mm": 125,
     },
+    "speedcal": {
+        # 패치가 화면 가로줄을 지나가는 동안(앞 가장자리~뒤 가장자리) 모터 명령 적분이 얼마였는지로
+        # "명령 1당 실제 mm"를 다시 잰다. patch.length_mm가 있어야 동작한다. agv/speedcal.py 참고
+        "rows": 10, "row_top": 0.32, "row_bottom": 0.95,   # 재는 가로줄(화면 높이 비율)
+        "on": 0.10, "off": 0.05, "end_frames": 2,          # 패치가 보이기 시작/끝 판정(줄의 색 비율)
+        "min_peak": 0.15,       # 줄마다 패치가 이 비율 이상 덮어야 그 줄을 씀
+        "min_rows": 4,          # 쓸 수 있는 줄이 이만큼 있어야 한 번의 측정으로 침
+        "max_spread": 0.08,     # 줄마다 잰 값의 사분위 폭 / 중앙값이 이보다 크면 버림
+        "turn_max": 0.20,       # 지나는 동안 |좌-우|/(좌+우) 평균이 이보다 크면(곡선) 버림
+        "alpha": 0.4,           # 새 측정을 섞는 비율(첫 측정은 그대로 씀)
+        "max_jump": 0.35,       # 지금 값과 이 비율 넘게 다르면 이상치로 버림
+        "max_frames": 300,
+    },
     "patch": {
         "region_top": 0.55,     # 패치 판정 영역(화면 아래쪽)
+        "length_mm": None,      # 패치의 진행 방향 길이(전부 같은 크기). 넣으면 지날 때마다 속도를 보정(speedcal)
         "s_min": 90, "v_min": 50,
         "on_frac": 0.20, "off_frac": 0.06,
         "on_frames": 3, "off_frames": 5,
@@ -135,6 +149,7 @@ class Analysis(object):
         self.ctrl_idx = 0
         self.patch_fracs = {}
         self.line_mask = None
+        self.sat_rows = []      # 속도 보정용: 정해진 가로줄마다 채도 높은(패치) 픽셀 비율
 
 
 def analyze(bgr, cfg):
@@ -162,6 +177,11 @@ def analyze(bgr, cfg):
     an.ctrl_idx = int(np.argmin(np.abs(ys - lc["control_row"] * h)))
 
     pc = cfg["patch"]
+    sc = cfg.get("speedcal")
+    if sc:
+        sat = (s >= pc["s_min"]) & (v >= pc["v_min"])
+        for y in np.linspace(sc["row_top"] * h, sc["row_bottom"] * h, sc["rows"]).astype(int):
+            an.sat_rows.append(float(sat[max(0, y - 1):min(h, y + 2)].mean()))
     top = int(pc["region_top"] * h)
     hh, ss, vv = hsv[top:, :, 0], hsv[top:, :, 1], hsv[top:, :, 2]
     colored = (ss >= pc["s_min"]) & (vv >= pc["v_min"])

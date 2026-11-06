@@ -70,7 +70,7 @@ function tick(){
   document.getElementById("st").innerHTML=h;
   var e="";
   for(var j=s.events.length-1;j>=0;j--){var x=s.events[j];
-   e+="<div"+(HI[x.type]||(x.msg||"").indexOf("vee")==0?" class='hi'":"")+">"+esc(x.line)+"</div>";}
+   e+="<div"+((HI[x.type]||/^(vee|speed_cal)/.test(x.msg||""))?" class='hi'":"")+">"+esc(x.line)+"</div>";}
   document.getElementById("ev").innerHTML=e;
   document.getElementById("stop").disabled=!!s.finished;
  }).catch(function(){

@@ -3,7 +3,7 @@
   "robot": {
     "id": "agv1",
     "speed_mm_s": 150,
-    "_speed_note": "follow.base_speed로 직진할 때 실제 속도(mm/s). camtool.py speed로 잰다.",
+    "_speed_note": "follow.base_speed로 직진할 때 실제 속도(mm/s)의 처음 짐작값. patch.length_mm를 넣으면 패치를 지날 때마다 자동으로 다시 재므로 대충 둬도 된다. 패치 길이를 안 넣을 때만 camtool speed로 잰다.",
     "invert_left": false,
     "invert_right": false,
     "trim": 0.0
@@ -23,6 +23,10 @@
       "1": 0,
       "5": 25
     }
+  },
+  "patch": {
+    "_length_note": "색 패치의 진행 방향 길이(mm, 자로 한 번 잼). 넣으면 패치를 지날 때마다 실제 속도를 다시 재서 이동거리를 보정한다(배터리·바닥 차이). null이면 끔.",
+    "length_mm": null
   },
   "follow": {
     "base_speed": 0.3,
