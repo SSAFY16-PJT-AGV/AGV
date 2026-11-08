@@ -1,4 +1,3 @@
-
 # Unreal Engine
 Binaries/
 Intermediate/
@@ -7,6 +6,8 @@ DerivedDataCache/
 
 # Visual Studio
 .vs/
+.vscode/
+.idea/
 *.sln
 *.suo
 *.VC.db
@@ -19,6 +20,15 @@ Build/*
 !Build/
 !Build/**/*.ico
 !Build/**/*.png
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# Test state
+agv_test_progress.json
 
 # OS
 Thumbs.db

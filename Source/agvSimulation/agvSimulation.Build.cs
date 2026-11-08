@@ -15,8 +15,9 @@ public class agvSimulation : ModuleRules
 			"InputCore", 
 			"EnhancedInput",
 		    "Json",
-		    "JsonUtilities"
-		});
+		    "JsonUtilities",
+            "WebSockets"
+        });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 

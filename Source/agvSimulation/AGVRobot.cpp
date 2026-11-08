@@ -147,7 +147,34 @@ void AAGVRobot::Tick(float DeltaTime)
         break;
 
     case EAGVMovementMode::External:
-        // TODO: 중앙 서버에서 수신한 AGV 위치 반영
+
+        if (bExternalDataReceived)
+        {
+            ExternalDataElapsed += DeltaTime;
+
+            if (!bExternalDataStale &&
+                ExternalDataElapsed >= ExternalDataTimeout)
+            {
+                bExternalDataStale = true;
+
+                // 오래된 목표를 향한 이동 중단
+                bExternalRotating = false;
+                bExternalInterpolating = false;
+
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("[External] Data timeout! No position update for %.1f seconds"),
+                    ExternalDataElapsed
+                );
+            }
+        }
+
+        if (!bExternalDataStale)
+        {
+            UpdateExternalInterpolation(DeltaTime);
+        }
+
         break;
 
     default:
@@ -565,6 +592,477 @@ bool AAGVRobot::StartSimulationRoute(const FString& StartId, const FString& Dest
     return true;
 }
 
+bool AAGVRobot::StartServerRoute(
+    const TArray<FString>& NodeIds,
+    const FString& ReleasedUntil)
+{
+    if (MovementMode != EAGVMovementMode::Simulation)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Server route ignored: AGV is not in Simulation mode"));
+        return false;
+    }
+
+    if (NodeIds.Num() < 2)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Server route requires at least two nodes"));
+        return false;
+    }
+
+    if (!IsValid(MapLoader))
+    {
+        for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
+        {
+            MapLoader = *It;
+            break;
+        }
+    }
+
+    if (!IsValid(MapLoader) || MapLoader->Nodes.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Server route: warehouse map not loaded"));
+        return false;
+    }
+
+    // 허가된 마지막 노드 위치 확인
+    const int32 LastAllowedNodeIndex =
+        NodeIds.Find(ReleasedUntil);
+
+    if (LastAllowedNodeIndex <= 0)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Server route: invalid released_until %s"),
+            *ReleasedUntil);
+        return false;
+    }
+
+    // 이전에 받은 경로와 동일한지 확인
+    const bool bSameRoute =
+        bServerRouteReceived &&
+        ServerRouteNodes == NodeIds;
+
+    if (bSameRoute)
+    {
+        // 이전 허가 범위보다 작거나 같으면 무시
+        if (LastAllowedNodeIndex <= ServerReleasedNodeIndex)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Server route: no new released nodes"));
+            return true;
+        }
+
+        // 기존 경로에 추가로 허가된 Edge만 연결
+        for (int32 i = ServerReleasedNodeIndex;
+            i < LastAllowedNodeIndex; ++i)
+        {
+            int32 FoundEdge = INDEX_NONE;
+            bool bReversed = false;
+
+            for (int32 EdgeIndex = 0;
+                EdgeIndex < MapLoader->Edges.Num(); ++EdgeIndex)
+            {
+                const FWarehouseEdge& Edge =
+                    MapLoader->Edges[EdgeIndex];
+
+                if (Edge.From == NodeIds[i] &&
+                    Edge.To == NodeIds[i + 1])
+                {
+                    FoundEdge = EdgeIndex;
+                    break;
+                }
+
+                if (Edge.From == NodeIds[i + 1] &&
+                    Edge.To == NodeIds[i])
+                {
+                    FoundEdge = EdgeIndex;
+                    bReversed = true;
+                    break;
+                }
+            }
+
+            if (FoundEdge == INDEX_NONE)
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Server route: extension edge not found"));
+                return false;
+            }
+
+            RouteEdgeIndices.Add(FoundEdge);
+            RouteReversed.Add(bReversed);
+        }
+
+        ServerReleasedNodeIndex = LastAllowedNodeIndex;
+
+        // J02 등에서 이미 정지한 상태라면 다음 Edge 준비
+        if (!bRouteActive)
+        {
+            bRouteActive = true;
+
+            if (!PrepareSimulationEdge())
+            {
+                bRouteActive = false;
+                return false;
+            }
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("Server route extended to %s"),
+            *ReleasedUntil);
+
+        return true;
+    }
+
+    TArray<int32> NewEdgeIndices;
+    TArray<bool> NewReversed;
+
+    // 서버가 허가한 노드까지만 Edge 생성
+    for (int32 i = 0; i < LastAllowedNodeIndex; ++i)
+    {
+        const FString& FromId = NodeIds[i];
+        const FString& ToId = NodeIds[i + 1];
+
+        int32 FoundEdge = INDEX_NONE;
+        bool bReversed = false;
+
+        for (int32 EdgeIndex = 0;
+            EdgeIndex < MapLoader->Edges.Num();
+            ++EdgeIndex)
+        {
+            const FWarehouseEdge& Edge =
+                MapLoader->Edges[EdgeIndex];
+
+            if (Edge.From == FromId && Edge.To == ToId)
+            {
+                FoundEdge = EdgeIndex;
+                bReversed = false;
+                break;
+            }
+
+            if (Edge.From == ToId && Edge.To == FromId)
+            {
+                FoundEdge = EdgeIndex;
+                bReversed = true;
+                break;
+            }
+        }
+
+        if (FoundEdge == INDEX_NONE)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("Server route: edge not found %s -> %s"),
+                *FromId, *ToId);
+            return false;
+        }
+
+        NewEdgeIndices.Add(FoundEdge);
+        NewReversed.Add(bReversed);
+    }
+
+    const FWarehouseNode* StartNode =
+        MapLoader->Nodes.FindByPredicate(
+            [&NodeIds](const FWarehouseNode& Node)
+            {
+                return Node.Id == NodeIds[0];
+            });
+
+    if (!StartNode)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Server route: start node not found"));
+        return false;
+    }
+
+    StopSimulationRoute();
+
+    RouteEdgeIndices = MoveTemp(NewEdgeIndices);
+    RouteReversed = MoveTemp(NewReversed);
+
+    SimulationHeight = GetActorLocation().Z;
+
+    FVector StartPosition = StartNode->Position;
+    StartPosition.Z = SimulationHeight;
+
+    SetActorLocation(StartPosition, false);
+
+    CurrentRouteStep = 0;
+    CurrentEdgeDistance = 0.0f;
+
+    bServerRouteReceived = true;
+    bAutoRouteAttempted = true;
+    bRouteActive = true;
+
+    // 서버의 전체 경로와 현재 허가 범위 저장
+    ServerRouteNodes = NodeIds;
+    ServerReleasedNodeIndex = LastAllowedNodeIndex;
+    ServerReachedNodeIndex = 0;
+
+    if (!PrepareSimulationEdge())
+    {
+        StopSimulationRoute();
+        return false;
+    }
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("Server route started: %s -> %s (%d edges)"),
+        *NodeIds[0],
+        *ReleasedUntil,
+        RouteEdgeIndices.Num());
+
+    return true;
+}
+
+void AAGVRobot::UpdateServerState(
+    const FString& InStatus,
+    const FString& InCurrentNode,
+    float InBattery)
+{
+    ServerStatus = InStatus;
+    ServerCurrentNode = InCurrentNode;
+    ServerBattery = FMath::Clamp(InBattery, 0.0f, 100.0f);
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("Server state updated: status=%s, node=%s, battery=%.1f"),
+        *ServerStatus,
+        *ServerCurrentNode,
+        ServerBattery);
+}
+
+void AAGVRobot::UpdateExternalPosition(const FString& NodeId)
+{
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        return;
+    }
+
+    if (!IsValid(MapLoader))
+    {
+        for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
+        {
+            MapLoader = *It;
+            break;
+        }
+    }
+
+    if (!IsValid(MapLoader) || MapLoader->Nodes.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("External: warehouse map not loaded"));
+        return;
+    }
+
+    const FWarehouseNode* TargetNode =
+        MapLoader->Nodes.FindByPredicate(
+            [&NodeId](const FWarehouseNode& Node)
+            {
+                return Node.Id == NodeId;
+            });
+
+    if (!TargetNode)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("External: node not found %s"), *NodeId);
+        return;
+    }
+
+    FVector TargetPosition = TargetNode->Position;
+
+    // AGV의 현재 높이는 유지
+    TargetPosition.Z = GetActorLocation().Z;
+
+    SetActorLocation(TargetPosition, false);
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("External position updated: %s"), *NodeId);
+}
+
+void AAGVRobot::UpdateExternalPose(
+    float X,
+    float Y,
+    float Yaw)
+{
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        return;
+    }
+
+    // 실제 서버 좌표 수신 시에만 타이머 초기화
+    ExternalDataElapsed = 0.0f;
+    bExternalDataReceived = true;
+
+    if (bExternalDataStale)
+    {
+        bExternalDataStale = false;
+
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("[External] Data connection restored")
+        );
+    }
+
+    // 현재 위치를 새로운 보간 시작점으로 설정
+    ExternalStartPosition = GetActorLocation();
+
+    // 서버 좌표를 Unreal 좌표로 변환
+    ExternalTargetPosition = FVector(
+        X * ExternalPositionScale,
+        Y * ExternalPositionScale,
+        GetActorLocation().Z
+    );
+
+    ExternalStartRotation = GetActorRotation();
+    ExternalTargetRotation = FRotator(0.0f, Yaw, 0.0f);
+
+    // 첫 위치 즉시 설정
+    if (!bExternalPoseInitialized)
+    {
+        SetActorLocation(ExternalTargetPosition, false);
+        SetActorRotation(ExternalTargetRotation);
+
+        bExternalPoseInitialized = true;
+        bExternalInterpolating = false;
+        return;
+    }
+
+    // 현재 위치와 새 목표 위치의 차이
+    const float PositionDifference = FVector::Dist2D(
+        GetActorLocation(),
+        ExternalTargetPosition
+    );
+
+    // 현재 방향과 새 목표 방향의 차이
+    const float RotationDifference = FMath::Abs(
+        FMath::FindDeltaAngleDegrees(
+            GetActorRotation().Yaw,
+            ExternalTargetRotation.Yaw
+        )
+    );
+
+    // 위치와 방향 모두 동일하면 새로운 보간을 시작하지 않음
+    if (PositionDifference <= ExternalPositionTolerance &&
+        RotationDifference <= ExternalRotationTolerance)
+    {
+        // 이미 진행 중인 보간이 있으면 중단하고 목표에 정렬
+        SetActorLocation(ExternalTargetPosition);
+        SetActorRotation(ExternalTargetRotation);
+
+        bExternalRotating = false;
+        bExternalInterpolating = false;
+
+        return;
+    }
+
+    // 새로운 목표를 받으면 회전 단계부터 시작
+    ExternalRotationElapsed = 0.0f;
+    ExternalInterpolationElapsed = 0.0f;
+
+    // 현재 위치에서 목표 위치까지 거리 (cm)
+    const float MoveDistance = FVector::Dist2D(
+        ExternalStartPosition,
+        ExternalTargetPosition
+    );
+
+    // 거리에 비례해 이동 시간 계산
+    ExternalCurrentMoveDuration = FMath::Max(
+        MoveDistance / FMath::Max(ExternalMoveSpeed, 1.0f),
+        ExternalMinInterpolationDuration
+    );
+
+    // 현재 방향과 목표 방향이 다르면 먼저 제자리 회전
+    const float YawDifference = FMath::Abs(
+        FMath::FindDeltaAngleDegrees(
+            ExternalStartRotation.Yaw,
+            ExternalTargetRotation.Yaw
+        )
+    );
+
+    bExternalRotating = YawDifference > 1.0f;
+
+    // 회전이 필요 없으면 바로 이동
+    bExternalInterpolating = !bExternalRotating;
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("External target received: X=%.2f, Y=%.2f, Yaw=%.2f"),
+        X, Y, Yaw);
+}
+
+void AAGVRobot::UpdateExternalInterpolation(float DeltaTime)
+{
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        return;
+    }
+
+    // 1단계: 제자리 회전
+    if (bExternalRotating)
+    {
+        ExternalRotationElapsed += DeltaTime;
+
+        const float RotationDuration =
+            FMath::Max(ExternalRotationDuration, 0.01f);
+
+        const float RotationAlpha = FMath::Clamp(
+            ExternalRotationElapsed / RotationDuration,
+            0.0f,
+            1.0f
+        );
+
+        // 최단 회전 방향으로 회전
+        const FQuat NewRotation = FQuat::Slerp(
+            ExternalStartRotation.Quaternion(),
+            ExternalTargetRotation.Quaternion(),
+            RotationAlpha
+        );
+
+        SetActorRotation(NewRotation);
+
+        if (RotationAlpha >= 1.0f)
+        {
+            bExternalRotating = false;
+            bExternalInterpolating = true;
+            ExternalInterpolationElapsed = 0.0f;
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("External rotation completed"));
+        }
+
+        return;
+    }
+
+    // 2단계: 직진 이동
+    if (bExternalInterpolating)
+    {
+        ExternalInterpolationElapsed += DeltaTime;
+
+        const float Duration =
+            FMath::Max(ExternalCurrentMoveDuration, 0.01f);
+
+        const float Alpha = FMath::Clamp(
+            ExternalInterpolationElapsed / Duration,
+            0.0f,
+            1.0f
+        );
+
+        const FVector NewPosition = FMath::Lerp(
+            ExternalStartPosition,
+            ExternalTargetPosition,
+            Alpha
+        );
+
+        SetActorLocation(NewPosition, false);
+
+        if (Alpha >= 1.0f)
+        {
+            bExternalInterpolating = false;
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("External target reached"));
+        }
+    }
+}
+
 void AAGVRobot::StopSimulationRoute()
 {
     bRouteActive = false;
@@ -614,7 +1112,9 @@ void AAGVRobot::UpdateSimulationMovement(float DeltaTime)
 {
     if (!bRouteActive)
     {
-        if (!bAutoRouteAttempted)
+        if (bAutoStartSimulationRoute &&
+            !bAutoRouteAttempted &&
+            !bServerRouteReceived)
         {
             // Loader의 Blueprint BeginPlay에서 LoadMap()을 호출하므로
             // 실제 데이터가 준비된 프레임에 자동 시작한다.
@@ -668,9 +1168,32 @@ void AAGVRobot::UpdateSimulationMovement(float DeltaTime)
         if (CurrentEdgeDistance + 0.01f >= EdgeLength)
         {
             ++CurrentRouteStep;
+
+            if (bServerRouteReceived)
+            {
+                ServerReachedNodeIndex = CurrentRouteStep;
+            }
+
             if (CurrentRouteStep >= RouteEdgeIndices.Num())
             {
-                UE_LOG(LogTemp, Warning, TEXT("Simulation destination reached"));
+                if (bServerRouteReceived)
+                {
+                    // 서버 허가 구간 끝에서 대기
+                    bRouteActive = false;
+
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("Server route: waiting at %s"),
+                        ServerRouteNodes.IsValidIndex(ServerReachedNodeIndex)
+                        ? *ServerRouteNodes[ServerReachedNodeIndex]
+                        : TEXT("Unknown"));
+                    
+                    return;
+                }
+
+                // 기존 자동 시뮬레이션은 종전 방식 유지
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Simulation destination reached"));
+
                 StopSimulationRoute();
                 return;
             }
@@ -761,4 +1284,18 @@ void AAGVRobot::DrawPlannedRoute() const
             );
         }
     }
+}
+
+void AAGVRobot::ResetExternalPoseInitialization()
+{
+    bExternalPoseInitialized = false;
+
+    bExternalRotating = false;
+    bExternalInterpolating = false;
+
+    ExternalRotationElapsed = 0.0f;
+    ExternalInterpolationElapsed = 0.0f;
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("[External] Pose initialization reset"));
 }

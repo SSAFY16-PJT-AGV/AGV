@@ -452,3 +452,18 @@ bool AWarehouseMapLoader::FindShortestRoute(
 
     return true;
 }
+
+void AWarehouseMapLoader::GenerateMapInEditor()
+{
+    if (!LoadMap())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[Warehouse] Failed to load map in editor"));
+        return;
+    }
+
+    SpawnPaths();
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("[Warehouse] Map generated in editor"));
+}

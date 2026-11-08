@@ -39,6 +39,10 @@ public:
     // Edge 방향을 양방향으로 해석한다. 단방향 통행은 추후 데이터 확장 필요.
     bool FindShortestRoute(const FString& StartId, const FString& DestinationId,
         TArray<int32>& OutEdgeIndices, TArray<bool>& OutReversed) const;
+    
+    UFUNCTION(CallInEditor, Category = "Warehouse Map")
+    void GenerateMapInEditor();
+
 protected:
     virtual void BeginPlay() override;
 };
