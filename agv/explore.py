@@ -64,6 +64,30 @@ def make_ask_fn(motors, view=None):
     return ask
 
 
+def _note_camera_calib(cfg, logger, runner):
+    """렌즈 보정값(config/camera_calib.json)이 있으면 기록하고, 지금 카메라 설정과 맞는지 본다.
+    지금은 주행에 쓰지 않는다(바닥 mm 좌표계 단계에서 씀)."""
+    path = os.path.join(HERE, "config", "camera_calib.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (IOError, ValueError):
+        print(u"camera_calib.json을 못 읽었어요.")
+        return
+    c = cfg["camera"]
+    now = [c.get("capture_width"), c.get("capture_height"), c.get("flip", 0)]
+    was = [d.get("capture_size", [None, None])[0], d.get("capture_size", [None, None])[1],
+           d.get("camera", {}).get("flip", 0)]
+    ok = now == was
+    if not ok:
+        print(u"[주의] 렌즈 보정값은 capture %sx%s flip %s에서 찍었는데 지금 설정은 %sx%s flip %s예요. "
+              u"다시 찍어야 맞아요." % tuple(was + now))
+    logger.log("note", runner._odo(), msg="camera_calib", model=d.get("model"), rms_px=d.get("rms_px"),
+               date=d.get("date"), matches_camera=ok)
+
+
 def _status_rows(a, runner, elapsed, left, right, fps):
     choice = runner.choice or u"-"
     return [
@@ -157,6 +181,7 @@ def main(argv=None):
     runner = ExploreRunner(cfg, logger, mode=a.mode, explorer=Explorer(max_laps=a.max_laps),
                            ask_fn=make_ask_fn(motors, view), speed_mm_s=rob["speed_mm_s"],
                            robot_id=rob.get("id", "agv1"), map_hint=None)
+    _note_camera_calib(cfg, logger, runner)
     writer = None
     period = 1.0 / a.fps
     t_start = time.time()

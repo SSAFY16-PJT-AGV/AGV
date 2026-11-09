@@ -13,7 +13,8 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더 |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
-| `tools/camtool.py` | 현장 보정: 화면 저장, HSV 측정, 속도 측정 |
+| `tools/camtool.py` | 현장 보정: 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
+| `camcalib.py`, `tools/calib.py` | 체커보드 사진으로 렌즈 보정값(어안/핀홀 자동 선택) 계산·불러오기 |
 | `speedcal.py` | 색 패치를 지날 때마다 실제 주행 속도를 다시 재서 이동거리 보정 |
 | `tools/autocolor.py` | 한 바퀴 영상에서 패치 색 범위·문턱 자동 보정 |
 | `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
@@ -46,7 +47,13 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 5. **판정 지점 거리 재기**: `snap`의 `debug.png`에서 파란 가로줄이 바닥 어디에 해당하는지 자로 재서 `geom.ctrl_ahead_mm`에 넣는다(차체 궤도 가운데 기준).
 6. **갈림길만 사람이 고르는 주행**: `python3 -m agv.explore --mode ask --enable-motors`
    - 갈라지는 곳에서 멈추고 왼쪽/오른쪽을 묻는다. 라인 추종이 흔들리면 `follow.base_speed`를 낮추고 `follow.kp`를 조정한다.
-7. **자율 탐색**: `python3 -m agv.explore --mode drive --enable-motors --record`
+7. **렌즈 보정(카메라 캘리브레이션)**: 지금 주행에는 안 쓰지만, 다음 단계(패치로 바닥 mm 좌표계를 만들어 실제 축척 맵 만들기)에 필요하다. 현장에 간 김에 찍어 둔다.
+   - 주행 자세(팔 각도) 그대로 `python3 -m agv.tools.camtool snap --count 25 --out data/calib`. 1.5초마다 한 장씩 찍으며 장마다 체커보드가 보였는지(O/x) 알려 준다. 보드를 화면 가운데·네 귀퉁이·가장자리로, 30~45도 기울여 가며 옮긴다.
+   - `python3 -m agv.tools.calib data/calib` → 일반(핀홀)·어안 모델을 둘 다 계산해 재투영 오차가 작은 쪽을 고른다. 오차 1px 아래, 화면 덮은 비율 60% 이상이면 좋다. `calib_check.png` 오른쪽(편 사진)에서 곧은 선이 곧게 보이는지 확인하고 `--write`로 `config/camera_calib.json`에 저장한다.
+   - 보정값은 그 센서 모드에서만 맞는다. `camera.capture_width/height`나 `flip`을 바꾸거나 초점 링을 돌리면 다시 찍는다(주행 시작 때 안 맞으면 경고).
+   - 설계 문서 5.2절은 ChArUco 보드를 쓰지만, Jetson 기본 OpenCV(4.1.1)에는 aruco 모듈이 없을 수 있어 일반 체커보드를 쓴다. 렌즈 보정값은 같게 나온다. 보드 크기(안쪽 모서리 9x6 등)는 자동으로 찾고, 칸 크기는 결과에 영향이 없다.
+   - 같이 찍어 둘 것: 로봇을 라인 위, 패치가 앞 15~25cm에 통째로 보이게 세우고 `python3 -m agv.tools.camtool ground --enable-motors --out data/ground` (제자리에서 좌우로 조금씩 돌며 9장).
+8. **자율 탐색**: `python3 -m agv.explore --mode drive --enable-motors --record`
    - 갈림길마다 안 가 본 쪽을 고르고, 모든 가지를 다 돈 뒤 같은 패치로 한 바퀴 깨끗하게 돌아오면 그 패치에서 멈춘다(`end` 이벤트의 `reason`이 `explore_explored`).
 8. **맵 만들기**: `python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json` → `mapping/viewer/index.html`에 끌어다 놓는다.
 

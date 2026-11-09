@@ -45,6 +45,8 @@ python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레
 | 색 6개 (자동) | `python3 -m agv.explore --mode passive --record --view`로 손으로 밀어 한 바퀴 → `python3 -m agv.tools.autocolor data/runs/<시각>` → 확인 후 `--write` | 여섯 색이 다 잡히고, `autocolor.png` 이름표가 실제 패치와 맞고, "새 설정" 패치 순서가 실제로 지나간 순서와 같음 |
 | 패치 길이 | 패치의 진행 방향 길이를 자로 잼 | 그 값을 `patch.length_mm`에 적음. 주행 중 패치마다 속도를 자동으로 다시 잰다(속도 측정 불필요) |
 | 판정 지점 거리 | `snap`의 파란 가로줄이 바닥 어디인지 줄자로 잼 | 그 값을 `geom.ctrl_ahead_mm`에 적음(궤도 가운데 기준) |
+| 렌즈 보정 (다음 단계용) | `python3 -m agv.tools.camtool snap --count 25 --out data/calib`(보드를 화면 곳곳으로, 기울여 가며) → `python3 -m agv.tools.calib data/calib` → 확인 후 `--write` | 장마다 `보드 O`가 15장 이상, 재투영 오차 1px 아래, 화면 덮은 비율 60% 이상, `calib_check.png`에서 곧은 선이 곧게 펴짐. 지금 주행에는 안 씀 |
+| 바닥 좌표계 사진 (다음 단계용) | 패치가 앞 15~25cm에 통째로 보이게 라인 위에 세우고 `python3 -m agv.tools.camtool ground --enable-motors --out data/ground` | `raw_*.png` 9장 모두에서 패치 네 모서리가 화면 안에 보임 |
 
 > 속도(`patch.length_mm`로 자동 보정)와 `geom.ctrl_ahead_mm`은 막다른 길에서 후진하는 거리와 V자에서 회전을 시작하는 지점을 정한다. `ctrl_ahead_mm`을 대충 넣으면 4·5단계가 어긋난다.
 
@@ -180,4 +182,4 @@ python3 -m agv.tools.runlog data/replay --all
 
 ## 8. 결과 공유
 
-시험한 주행마다 `data/runs/<시각>/` 폴더를 통째로 압축해 공유한다. 폴더에는 `events.jsonl`, `config_used.json`, `camera.mp4`, `debug/`가 있다. 어느 단계 시험인지와 통과 여부를 한 줄 적는다. 영상이 있으면 노트북에서 그대로 재현해 원인을 찾을 수 있다.
+시험한 주행마다 `data/runs/<시각>/` 폴더를 통째로 압축해 공유한다. 폴더에는 `events.jsonl`, `config_used.json`, `camera.mp4`, `debug/`가 있다. 어느 단계 시험인지와 통과 여부를 한 줄 적는다. 영상이 있으면 노트북에서 그대로 재현해 원인을 찾을 수 있다. 렌즈 보정·바닥 좌표계 사진(`data/calib/`, `data/ground/`)도 같이 공유하면 다음 단계(실제 축척 맵)를 바로 이어서 만들 수 있다.
