@@ -23,4 +23,5 @@ AGV 주행, 재고 인식, 관제 서버와 디지털 트윈을 함께 개발하
 
 - [docs/design.md](docs/design.md): 설계 문서 v0.2 (아키텍처, MQTT 규격, 맵 데이터, 협동 매핑, 충돌 방지)
 - [docs/roadmap.md](docs/roadmap.md): 8주 로드맵, GitHub Milestone·Issue 운영 계획
+- [docs/mapping/patch-localization.md](docs/mapping/patch-localization.md): 마커 설치 전 색 패치 기반 위치 추정·매핑 실험 (제안)
 - [CLAUDE.md](CLAUDE.md): Claude Code 작업 시 공유하는 프로젝트 맥락·제약·규칙
