@@ -41,13 +41,21 @@ python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레
 
 | 순서 | 명령 | 통과 기준 |
 | --- | --- | --- |
-| 카메라 자세 | `python3 -m agv.tools.camtool snap` | `data/snap/debug.png`에서 가로줄마다 초록 점이 하나씩 찍힘 |
+| 카메라 자세 (처음 한 번) | 로봇을 라인 위에 놓고 `python3 -m agv.tools.camtool arm --view` → 브라우저 화면을 보며 키보드로 팔·카메라 각도를 맞춤 → `p`로 저장 → `q` | 화면 아래 절반 가운데에 라인이 보이고 가로줄마다 초록 점이 하나씩 찍힘(상태 표의 "선 하나로 보이는 줄"이 거의 전부). 저장하면 `arm.servo_angles`에 들어가고, 이후 탐색·사진 찍기는 시작할 때 자동으로 이 자세로 맞춘다 |
+| 자세 확인 | `python3 -m agv.tools.camtool snap` | 시작할 때 `카메라 자세를 저장한 값으로 맞췄어요`가 나오고, `data/snap/debug.png`가 위와 같음 |
 | 패치 길이 | 패치의 진행 방향 길이를 자로 잼 | 그 값을 `patch.length_mm`에 적음. 주행 중 패치마다 속도를 자동으로 다시 잰다(속도 측정 불필요) |
 | 판정 지점 거리 | `snap`의 파란 가로줄이 바닥 어디인지 줄자로 잼 | 그 값을 `geom.ctrl_ahead_mm`에 적음(궤도 가운데 기준) |
 | 렌즈 보정 (다음 단계용) | `python3 -m agv.tools.camtool snap --count 25 --out data/calib`(보드를 화면 곳곳으로, 기울여 가며) → `python3 -m agv.tools.calib data/calib` → 확인 후 `--write` | 장마다 `보드 O`가 15장 이상, 재투영 오차 1px 아래, 화면 덮은 비율 60% 이상, `calib_check.png`에서 곧은 선이 곧게 펴짐. 지금 주행에는 안 씀 |
 | 바닥 좌표계 사진 (다음 단계용) | 패치가 앞 15~25cm에 통째로 보이게 라인 위에 세우고 `python3 -m agv.tools.camtool ground --enable-motors --out data/ground` | `raw_*.png` 9장 모두에서 패치 네 모서리가 화면 안에 보임 |
 
 패치 색은 2단계의 첫 한 바퀴 영상으로 잡는다.
+
+카메라 자세는 한 번 저장하면 다음 날·다음 현장에서도 그대로 쓴다. 판정 지점 거리, 렌즈 보정, 바닥 사진은 그 자세에서 잰 값이라서 **자세를 다시 저장했으면 이 셋을 다시 잰다**(`camtool arm`이 저장할 때 목록을 보여 준다). 렌즈 보정은 찍을 때 자세를 같이 기록해서, 나중에 자세가 바뀌면 주행 시작 때 경고한다.
+
+- 팔을 손으로 맞추는 게 편하면 `camtool arm`에서 `f`(힘 빼기) → 손으로 맞춤 → `f`(그 자리 고정) → `p`. 힘을 빼면 팔이 처지니 받친다.
+- 주피터 등 다른 방법으로 맞춰 두었으면 `python3 -m agv.tools.camtool arm --save-now`로 지금 자세를 그대로 저장한다.
+- 팔이 걸려 저장한 자세로 못 가면 시작할 때 `[주의] 카메라 자세가 저장한 값과 ...도 달라요`가 나온다. 팔 주변을 확인한다.
+- 팔을 건드리지 않고 실행하려면 `--no-arm`.
 
 > 속도(`patch.length_mm`로 자동 보정)와 `geom.ctrl_ahead_mm`은 막다른 길에서 후진하는 거리와 V자에서 회전을 시작하는 지점을 정한다. `ctrl_ahead_mm`을 대충 넣으면 4·5단계가 어긋난다.
 

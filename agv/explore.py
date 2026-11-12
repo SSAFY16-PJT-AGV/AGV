@@ -17,6 +17,9 @@
     # 실시간 화면: 어느 모드든 --view를 붙이고 노트북·폰 브라우저에서 http://<젯슨 IP>:8080
     python3 -m agv.explore --mode drive --enable-motors --view
 
+카메라로 찍을 때는 시작하면서 저장해 둔 카메라 자세(arm.servo_angles, camtool arm으로 정함)로 팔을 맞춘다.
+--no-arm이면 팔을 건드리지 않는다. 녹화 영상 재생은 팔을 건드리지 않는다.
+
 결과: data/runs/<시각>/events.jsonl, trace.jsonl(회전 기록, 맵 모양 계산용) (+ camera.mp4, debug/*.jpg)
 맵 만들기: python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json
 Ctrl+C로 언제든 멈춘다(모터 정지 후 end 이벤트 기록).
@@ -30,7 +33,7 @@ import time
 
 import cv2
 
-from .hw import JetbotMotors, NullMotors, open_camera, set_arm_pose
+from .hw import JetbotMotors, NullMotors, open_camera
 from .linecam import DEFAULT_CONFIG, draw_debug, merge_config
 from .runner import ExploreRunner
 from .topo import EventLogger, Explorer
@@ -84,8 +87,12 @@ def _note_camera_calib(cfg, logger, runner):
     if not ok:
         print(u"[주의] 렌즈 보정값은 capture %sx%s flip %s에서 찍었는데 지금 설정은 %sx%s flip %s예요. "
               u"다시 찍어야 맞아요." % tuple(was + now))
+    from .arm import calib_pose_warning
+    w = calib_pose_warning(cfg, d.get("arm"), u"렌즈 보정값")
+    if w:
+        print(u"[주의] " + w)
     logger.log("note", runner._odo(), msg="camera_calib", model=d.get("model"), rms_px=d.get("rms_px"),
-               date=d.get("date"), matches_camera=ok)
+               date=d.get("date"), matches_camera=ok, matches_arm=w is None)
 
 
 def _status_rows(a, runner, elapsed, left, right, fps):
@@ -117,7 +124,9 @@ def main(argv=None):
     ap.add_argument("--debug-every", type=int, default=20, help="N프레임마다 검출 그림 저장(0이면 끔)")
     ap.add_argument("--max-time", type=float, default=600.0, help="최대 주행 시간(초)")
     ap.add_argument("--max-laps", type=int, default=6, help="출발 패치를 이만큼 지나면 강제 종료")
-    ap.add_argument("--set-arm", action="store_true", help="설정의 arm.servo_angles로 카메라 자세를 맞춘다")
+    ap.add_argument("--no-arm", action="store_true",
+                    help="저장한 카메라 자세(arm.servo_angles)로 팔을 맞추지 않음(기본은 맞춤)")
+    ap.add_argument("--set-arm", action="store_true", help=argparse.SUPPRESS)   # 예전 옵션. 이제 기본
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--view", type=int, nargs="?", const=8080, default=0, metavar="PORT",
                     help="실시간 화면을 웹으로 띄움(기본 포트 8080). 브라우저에서 http://<젯슨 IP>:PORT")
@@ -142,8 +151,10 @@ def main(argv=None):
     with io.open(os.path.join(out, "config_used.json"), "w", encoding="utf-8") as f:
         f.write(json.dumps(cfg, ensure_ascii=False, indent=1))
 
-    if a.set_arm:
-        set_arm_pose(cfg["arm"]["servo_angles"])
+    arm_res = None
+    if not video_mode and not a.no_arm:
+        from .arm import apply_saved
+        arm_res = apply_saved(cfg)
 
     cam = open_camera(a.camera, cfg["camera"])
     rob = cfg["robot"]
@@ -183,6 +194,9 @@ def main(argv=None):
                            robot_id=rob.get("id", "agv1"), map_hint=None,
                            trace_path=os.path.join(out, "trace.jsonl"))
     _note_camera_calib(cfg, logger, runner)
+    if arm_res is not None:
+        logger.log("note", runner._odo(), msg="arm_pose", saved=arm_res["saved"], pose=arm_res["pose"],
+                   diff_deg=arm_res["diff"], ok=arm_res["ok"])
     writer = None
     period = 1.0 / a.fps
     t_start = time.time()

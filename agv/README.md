@@ -12,8 +12,9 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `runner.py` | 한 프레임 처리 로직. 시뮬레이터(`sim/mat/`)도 같은 코드를 쓴다 |
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더, 주행 기록으로 맵 모양 계산(`shape.py`) |
-| `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
-| `tools/camtool.py` | 현장 보정: 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
+| `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot) |
+| `arm.py` | 카메라 자세(팔 서보 1·2·3·5번 각도) 읽기·맞추기·저장. 저장한 자세는 시작할 때 자동으로 맞춤 |
+| `tools/camtool.py` | 현장 보정: 카메라 자세 맞추기·저장(`arm`), 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
 | `camcalib.py`, `tools/calib.py` | 체커보드 사진으로 렌즈 보정값(어안/핀홀 자동 선택) 계산·불러오기 |
 | `speedcal.py` | 색 패치를 지날 때마다 실제 주행 속도를 다시 재서 이동거리 보정 |
 | `tools/autocolor.py` | 한 바퀴 영상에서 패치 색 범위·문턱 자동 보정 |
@@ -26,10 +27,12 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 
 저장소 루트에서 실행한다. 주피터 노트북이 카메라를 잡고 있으면 먼저 그 커널을 끈다.
 
-1. **카메라 자세 확인**: `python3 -m agv.tools.camtool snap`
-   - 팔을 숙여 카메라가 차체 앞 바닥을 보게 한다. `data/snap/debug.png`에서 라인이 화면 아래 절반의 가운데쯤 보이고, 가로줄마다 초록 점이 하나씩 찍혀야 한다.
-   - `full.png`(원본 해상도)도 같이 저장된다. 검출 그림과 HSV 측정은 주행 해상도인 `raw.png` 기준이다.
-   - 이 자세를 주행 자세로 정하고, 서보 각도를 `config/explore.json`의 `arm.servo_angles`에 적어 두면 `--set-arm`으로 다시 맞출 수 있다.
+1. **카메라 자세 정하기(처음 한 번)**: `python3 -m agv.tools.camtool arm --view`
+   - 로봇을 라인 위에 놓고 브라우저(`http://<젯슨 IP>:8080`)로 검출 화면을 보며 키보드로 맞춘다. `1`·`2`·`3`·`5`로 서보(팔 좌우, 팔 아래 관절, 팔 가운데 관절, 카메라 상하)를 고르고 `+`/`-`로 움직인다(`[` 1도씩, `]` 5도씩). 손으로 맞추려면 `f`로 힘을 뺐다가 `f`로 고정한다. `p`로 저장, `q`로 끝.
+   - 라인이 화면 아래 절반의 가운데쯤 보이고, 가로줄마다 초록 점이 하나씩 찍히면 된다. 상태 표에 "선 하나로 보이는 줄", "조향 줄 선 위치"가 숫자로 나온다. `--view`가 없으면 `data/snap/arm_preview.png`를 계속 저장한다.
+   - 저장한 각도(`config/explore.json`의 `arm.servo_angles`)는 이후 `explore`, `camtool snap`/`ground`, `autocolor --camera`가 시작할 때 자동으로 맞춘다. 맞춘 뒤 다시 읽어 3도 넘게 다르면 경고한다. 팔을 건드리지 않으려면 `--no-arm`. `camtool arm --read`는 지금·저장한 각도 출력, `--apply`는 맞추기만, `--save-now`는 지금 자세를 그대로 저장.
+   - 자세를 다시 저장하면 그 자세에서 잰 값(5번 판정 지점 거리, 7번 렌즈 보정·바닥 사진)을 다시 잰다. 저장할 때 목록이 나온다.
+   - 확인: `python3 -m agv.tools.camtool snap` → `data/snap/debug.png`. `full.png`(원본 해상도)도 같이 저장된다. 검출 그림과 HSV 측정은 주행 해상도인 `raw.png` 기준이다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
    - **캘리브레이션 사진**(다음 단계인 실제 축척 형상·AprilTag용, 지금 맵 생성에는 필요 없음): `python3 -m agv.tools.camtool snap --count 25 --out data/calib`로 원본 해상도 25장을 1.5초 간격으로 찍는다. 그동안 체커보드(노트북 화면에 띄워도 됨)를 화면 가운데·귀퉁이·가장자리로, 기울기도 바꿔 가며 옮긴다. 계산은 나중에 노트북에서 한다.
 2. **색 자동으로 잡기**: 맵을 한 바퀴 도는 영상에서 패치 색 범위를 자동으로 잡는다. 라인 추종은 검은 선만 보므로 색이 안 맞아도 로봇이 직접 돌 수 있다.

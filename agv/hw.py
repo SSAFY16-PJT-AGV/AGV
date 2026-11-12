@@ -118,9 +118,6 @@ class JetbotMotors(object):
 
 # ---------- 팔(카메라 자세) ----------
 def set_arm_pose(servo_angles, speed=150, settle_s=1.5):
-    """{"1": 0, "5": 25} 처럼 서보 번호별 각도. 1번=카메라 좌우(PAN), 5번=카메라 상하(TILT)."""
-    from SCSCtrl import TTLServo
-    for sid, ang in sorted(servo_angles.items()):
-        TTLServo.servoAngleCtrl(int(sid), int(ang), 1, speed)
-        time.sleep(0.05)
-    time.sleep(settle_s)
+    """{"1": 0, "5": 25} 처럼 서보 번호별 각도. 자세 저장·확인까지 하려면 agv.arm을 쓴다."""
+    from .arm import move
+    move(servo_angles, speed=speed, settle_s=settle_s)

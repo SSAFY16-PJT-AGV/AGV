@@ -328,6 +328,9 @@ def frames_from(a, cfg):
         cap.release()
     else:
         from ..hw import open_camera
+        if not getattr(a, "no_arm", False):
+            from ..arm import apply_saved
+            apply_saved(cfg)
         cam = open_camera(a.camera, cfg["camera"])
         print(u"%d초 동안 찍어요. 로봇을 라인 위로 밀어 맵을 한 바퀴 돌리세요." % a.seconds)
         t0 = time.time()
@@ -359,6 +362,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run", nargs="?", help="주행 결과 폴더(camera.mp4가 있는) 또는 영상 파일")
     ap.add_argument("--camera", default=None, help="영상 대신 카메라로 바로 찍기(gst | jetbot)")
+    ap.add_argument("--no-arm", action="store_true", help="--camera일 때 저장한 카메라 자세로 팔을 맞추지 않음")
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--every", type=int, default=2, help="N프레임마다 하나 씀")
     ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))

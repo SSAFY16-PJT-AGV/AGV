@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """현장 보정 도구. 저장소 루트에서 실행한다.
 
+    # 카메라 자세(팔 각도) 정하기: 브라우저로 화면을 보며 키보드로 맞추고 p로 저장. 처음 한 번만
+    python3 -m agv.tools.camtool arm --view
+    python3 -m agv.tools.camtool arm --read        # 지금 각도만 출력
+    python3 -m agv.tools.camtool arm --apply       # 저장한 자세로 맞추기만
+
     # 지금 카메라 화면 저장. 원본 해상도(full.png) + 주행 해상도(raw.png) + 검출 결과(debug.png)
     python3 -m agv.tools.camtool snap [--camera gst] [--out data/snap]
 
@@ -18,7 +23,10 @@
     python3 -m agv.tools.camtool speed --seconds 4 --enable-motors
 """
 import argparse
+import io
+import json
 import os
+import select
 import sys
 import time
 
@@ -39,6 +47,8 @@ def cmd_snap(a, cfg):
     full_cfg["width"], full_cfg["height"] = c.get("capture_width", 1280), c.get("capture_height", 720)
     if not os.path.isdir(a.out):
         os.makedirs(a.out)
+    arm_res = _apply_arm(a, cfg)
+    _write_info(a.out, "snap.json", cfg, arm_res, count=a.count)
     cam = open_camera(a.camera, full_cfg)
     full = None
     try:
@@ -104,6 +114,7 @@ def cmd_ground(a, cfg):
     full_cfg["width"], full_cfg["height"] = c.get("capture_width", 1280), c.get("capture_height", 720)
     if not os.path.isdir(a.out):
         os.makedirs(a.out)
+    arm_res = _apply_arm(a, cfg)
     motors = None
     if a.enable_motors:
         rob = cfg["robot"]
@@ -142,9 +153,227 @@ def cmd_ground(a, cfg):
     import json
     with open(os.path.join(a.out, "ground.json"), "w") as f:
         json.dump({"shots": shots, "pivot_speed": speed, "pulse_s": a.pulse_s,
-                   "patch_length_mm": cfg["patch"].get("length_mm"), "camera": c}, f, indent=1)
+                   "patch_length_mm": cfg["patch"].get("length_mm"), "camera": c,
+                   "arm": (arm_res or {}).get("pose") or (arm_res or {}).get("saved")}, f, indent=1)
     print(u"저장: %s (full_*.png 원본, raw_*.png 주행 해상도, ground.json)" % a.out)
     print(u"패치 네 모서리가 모든 사진에서 화면 안에 보여야 해요. raw_*.png로 확인하세요.")
+    return 0
+
+
+def _apply_arm(a, cfg):
+    """카메라로 찍기 전에 저장한 카메라 자세로 맞춘다(--no-arm이면 안 함)."""
+    if getattr(a, "no_arm", False) or str(getattr(a, "camera", "gst")).startswith("video:"):
+        return None
+    from ..arm import apply_saved
+    return apply_saved(cfg)
+
+
+def _write_info(folder, name, cfg, arm_res, **extra):
+    """찍은 조건(카메라 설정, 카메라 자세)을 사진 폴더에 남긴다. tools.calib이 읽어 보정값에 같이 적는다."""
+    arm = (arm_res or {}).get("pose") or (arm_res or {}).get("saved") or (cfg.get("arm") or {}).get("servo_angles")
+    d = {"date": time.strftime("%Y-%m-%d %H:%M"), "camera": cfg["camera"], "arm": arm}
+    d.update(extra)
+    with io.open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False, indent=1))
+
+
+class _Keys(object):
+    """터미널에서 키 하나씩 읽기(Enter 없이). 터미널이 아니면 한 줄씩 읽어 글자마다 처리."""
+
+    def __init__(self):
+        self.tty = sys.stdin.isatty()
+        self.old = None
+        self.buf = []
+
+    def __enter__(self):
+        if self.tty:
+            import termios
+            import tty
+            self.old = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old)
+
+    def get(self, timeout):
+        if self.buf:
+            return self.buf.pop(0)
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return None
+        if self.tty:
+            return sys.stdin.read(1)
+        line = sys.stdin.readline()
+        if not line:
+            return "q"
+        self.buf = list(line.strip())
+        return self.buf.pop(0) if self.buf else None
+
+
+ARM_HELP = u"""키: 1 2 3 5 = 움직일 서보 고르기(1 팔 좌우, 2 팔 아래 관절, 3 팔 가운데 관절, 5 카메라 상하)
+    + 또는 w = 고른 서보 +쪽 / - 또는 s = -쪽 / [ = 1도씩 / ] = 5도씩
+    f = 힘 빼기(손으로 팔을 움직임. 팔이 처지니 받칠 것) -> f 한 번 더 = 그 자리에서 고정
+    r = 지금 각도 다시 읽기 / z = 저장한 자세로 되돌리기 / p = 저장 / h = 도움말 / q = 끝내기
+기준: 라인이 화면 아래 절반 가운데에 보이고, 가로줄마다 초록 점이 하나씩 찍히면 좋다.
+      조향 줄(파란 줄)이 차체 앞 10~15cm 바닥에 오고, 갈림길이 갈라지기 전에 보일 만큼 멀리 보면 좋다."""
+
+
+def _framing(an):
+    """자세가 괜찮은지 숫자로: 선이 하나로 보이는 줄 수, 조향 줄에서 선의 가로 위치(가운데 기준 px)."""
+    one = sum(1 for _, segs in an.rows if len(segs) == 1)
+    segs = an.rows[an.ctrl_idx][1]
+    off = None
+    if segs:
+        off = min(segs, key=lambda v: abs(v - an.w / 2.0)) - an.w / 2.0
+    return one, len(an.rows), off
+
+
+def cmd_arm(a, cfg):
+    from .. import arm as A
+    try:
+        if a.read:
+            print(u"지금 카메라 자세: " + A.fmt(A.read_pose()))
+            print(u"저장한 자세:     " + A.fmt(A.saved_pose(cfg)))
+            return 0
+        if a.apply:
+            r = A.apply_saved(cfg)
+            return 0 if r["ok"] else 1
+        if a.save_now:
+            return _arm_save(a, cfg, A.read_pose())
+        A.read_pose()          # 포트가 열리는지 먼저 확인
+    except RuntimeError as e:
+        print(u"서보를 못 써요: %s" % e)
+        return 1
+    return _arm_interactive(a, cfg, A)
+
+
+def _arm_save(a, cfg, pose):
+    from .. import arm as A
+    if any(v is None for v in pose.values()):
+        print(u"못 읽은 서보가 있어서 저장하지 않았어요: " + A.fmt(pose))
+        return 1
+    old = A.saved_pose(cfg)
+    bak, _ = A.save_pose(a.config, pose)
+    print(u"카메라 자세를 저장했어요: %s (원래 설정: %s)" % (A.fmt(pose), bak))
+    d = A.pose_diff(old, pose) if old else None
+    if old is None or d is None or d > 1.0:
+        print(u"자세가 바뀌었으니 이 자세에서 다시 재야 하는 것:")
+        for x in A.REDO:
+            print(u"  - " + x)
+    cfg.setdefault("arm", {})["servo_angles"] = dict(pose)
+    return 0
+
+
+def _arm_interactive(a, cfg, A):
+    from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
+    saved = A.saved_pose(cfg)
+    if saved and not a.keep:
+        print(u"저장한 자세로 맞추고 시작해요(지금 자세에서 시작하려면 --keep): " + A.fmt(saved))
+        A.move(saved)
+    pose = A.read_pose()
+    missing = [k for k, v in pose.items() if v is None]
+    if missing:
+        print(u"[주의] %s번 서보를 못 읽었어요. 그 서보는 건드리지 않아요." % u", ".join(missing))
+    view = None
+    if a.view:
+        from ..liveview import LiveView, local_ips
+        view = LiveView(port=a.view, fps=8.0)
+        print(u"화면: " + u", ".join(u"http://%s:%d" % (ip, view.port) for ip in local_ips()))
+    cam = None
+    if a.camera != "none":
+        cam = open_camera(a.camera, cfg["camera"])
+    print(ARM_HELP)
+    sel, step, free, dirty = "5", 2.0, False, False
+    last_line = [None]
+    junc, patch = JunctionTracker(cfg), PatchTracker(cfg)
+
+    def status(force=False):
+        line = u"[%s] 고른 서보 %s번(%s) %g도씩 | %s%s" % (
+            u"힘 뺌" if free else u"고정", sel, A.NAMES.get(sel, u""), step, A.fmt(pose), u" *저장 안 함" if dirty else u"")
+        if force or line != last_line[0]:
+            print(line)
+            last_line[0] = line
+
+    status(True)
+    n = 0
+    try:
+        with _Keys() as keys:
+            while True:
+                if cam is not None:
+                    frame = cam.read()
+                    if frame is not None:
+                        an = analyze(frame, cfg)
+                        one, rows, off = _framing(an)
+                        if view is not None and view.want():
+                            dbg = draw_debug(frame, an, None, junc, patch, u"servo %s  %s" % (sel, u" ".join(
+                                u"%s:%s" % (k, u"?" if v is None else u"%.0f" % v) for k, v in sorted(pose.items()))))
+                            view.publish(dbg)
+                            view.set_status([
+                                (u"카메라 자세", A.fmt(pose)),
+                                (u"고른 서보", u"%s번 %s, %g도씩" % (sel, A.NAMES.get(sel, u""), step)),
+                                (u"선 하나로 보이는 줄", u"%d / %d" % (one, rows)),
+                                (u"조향 줄 선 위치", u"-" if off is None else u"가운데에서 %+.0fpx" % off),
+                                (u"상태", (u"힘 뺌(손으로 움직이는 중)" if free else u"고정") + (u", 저장 안 함" if dirty else u""))])
+                        if n % 40 == 0 and a.camera != "none" and view is None:
+                            cv2.imwrite(os.path.join(a.out, "arm_preview.png"),
+                                        draw_debug(frame, an, None, junc, patch, None))
+                        n += 1
+                k = keys.get(0.03 if cam is not None else 0.5)
+                if k is None:
+                    continue
+                if k in "1235":
+                    sel = k
+                elif k in "+=wW-sS" and not free:
+                    if pose.get(sel) is None:
+                        print(u"%s번 서보 각도를 몰라서 움직이지 않아요(r로 다시 읽기)" % sel)
+                        continue
+                    pose[sel] = round(pose[sel] + (step if k in "+=wW" else -step), 1)
+                    A.move({sel: pose[sel]}, speed=300, settle_s=0.0)
+                    dirty = True
+                elif k == "[":
+                    step = 1.0
+                elif k == "]":
+                    step = 5.0
+                elif k in "fF":
+                    if not free:
+                        A.torque(False)
+                        free = True
+                        print(u"힘을 뺐어요. 팔을 손으로 받쳐 맞춘 뒤 f를 다시 누르세요.")
+                    else:
+                        pose = A.hold_here()
+                        free, dirty = False, True
+                elif k in "rR":
+                    pose = A.read_pose()
+                elif k in "zZ":
+                    if saved:
+                        A.move(saved)
+                        pose = A.read_pose()
+                        dirty = False
+                    else:
+                        print(u"저장한 자세가 없어요.")
+                elif k in "pP":
+                    if free:
+                        pose = A.hold_here()
+                        free = False
+                    if _arm_save(a, cfg, pose) == 0:
+                        saved, dirty = dict(pose), False
+                elif k in "hH?":
+                    print(ARM_HELP)
+                elif k in "qQ\x1b":
+                    break
+                status()
+    finally:
+        if free:
+            A.hold_here()
+        if cam is not None:
+            cam.close()
+        if view is not None:
+            view.close()
+    if dirty:
+        print(u"[주의] 바꾼 자세를 저장하지 않았어요. 다음에는 저장한 자세(%s)로 맞춰요." % A.fmt(saved))
     return 0
 
 
@@ -192,17 +421,29 @@ def main(argv=None):
     ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("snap")
+    s.add_argument("--no-arm", action="store_true", help="저장한 카메라 자세로 팔을 맞추지 않음")
     s.add_argument("--camera", default="gst")
     s.add_argument("--out", default=os.path.join(ROOT, "data", "snap"))
     s.add_argument("--count", type=int, default=1, help="원본 해상도로 연속 촬영할 장 수(캘리브레이션용)")
     s.add_argument("--interval", type=float, default=1.5, help="연속 촬영 간격(초)")
     s.add_argument("--board", default="auto", help="연속 촬영 때 체커보드 확인: 9x6처럼 안쪽 모서리 수, auto, none")
     gr = sub.add_parser("ground")
+    gr.add_argument("--no-arm", action="store_true", help="저장한 카메라 자세로 팔을 맞추지 않음")
     gr.add_argument("--camera", default="gst")
     gr.add_argument("--out", default=os.path.join(ROOT, "data", "ground"))
     gr.add_argument("--enable-motors", action="store_true")
     gr.add_argument("--pulse-s", type=float, default=0.2, help="한 번 돌 때 모터를 켜는 시간(초)")
     gr.add_argument("--settle-s", type=float, default=0.8, help="돌고 나서 찍기 전 기다리는 시간(초)")
+    ar = sub.add_parser("arm", help="카메라 자세(팔 서보 각도) 맞추기·저장")
+    ar.add_argument("--camera", default="gst", help="gst | jetbot | none(화면 없이 각도만)")
+    ar.add_argument("--view", type=int, nargs="?", const=8080, default=0, metavar="PORT",
+                    help="브라우저로 검출 화면 보기(http://<젯슨 IP>:PORT). 없으면 --out에 arm_preview.png를 계속 저장")
+    ar.add_argument("--out", default=os.path.join(ROOT, "data", "snap"))
+    ar.add_argument("--keep", action="store_true", help="저장한 자세로 먼저 맞추지 않고 지금 자세에서 시작")
+    ar.add_argument("--read", action="store_true", help="지금 각도와 저장한 각도만 출력")
+    ar.add_argument("--apply", action="store_true", help="저장한 자세로 맞추기만")
+    ar.add_argument("--save-now", action="store_true",
+                    help="지금 자세를 그대로 저장(주피터 등 다른 방법으로 맞췄을 때)")
     h = sub.add_parser("hsv")
     h.add_argument("image")
     for k in ("x", "y", "w", "h"):
@@ -216,6 +457,10 @@ def main(argv=None):
         return cmd_snap(a, cfg)
     if a.cmd == "hsv":
         return cmd_hsv(a, cfg)
+    if a.cmd == "arm":
+        if not os.path.isdir(a.out):
+            os.makedirs(a.out)
+        return cmd_arm(a, cfg)
     if a.cmd == "ground":
         return cmd_ground(a, cfg)
     if a.cmd == "speed":

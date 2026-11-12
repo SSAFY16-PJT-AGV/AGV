@@ -40,6 +40,18 @@ def _parse_board(s):
     return int(a), int(b)
 
 
+def _snap_arm(folder):
+    """camtool snap이 사진 폴더에 남긴 카메라 자세."""
+    p = os.path.join(folder, "snap.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with io.open(p, encoding="utf-8") as f:
+            return json.load(f).get("arm")
+    except (IOError, ValueError):
+        return None
+
+
 def run(folder, cfg, board=None, square=25.0, quiet=False):
     """반환: (결과 dict, 보고 정보). 결과는 camera_calib.json 내용."""
     say = (lambda *a: None) if quiet else print
@@ -125,7 +137,16 @@ def run(folder, cfg, board=None, square=25.0, quiet=False):
         "camera": {"sensor_id": c.get("sensor_id", 0), "capture_width": c.get("capture_width"),
                    "capture_height": c.get("capture_height"), "flip": c.get("flip", 0)},
         "date": time.strftime("%Y-%m-%d %H:%M"),
+        "arm": _snap_arm(folder),
     }
+    if out["arm"] is None:
+        info["warnings"].append(u"사진을 찍을 때의 카메라 자세 기록(snap.json)이 없어요. 주행 자세와 같은 자세에서 찍었는지 "
+                                u"확인하세요.")
+    else:
+        from ..arm import calib_pose_warning
+        w = calib_pose_warning(cfg, out["arm"], u"이 사진들")
+        if w:
+            info["warnings"].append(w + u" (camtool arm으로 저장한 자세)")
     if (c.get("capture_width"), c.get("capture_height")) != size:
         info["warnings"].append(u"사진 해상도 %dx%d가 설정의 camera.capture %sx%s와 달라요. 주행과 같은 센서 모드로 찍어야 "
                                 u"맞아요." % (size[0], size[1], c.get("capture_width"), c.get("capture_height")))
