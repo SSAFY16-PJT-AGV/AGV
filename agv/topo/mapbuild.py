@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""노드 이벤트 로그 -> 위상 맵 JSON (topo-v0).
+"""노드 이벤트 로그 -> 위상 맵 dict (topo-v0). 파일로 쓸 때는 export.to_agv_map_v1로 팀 공통 형식(agv-map-v1)으로 바꾼다.
 
 노드 식별 방법
 - 색 패치: 색이 곧 ID (P_yellow 등). 한 맵에서 같은 색 패치는 하나라고 가정한다.

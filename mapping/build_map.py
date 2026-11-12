@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""노드 이벤트 로그(JSONL) 여러 개 -> 위상 맵 JSON(topo-v0).
+"""노드 이벤트 로그(JSONL) 여러 개 -> 팀 공통 맵 JSON(agv-map-v1).
 
     python3 mapping/build_map.py data/run1/events.jsonl [data/run2/events.jsonl ...] \\
         -o maps/mat_test.json --map-id mat_test
 
-결과는 mapping/viewer/index.html 에 끌어다 놓아서 확인한다.
+결과는 mapping/viewer/index.html 에 끌어다 놓아서 확인한다. 디지털 트윈(언리얼)에서 보려면
+그 파일을 트윈 프로젝트의 Content/Data/warehouse_map.json 으로 복사한다(--twin 으로 바로 복사 가능).
+agv-map-v1은 트윈 맵 형식에 탐색기 정보를 더한 것이다(mapping/README.md). 좌표는 아직 엣지 길이로
+추정한 배치다.
 Python 3.6 이상, 표준 라이브러리만 사용(Jetson에서 바로 돌려도 된다).
 """
 import argparse
@@ -15,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agv.topo import build_map, read_events  # noqa: E402
+from agv.topo import build_map, read_events, to_agv_map_v1, twin_problems  # noqa: E402
 
 
 def main():
@@ -26,6 +29,10 @@ def main():
     ap.add_argument("--version", type=int, default=0)
     ap.add_argument("--origin", default=None, help="원점 노드 ID (기본: 처음 만난 패치)")
     ap.add_argument("--no-debug", action="store_true", help="debug.events 섹션 제외")
+    ap.add_argument("--format", choices=["v1", "topo-v0"], default="v1",
+                    help="v1: 팀 공통(트윈 호환, 기본). topo-v0: 예전 위상 맵 형식")
+    ap.add_argument("--twin", default=None, metavar="트윈_프로젝트_폴더",
+                    help="결과를 <트윈 폴더>/Content/Data/warehouse_map.json 에도 복사(원래 파일은 .bak)")
     a = ap.parse_args()
 
     lists = [read_events(p) for p in a.events]
@@ -37,10 +44,28 @@ def main():
     d = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(d):
         os.makedirs(d)
+    doc = m if a.format == "topo-v0" else to_agv_map_v1(m)
     with io.open(a.out, "w", encoding="utf-8") as f:
-        f.write(json.dumps(m, ensure_ascii=False, indent=1))
+        f.write(json.dumps(doc, ensure_ascii=False, indent=1))
+    if a.format == "v1":
+        probs = twin_problems(doc)
+        print(u"형식: agv-map-v1 (좌표는 추정 배치, 원점 %s) / 트윈 로더 검사: %s" % (
+            doc["origin_node"], u"통과" if not probs else u"문제 %d개" % len(probs)))
+        for p in probs:
+            print(u"  " + p)
+    if a.twin:
+        import shutil
+        import time
+        dst = os.path.join(a.twin, "Content", "Data", "warehouse_map.json")
+        if not os.path.isdir(os.path.dirname(dst)):
+            raise SystemExit(u"트윈 프로젝트 폴더가 아닌 것 같아요(Content/Data 없음): %s" % a.twin)
+        if os.path.exists(dst):
+            shutil.copy(dst, dst + time.strftime(".bak-%Y%m%d-%H%M%S"))
+        shutil.copy(a.out, dst)
+        print(u"트윈에 복사: %s" % dst)
 
-    print(u"노드 %d개, 엣지 %d개 -> %s" % (len(m["nodes"]), len(m["edges"]), a.out))
+    extra = u"" if a.format == "topo-v0" else u" (스퍼 끝 노드·엣지 %d개 더함)" % (len(doc["nodes"]) - len(m["nodes"]))
+    print(u"노드 %d개, 엣지 %d개%s -> %s" % (len(m["nodes"]), len(m["edges"]), extra, a.out))
     for e in m["edges"]:
         print(u"  %-4s %-9s -> %-9s %-6s %6.0f ± %3.0f mm  (%d회)" % (
             e["id"], e["from"], e["to"], e["branch"] or "", e["length_mm"], e["length_std_mm"],

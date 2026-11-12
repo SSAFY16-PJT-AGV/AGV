@@ -151,6 +151,18 @@ class TestSimV2(unittest.TestCase):
         self.assertIsNone(nodes["P_yellow"]["spur"])
         t = [n for n in m["nodes"] if n["type"] == "tee"][0]
         self.assertTrue(any(e["from"] == "P_red" and e["to"] == t["id"] for e in m["edges"]))
+        # 팀 공통 맵(agv-map-v1): 트윈 로더가 그대로 읽고, 스퍼 끝은 destination 노드
+        from agv.topo import to_agv_map_v1, twin_problems
+        d = to_agv_map_v1(m)
+        self.assertEqual(twin_problems(d), [])
+        dests = [n for n in d["nodes"] if n["type"] == "destination"]
+        self.assertEqual(sorted(n["spur_of"] for n in dests), sorted(
+            [n["id"] for n in m["nodes"] if n.get("spur")] + [t["id"]]))
+        P = dict((n["id"], (n["x"], n["y"])) for n in d["nodes"])
+        self.assertEqual(P[d["origin_node"]], (0.0, 0.0))
+        # 시계 방향으로 도는 맵: 고리 안쪽은 원점에서 진행 방향 오른쪽(+y)이라 노드들의 무게중심이 +y 쪽
+        ys = [n["y"] for n in d["nodes"] if n["type"] != "destination"]
+        self.assertGreater(sum(ys) / len(ys), 0.2)
 
 
 @unittest.skipIf(run_sim is None, "sim/mat/ 없음")

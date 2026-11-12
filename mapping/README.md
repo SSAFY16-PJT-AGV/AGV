@@ -1,4 +1,4 @@
-# mapping/ — 위상 맵 생성과 디버그 뷰어
+# mapping/ — 맵 생성(팀 공통 형식 agv-map-v1)과 디버그 뷰어
 
 ## 맵 만들기
 
@@ -6,35 +6,59 @@
 python3 mapping/build_map.py data/runs/<시각>/events.jsonl [다른 주행 로그 ...] -o maps/<이름>.json --map-id <이름>
 ```
 
-여러 주행 로그를 한꺼번에 넣으면 합쳐서 맵 하나를 만든다. 터미널에 엣지 목록, 미탐색 가지, 경고가 나온다. 표준 라이브러리만 쓰므로 Jetson에서 바로 돌려도 된다.
+여러 주행 로그를 한꺼번에 넣으면 합쳐서 맵 하나를 만든다. 터미널에 엣지 목록, 미탐색 가지, 경고, 트윈 로더 검사 결과가 나온다. 표준 라이브러리만 쓰므로 Jetson에서 바로 돌려도 된다.
+
+결과는 팀 공통 맵 형식(**agv-map-v1**)이다. 예전 형식이 필요하면 `--format topo-v0`.
+
+### 디지털 트윈(언리얼)에서 보기
+
+agv-map-v1은 트윈(`feature/digital-twin`)의 `warehouse_map.json` 형식을 그대로 포함하므로, 트윈 코드를 고치지 않고 파일만 바꿔 넣으면 된다.
+
+```
+python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json --twin <트윈 프로젝트 폴더>
+```
+
+`--twin`을 주면 `<트윈 폴더>/Content/Data/warehouse_map.json`에 복사한다(원래 파일은 `.bak-<시각>`). 손으로 복사해도 된다.
+
+트윈에서 볼 때 알아 둘 것:
+
+- **좌표는 추정 배치다.** 엣지 길이(주행 거리)와 "색 패치는 곧은 라인 위에 있다"는 가정으로 배치를 추정했다. 연결 관계와 길이는 맞지만 모양은 실제 매트와 다를 수 있다(길이만으로는 고리 모양이 하나로 정해지지 않음). `pos_source: "estimated"`로 표시된다. 실측 좌표는 바닥 mm 좌표계 단계에서 채운다.
+- **길은 한쪽 방향이다.** 트윈 경로 찾기는 지금 엣지를 양방향으로 본다(트윈 코드 주석: 단방향은 추후 확장). 맵에는 `directed: true`가 들어 있어서 트윈이 나중에 읽으면 된다.
+- 트윈 레벨에서 시뮬레이션 출발·도착 노드를 예시 맵 ID(`J01` 등)로 정해 두었다면 새 맵의 노드 ID(`P_orange`, `S1` 등)로 바꿔야 한다.
 
 ## 뷰어
 
-`mapping/viewer/index.html`을 브라우저로 열고 맵 JSON을 끌어다 놓는다. 버튼으로 열거나 붙여넣어도 된다. 처음에는 시뮬레이션 예시 맵이 떠 있다.
+`mapping/viewer/index.html`을 브라우저로 열고 맵 JSON을 끌어다 놓는다. 버튼으로 열거나 붙여넣어도 된다. 처음에는 시뮬레이션 예시 맵이 떠 있다. agv-map-v1, 트윈 맵(`warehouse_map.json`), 예전 topo-v0을 모두 연다.
 
-- **배치**: 맵에 좌표(`pos`)가 없으면 엣지 길이를 맞추도록 자동 배치(응력 최소화)한 추정 모양을 그린다. 원점 패치가 아래로 오게 돌린다. 노드는 끌어서 옮길 수 있다.
-- **표시**: 색 패치는 실제 색 사각형, 갈라짐은 ◆, 합쳐짐은 ●, 미탐색 가지는 점선으로 그린다. 검출 누락으로 보고 뺀 엣지는 붉은 점선이다.
+- **배치**: 맵 파일의 좌표로 그린다. 좌표가 없는 예전 맵은 엣지 길이로 자동 배치한다. 왼쪽 아래에 좌표 출처(추정/파일)가 나온다. 노드는 끌어서 옮길 수 있다.
+- **표시**: 색 패치는 실제 색 사각형, 갈라짐은 ◆, 합쳐짐은 ●, 미탐색 가지는 점선으로 그린다. 검출 누락으로 보고 뺀 엣지는 붉은 점선이다. 스퍼 끝(destination) 노드는 따로 그리지 않고 패치 옆 짧은 선으로 그린다.
 - **패널**: 요약, 경고, 선택한 노드·엣지의 값, 엣지 표, 이벤트 로그(`debug.events`)를 보여 준다. 이벤트 행을 누르면 그 관측이 묶인 노드가 선택된다. 노드 식별이 이상할 때 여기서 원인을 찾는다.
 - **배경 사진**: 매트를 위에서 찍어 반듯하게 편 사진을 깔고, 폭과 위치를 mm로 맞춘 뒤 노드를 끌어 비교한다.
-- 로컬 서버로 열면 주소로 바로 불러올 수 있다: `python3 -m http.server` 후 `http://localhost:8000/mapping/viewer/?map=../../maps/sim_ssafy_mat.json`
+- 로컬 서버로 열면 주소로 바로 불러올 수 있다: `python3 -m http.server` 후 `http://localhost:8000/mapping/viewer/?map=../../maps/sim_ssafy_v2.json`
 
-## 맵 JSON 형식 (topo-v0)
+## 맵 JSON 형식 (agv-map-v1)
 
-설계 문서 v0.2 4장 맵 JSON의 `nodes`·`edges` 골격을 따르되, 마커 대신 색 패치·갈림길을 노드로 쓴다. 팀 합의 전의 디버그용 형식이라 `schema: "topo-v0"`으로 구분한다.
+팀 맵 형식이 설계 문서 4장 형식, 탐색기의 topo-v0, 트윈의 `warehouse_map.json`으로 갈라져 있던 것을 하나로 모으는 첫 단계다. 트윈 로더가 읽는 필드를 뼈대로 두고 탐색기 정보를 필드로 더했다. 트윈은 모르는 필드를 무시한다.
 
 ```json
 {
-  "map_id": "sim_ssafy_mat", "version": 0, "schema": "topo-v0", "unit": "mm",
-  "origin_node": "P_orange",
+  "map_id": "sim_ssafy_v2", "version": 0, "schema": "agv-map-v1",
+  "coordinate_unit": "meter", "coordinate_frame": "x_forward_y_right",
+  "origin_node": "P_orange", "pos_source": "estimated", "one_way": true,
   "nodes": [
-    {"id": "P_orange", "type": "patch", "color": "orange", "pos": null, "visits": 3},
-    {"id": "S1", "type": "split", "pos": null, "visits": 3, "branches": {"left": "E3", "right": "E9"}},
-    {"id": "M1", "type": "merge", "pos": null, "visits": 3}
+    {"id": "P_orange", "x": 0.0, "y": 0.0, "type": "access", "kind": "patch", "color": "orange", "visits": 4,
+     "spur": {"side": "left", "seen": 2, "length_m": null, "node": "D_P_orange"}},
+    {"id": "S1", "x": 0.36, "y": 0.0, "type": "junction", "kind": "split", "visits": 4,
+     "branches": {"left": "E2", "right": "E14"}},
+    {"id": "D_P_orange", "x": -0.08, "y": -0.13, "type": "destination", "kind": "spur_end",
+     "spur_of": "P_orange", "length_estimated": true}
   ],
   "edges": [
-    {"id": "E1", "from": "P_orange", "to": "P_green", "branch": null,
-     "length_mm": 1060, "length_std_mm": 4, "length_src": "odo", "traversals": 3,
-     "shape": null, "bidirectional": false, "lanes": 1}
+    {"id": "E1", "from": "P_orange", "to": "S1", "type": "main", "points": [],
+     "branch": null, "length_m": 0.3625, "length_std_m": 0.0139, "length_src": "odo",
+     "traversals": 4, "directed": true, "lanes": 1},
+    {"id": "E_D_P_orange", "from": "P_orange", "to": "D_P_orange", "type": "destination", "points": [],
+     "branch": "left", "length_m": null, "directed": false, "lanes": 1}
   ],
   "explore": {"complete": true, "unexplored": []},
   "warnings": [],
@@ -42,20 +66,48 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl [다른 주행 로�
 }
 ```
 
+**트윈 로더가 꼭 읽는 필드** (하나라도 없으면 트윈이 맵 전체를 안 읽는다. `build_map.py`가 내보낼 때 같은 검사를 한다)
+
 | 필드 | 뜻 |
 | --- | --- |
-| `nodes[].type` | `patch`(색 패치, ID는 `P_<색>`), `split`(갈라짐), `merge`(합쳐짐), `cross`(X자 교차), `tee`(패치에서 떨어진 스퍼) |
-| `nodes[].spur` | 패치 위 스퍼. `{"side": "left", "seen": 2, "length_mm": 180}`. 지나간 횟수의 30% 이상에서 봤거나 들어갔다 나왔을 때. 길이는 들어갔다 나온 적이 있을 때만 |
-| `nodes[].length_mm` | `tee` 노드의 스퍼 길이(들어갔다 나온 적이 있을 때) |
-| `nodes[].crossing` | 패치 위에서 다른 선이 X자로 지나감 |
-| `nodes[].through` | 여러 길이 지나는 노드에서 실제로 지나간 (들어온 엣지, 나간 엣지) 쌍. 교차에서 꺾으면 안 되므로 경로 계획은 이 쌍만 쓴다 |
-| `nodes[].same_spot` | 같은 자리의 다른 교차 노드. 교차는 선마다 노드가 따로 생기므로, 충돌 회피 때 하나로 본다 |
-| `nodes[].pos` | 실제 좌표 [x, y] mm. 지금은 항상 `null`. 2D 형상 매핑이 생기면 채운다 |
-| `edges[].branch` | 갈라짐에서 나가는 엣지면 `left`/`right`(로봇 진행 방향 기준) |
-| `edges[].length_mm` | 이벤트 사이 이동거리 평균. `length_src`가 `odo`면 모터 명령 적분, `time`이면 시간 × 속도 |
-| `edges[].shape` | 엣지 형상 점 목록. 지금은 `null` |
-| `explore.unexplored` | 한쪽 가지만 가 본 갈라짐 |
-| `debug.events` | 관측 하나하나가 어느 노드로 묶였는지(디버깅용, `--no-debug`로 뺄 수 있음) |
+| `nodes[].id`, `x`, `y` | 노드 ID와 좌표(m) |
+| `edges[].from`, `to` | 엣지 양 끝 노드 ID |
+| `edges[].type` | `main`(라인), `destination`(스퍼: 패치에서 빠져 비켜서는 곳), `connector`(트윈 예시 맵에만 있음) |
+| `edges[].points` | 곡선 중간 좌표 `[{"x", "y"}]`(m). 지금은 형상을 몰라 항상 빈 배열(직선으로 그려짐) |
+
+**좌표계**
+
+- 단위는 m(트윈과 같음). 설계 문서 v0.3은 mm라서 문서 쪽을 맞춰야 한다(합의 필요).
+- 원점 패치가 (0, 0), 원점 패치에서 나가는 진행 방향이 +x다(설계 문서 v0.3 4장).
+- **+y는 +x의 오른쪽**이다. 언리얼(왼손 좌표계: X 앞, Y 오른쪽, Z 위)과 같아서, 트윈이 x, y를 그대로 X, Y로 써도 위에서 볼 때 실제 매트와 같은 모양(거울상 아님)이 된다. 각도도 언리얼처럼 위에서 볼 때 시계 방향이 +다. 수학 좌표(+y가 왼쪽)로 그리는 프로그램은 y를 뒤집어 그린다(뷰어가 그렇게 함).
+- 거울상은 갈림길의 왼쪽/오른쪽 기록으로 바로잡는다(왼쪽 가지가 진행 방향 왼쪽).
+
+**노드**
+
+| 필드 | 뜻 |
+| --- | --- |
+| `type` | 트윈 분류: `access`(색 패치), `junction`(갈라짐·합쳐짐·교차·스퍼 갈림), `destination`(스퍼 끝) |
+| `kind` | 탐색기 분류: `patch`, `split`, `merge`, `cross`, `tee`(패치에서 떨어진 스퍼 갈림), `spur_end` |
+| `color` | 패치 색. 패치 ID는 `P_<색>`이라 한 맵에서 같은 색은 하나로 가정 |
+| `spur` | 이 노드에 달린 스퍼: `side`, `seen`(본 횟수), `length_m`(들어갔다 나온 적이 있을 때만), `node`(스퍼 끝 노드 ID) |
+| `crossing` | 패치 위에서 다른 선이 X자로 지나감 |
+| `through` | 여러 길이 지나는 노드에서 실제로 지나간 (들어온 엣지, 나간 엣지) 쌍. 교차에서 꺾으면 안 되므로 경로 계획은 이 쌍만 쓴다 |
+| `same_spot` | 같은 자리의 다른 교차 노드. 교차는 선마다 노드가 따로 생기므로 충돌 회피 때 하나로 본다 |
+| `branches` | 갈라짐에서 `left`/`right` 엣지 ID |
+| `spur_of`, `length_estimated` | 스퍼 끝 노드: 어느 노드의 스퍼인지, 길이를 몰라 그림용 길이(0.15m)로 놓았는지 |
+
+**엣지**
+
+| 필드 | 뜻 |
+| --- | --- |
+| `branch` | 갈라짐에서 나가는 엣지면 `left`/`right`(로봇 진행 방향 기준). 스퍼 엣지는 스퍼 쪽 |
+| `length_m`, `length_std_m` | 이벤트 사이 이동거리 평균·표준편차(m). 속도는 패치로 보정(`length_src: "odo"`) |
+| `traversals` | 지나간 횟수 |
+| `directed` | 한쪽 방향만 다님(`from` → `to`). 스퍼 엣지는 들어갔다 나오므로 `false` |
+
+**맵 전체**: `pos_source`(`estimated` = 길이로 추정한 배치, `measured` = 실측), `one_way`, `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
+
+아직 정하지 않은 것(트윈·서버 담당과 합의): 설계 문서의 단위(mm)를 m로 맞출지, 선반·벽·구역 필드(설계 문서 4장)를 어떻게 얹을지, 트윈이 `directed`를 읽을지.
 
 ### 노드 식별
 
@@ -81,9 +133,9 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl [다른 주행 로�
 
 ### 한계 (v0)
 
-- **맵 JSON 형식이 팀 안에서 아직 하나가 아니다**: 이 `topo-v0`, 설계 문서 v0.2 4장 형식(서버 브랜치 예시 맵 `two-segment-map.json`도 이쪽), 디지털 트윈 #39의 `warehouse_map.json`이 따로 있다. `topo-v0`는 노드 종류·갈림길 방향·길이·교차 통과 쌍이 있는 대신 `pos`·`shape`가 비어 있어서, 트윈과 서버가 지금은 바로 읽지 못한다. 별도 변환기를 두지 않고 형식 하나로 통일하는 방향이며, 구체 설계는 팀과 정한다.
+- **맵 형식 통일은 진행 중이다**: 트윈 형식을 뼈대로 한 agv-map-v1로 트윈은 바로 읽는다. 서버 브랜치 예시 맵(`two-segment-map.json`, 설계 문서 v0.2 4장 형식)과 설계 문서 4장은 아직 맞추지 않았다.
 
-- **실제 축척 형상 없음**: `pos`와 `shape`가 비어 있다. 뷰어의 모양은 길이로 추정한 배치일 뿐이다. 실제 2D 형상은 설계 문서의 버드아이뷰 모자이크 단계에서 채운다.
+- **실제 축척 형상 없음**: 좌표는 길이로 추정한 배치이고 `points`(곡선 형상)는 비어 있다. 실제 2D 형상은 바닥 mm 좌표계 단계에서 채운다.
 - **길이 정확도**: `patch.length_mm`를 넣으면 패치를 지날 때마다 속도를 다시 재므로 배터리·바닥 차이로 길이가 통째로 틀어지지 않는다(시뮬레이션: 속도가 20% 느리고 계속 느려져도 패치 사이 거리 오차 중앙값 2% 안팎). 시뮬레이션 기준 큰 구간은 ±3%, 노랑 쪽 분기는 −6% 정도다. 보라 쪽처럼 30~40cm짜리 짧은 분기는 카메라가 내다보는 거리보다 짧아서 −20% 이상 틀린다.
 - **같은 색 패치가 두 개인 맵**은 아직 구분하지 못한다.
 - **스퍼 길이**(`spur.length_mm`)는 로봇이 실제로 들어갔다 나온 스퍼만 채워진다. 직각 스퍼는 지나치기만 하므로 비어 있다.

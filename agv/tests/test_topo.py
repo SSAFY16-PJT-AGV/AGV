@@ -202,5 +202,64 @@ class TestExplorer(unittest.TestCase):
         self.assertTrue(ex.done)
 
 
+class TestExportV1(unittest.TestCase):
+    """팀 공통 맵(agv-map-v1) 내보내기: 트윈 로더 호환, 좌표계, 거울상, 스퍼 끝."""
+
+    def _map(self):
+        # 원점 P_o -> S(갈림길) -> 왼쪽 L / 오른쪽 R -> M(합류) -> P_o. P_o에는 왼쪽 스퍼
+        def e(i, a, b, L, br=None):
+            return {"id": i, "from": a, "to": b, "branch": br, "length_mm": L, "length_std_mm": 0.0,
+                    "length_src": "odo", "traversals": 1, "lanes": 1}
+        return {"map_id": "t", "version": 0, "origin_node": "P_o", "created_at": "x",
+                "nodes": [{"id": "P_o", "type": "patch", "color": "orange", "visits": 2,
+                           "spur": {"side": "left", "seen": 2, "length_mm": 200.0}},
+                          {"id": "S", "type": "split", "visits": 2, "branches": {"left": "E2", "right": "E3"}},
+                          {"id": "L", "type": "patch", "color": "red", "visits": 1},
+                          {"id": "R", "type": "patch", "color": "blue", "visits": 1},
+                          {"id": "M", "type": "merge", "visits": 2}],
+                "edges": [e("E1", "P_o", "S", 400), e("E2", "S", "L", 300, "left"), e("E3", "S", "R", 300, "right"),
+                          e("E4", "L", "M", 300), e("E5", "R", "M", 300), e("E6", "M", "P_o", 900)],
+                "explore": {"complete": True, "unexplored": []}, "warnings": []}
+
+    def test_twin_compatible_and_frame(self):
+        from agv.topo import to_agv_map_v1, twin_problems
+        d = to_agv_map_v1(self._map())
+        self.assertEqual(twin_problems(d), [])
+        self.assertEqual((d["schema"], d["coordinate_unit"], d["coordinate_frame"]),
+                         ("agv-map-v1", "meter", "x_forward_y_right"))
+        P = dict((n["id"], (n["x"], n["y"])) for n in d["nodes"])
+        self.assertEqual(P["P_o"], (0.0, 0.0))
+        self.assertGreater(P["S"][0], 0.2)                       # 원점에서 나가는 방향이 +x 쪽
+        # 갈림길 S의 왼쪽 가지(L)는 진행 방향 왼쪽 = 언리얼 방향 좌표에서 -y 쪽
+        self.assertLess(P["L"][1], P["R"][1])
+        # 스퍼 끝: 왼쪽 스퍼라 원점 패치의 -y 쪽, 길이 0.2m
+        self.assertEqual(P["D_P_o"], (P["D_P_o"][0], P["D_P_o"][1]))
+        self.assertLess(P["D_P_o"][1], -0.15)
+        de = [e for e in d["edges"] if e["type"] == "destination"][0]
+        self.assertEqual((de["from"], de["to"], de["length_m"]), ("P_o", "D_P_o", 0.2))
+        self.assertTrue(all(e["type"] == "main" and e["directed"] for e in d["edges"] if e["to"] != "D_P_o"))
+
+    def test_mirror_fix_is_independent_of_layout_flip(self):
+        from agv.topo import to_agv_map_v1
+        m = self._map()
+        # 일부러 거울상 배치를 줘도(+왼쪽이 오른쪽에) 왼쪽 가지가 왼쪽에 오도록 바로잡히는지
+        from agv.topo.export import estimate_layout, _orient
+        pos = estimate_layout(m)
+        flipped = dict((k, (p[0], -p[1])) for k, p in pos.items())
+        fixed = _orient(m, flipped, "P_o")
+        d = to_agv_map_v1(m, pos_mm=fixed)
+        P = dict((n["id"], (n["x"], n["y"])) for n in d["nodes"])
+        self.assertLess(P["L"][1], P["R"][1])
+        self.assertEqual(d["pos_source"], "measured")
+
+    def test_twin_problems_detects_missing_fields(self):
+        from agv.topo import twin_problems
+        bad = {"nodes": [{"id": "A", "x": 0, "y": 0}, {"id": "B", "pos": None}],
+               "edges": [{"from": "A", "to": "B", "points": []}]}
+        probs = twin_problems(bad)
+        self.assertTrue(any(u"노드 필드" in p for p in probs))
+        self.assertTrue(any(u"type" in p for p in probs))
+
+
 if __name__ == "__main__":
     unittest.main()
