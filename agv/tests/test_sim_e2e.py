@@ -327,3 +327,41 @@ class TestSpeedCalUnit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestShapeFromTrace(unittest.TestCase):
+    """궤도가 미끄러져 명령한 만큼 덜 돌아도(실효 궤도 폭 200mm, 실제 140mm), 주행 기록으로 실효 폭을
+    맞추고 패치 위치를 몇 cm 안으로 되살린다. 막다른 길 되돌아 나오기·급한 가지의 제자리 회전 포함."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_drawn_map_with_track_slip(self):
+        import numpy as np
+        from agv.topo import estimate_shape, read_trace, to_agv_map_v1, twin_problems
+        ev, gt = run_sim.run(os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"), self.tmp, seed=0,
+                             max_time_s=300, turn_slip=0.3, speed_scale=0.9,
+                             cfg_override={"patch": {"length_mm": 159.3}})
+        self.assertEqual(gt["finish_reason"], "explore_explored")
+        tr = read_trace(os.path.join(self.tmp, "trace.jsonl"))
+        self.assertEqual(tr["meta"]["patch_length_mm"], 159.3)
+        self.assertGreater(abs(tr["p"][-1]), 50.0)          # 제자리 회전도 기록됨
+        m = build_map([read_events(ev)], run_names=["r"])
+        res, why = estimate_shape(m, {"r": tr})
+        self.assertIsNone(why)
+        self.assertAlmostEqual(res["fit"]["track_eff_mm"] / 200.0, 1.0, delta=0.08)
+        self.assertLess(res["fit"]["loop_rms_mm"], 20.0)
+        # 패치 가운데 정답과 비교(회전·이동만 맞춤, 축척·거울상은 맞추지 않음)
+        est = np.array([res["pos"]["P_" + p["color"]] for p in gt["patches"]])
+        ref = np.array([p["center"] for p in gt["patches"]])
+        ma, mb = est.mean(0), ref.mean(0)
+        U, S, Vt = np.linalg.svd((est - ma).T.dot(ref - mb))
+        self.assertGreater(np.linalg.det(Vt.T.dot(U.T)), 0)  # 거울상이 아님
+        err = np.hypot(*((est - ma).dot(Vt.T.dot(U.T).T) + mb - ref).T)
+        self.assertLess(np.sqrt(np.mean(err ** 2)), 50.0, err)
+        d = to_agv_map_v1(m, shape=res)
+        self.assertEqual((d["pos_source"], twin_problems(d)), ("odometry", []))

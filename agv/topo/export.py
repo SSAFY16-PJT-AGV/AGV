@@ -9,8 +9,10 @@ agv-map-v1은 디지털 트윈(feature/digital-twin)의 `warehouse_map.json` 형
     nodes[]: id(문자열), x, y(숫자, 미터)
     edges[]: from, to(문자열), type(문자열), points(배열, 원소는 {x, y} 미터. 비어도 됨)
 
-좌표는 아직 실측이 아니다. 엣지 길이(주행 거리)에 맞춰 배치를 추정한 값이고 `pos_source`가
-"estimated"로 표시된다. 실제 축척 좌표는 바닥 mm 좌표계 단계에서 채운다.
+좌표의 출처는 `pos_source`에 적는다.
+    "odometry"   주행 기록(trace.jsonl)으로 되살린 궤적에서 계산한 노드 좌표와 엣지 곡선(topo/shape.py).
+                 축척은 패치 길이로 보정한 이동거리, 모양은 고리로 맞춘 회전량. 수 cm 오차가 있다.
+    "estimated"  주행 기록이 없을 때. 엣지 길이만 맞춘 배치라 연결 관계만 믿을 수 있다.
 좌표계: 원점 패치가 (0, 0), 원점 패치를 지나는 진행 방향이 +x(설계 문서 v0.3 4장).
 +y는 +x의 오른쪽이다. 언리얼(왼손 좌표계, X 앞·Y 오른쪽·Z 위)과 같은 방향이라서, 트윈이 x, y를
 그대로 X, Y로 써도 위에서 볼 때 매트와 같은 모양(거울상 아님)으로 보인다. 각도(yaw)도 언리얼처럼
@@ -181,10 +183,18 @@ def _travel_dir(m, nid, pos):
     return (1.0, 0.0) if L < 1e-9 else (sx / L, sy / L)
 
 
-def to_agv_map_v1(m, pos_mm=None):
-    """build_map 결과를 agv-map-v1 dict로. pos_mm를 안 주면 엣지 길이로 배치를 추정한다."""
+def to_agv_map_v1(m, pos_mm=None, shape=None):
+    """build_map 결과를 agv-map-v1 dict로.
+
+    shape: topo.shape.estimate_shape 결과(노드 좌표·진행 방향·엣지 곡선). 있으면 그 좌표를 쓴다.
+    pos_mm: 노드 좌표를 직접 줄 때. 둘 다 없으면 엣지 길이로 배치를 추정한다."""
+    if shape is not None:
+        pos_mm = shape["pos"]
     estimated = pos_mm is None
     pos = dict(pos_mm) if pos_mm is not None else estimate_layout(m)
+    heading = (shape or {}).get("heading") or {}
+    shapes = (shape or {}).get("shapes") or {}
+    spur_end = (shape or {}).get("spur_end") or {}
     nodes_out, edges_out = [], []
     dest = []      # (스퍼가 달린 노드, 쪽, 길이mm 또는 None)
     for nd in m["nodes"]:
@@ -209,8 +219,10 @@ def to_agv_map_v1(m, pos_mm=None):
             dest.append((nd["id"], nd.get("side") or "left", nd.get("length_mm")))
         nodes_out.append(o)
     for e in m["edges"]:
+        pts = shapes.get(e["id"]) or []
         edges_out.append({
-            "id": e["id"], "from": e["from"], "to": e["to"], "type": "main", "points": [],
+            "id": e["id"], "from": e["from"], "to": e["to"], "type": "main",
+            "points": [{"x": round(q[0] / 1000.0, 4), "y": round(-q[1] / 1000.0, 4) + 0.0} for q in pts[1:-1]],
             "branch": e.get("branch"), "length_m": _m(e.get("length_mm")),
             "length_std_m": _m(e.get("length_std_mm")), "length_src": e.get("length_src"),
             "traversals": e.get("traversals"), "directed": True, "lanes": e.get("lanes", 1)})
@@ -218,12 +230,12 @@ def to_agv_map_v1(m, pos_mm=None):
     for nid, side, L in dest:
         if nid not in pos:
             continue
-        dx, dy = _travel_dir(m, nid, pos)
+        dx, dy = heading.get(nid) or _travel_dir(m, nid, pos)
         nx, ny = (-dy, dx) if side == "left" else (dy, -dx)
         length = L if L else DEFAULT_SPUR_MM
         p = pos[nid]
         did = "D_" + nid
-        pos[did] = (p[0] + nx * length, p[1] + ny * length)
+        pos[did] = spur_end.get(nid) or (p[0] + nx * length, p[1] + ny * length)
         nodes_out.append({"id": did, "x": None, "y": None, "type": "destination", "kind": "spur_end",
                           "spur_of": nid, "length_estimated": not L})
         edges_out.append({"id": "E_" + did, "from": nid, "to": did, "type": "destination", "points": [],
@@ -248,13 +260,15 @@ def to_agv_map_v1(m, pos_mm=None):
         "coordinate_frame": "x_forward_y_right",
         "created_at": m.get("created_at"),
         "origin_node": m.get("origin_node"),
-        "pos_source": "estimated" if estimated else "measured",
+        "pos_source": "estimated" if estimated else ("odometry" if shape is not None else "measured"),
         "one_way": True,
         "nodes": nodes_out,
         "edges": edges_out,
         "explore": m.get("explore"),
         "warnings": m.get("warnings", []),
     }
+    if shape is not None:
+        out["shape_fit"] = shape.get("fit")
     if m.get("debug") is not None:
         out["debug"] = dbg
     return out

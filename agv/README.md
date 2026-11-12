@@ -11,7 +11,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `explore.py` | 실행 진입점. 카메라 → 인식 → 이벤트 기록 → 모터 |
 | `runner.py` | 한 프레임 처리 로직. 시뮬레이터(`sim/mat/`)도 같은 코드를 쓴다 |
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
-| `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더 |
+| `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더, 주행 기록으로 맵 모양 계산(`shape.py`) |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot), 팔 서보 |
 | `tools/camtool.py` | 현장 보정: 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
 | `camcalib.py`, `tools/calib.py` | 체커보드 사진으로 렌즈 보정값(어안/핀홀 자동 선택) 계산·불러오기 |
@@ -114,6 +114,8 @@ Ctrl+C를 누르면 모터를 세우고 `end` 이벤트를 남긴 뒤 끝난다.
 {"ts": 1730700012.95, "seq": 3, "type": "split", "odo_mm": 1735.2, "choice": "left", "cmd": "left", "onset": {"ratio": 1.23, "trend": 16.0}}
 {"ts": 1730700014.10, "seq": 5, "type": "merge", "odo_mm": 2013.4, "from_side": "left"}
 ```
+
+같은 폴더의 `trace.jsonl`에는 프레임마다 이동거리(`o`)와 좌우 모터 명령 차이 적분(`y`, 그중 제자리 회전 몫 `p`)이 남는다. 맵 빌더가 이것으로 실효 궤도 폭을 맞추고 맵 모양(노드 좌표·엣지 곡선)을 계산한다([mapping/README.md](../mapping/README.md#모양-계산-주행-기록)). passive 모드에서는 모터 명령이 없어서 남기지 않는다.
 
 `odo_mm`은 모터 명령 × 속도를 적분한 추정 이동거리에 판정 지점까지 거리(`geom`)를 더한 값이다. 속도는 `patch.length_mm`가 있으면 패치를 지날 때마다 다시 잰 값(`note` `speed_cal`)을 쓴다. passive 모드에서는 `null`이고, 이때 빌더가 시간 × 속도로 대신 계산한다. 교차는 `cross`(다른 선이 들어온 쪽 `from_side`), 스퍼는 `tee`(`side`)로 남는다.
 

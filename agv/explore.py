@@ -17,7 +17,7 @@
     # 실시간 화면: 어느 모드든 --view를 붙이고 노트북·폰 브라우저에서 http://<젯슨 IP>:8080
     python3 -m agv.explore --mode drive --enable-motors --view
 
-결과: data/runs/<시각>/events.jsonl (+ camera.mp4, debug/*.jpg)
+결과: data/runs/<시각>/events.jsonl, trace.jsonl(회전 기록, 맵 모양 계산용) (+ camera.mp4, debug/*.jpg)
 맵 만들기: python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/<이름>.json
 Ctrl+C로 언제든 멈춘다(모터 정지 후 end 이벤트 기록).
 """
@@ -180,7 +180,8 @@ def main(argv=None):
         a.show = False
     runner = ExploreRunner(cfg, logger, mode=a.mode, explorer=Explorer(max_laps=a.max_laps),
                            ask_fn=make_ask_fn(motors, view), speed_mm_s=rob["speed_mm_s"],
-                           robot_id=rob.get("id", "agv1"), map_hint=None)
+                           robot_id=rob.get("id", "agv1"), map_hint=None,
+                           trace_path=os.path.join(out, "trace.jsonl"))
     _note_camera_calib(cfg, logger, runner)
     writer = None
     period = 1.0 / a.fps

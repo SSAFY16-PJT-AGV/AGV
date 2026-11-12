@@ -4,7 +4,7 @@
     python3 sim/mat/run_sim.py --out data/sim_run --video
     python3 mapping/build_map.py data/sim_run/events.jsonl -o maps/sim.json
 
-산출물: events.jsonl(실물과 같은 형식), gt.json(정답 노드 위치·경로 길이·궤적),
+산출물: events.jsonl·trace.jsonl(실물과 같은 형식), gt.json(정답 노드 위치·경로 길이·궤적),
 --video면 run.mp4(카메라 시점 + 위에서 본 궤적).
 """
 import argparse
@@ -39,9 +39,11 @@ class SimClock(object):
 def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         mode="drive", speed_err=0.05, slip=0.03, vmax_mm_s=500.0, track_mm=140.0,
         cfg_override=None, quiet=True, max_laps=8, raw_video=False, start_pose=None,
-        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0):
+        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None):
     """speed_scale: 실제 속도 / 설정 속도를 이 값으로 고정(기본: 1 ± speed_err 무작위).
-    speed_drift: 1분마다 실제 속도가 이 비율만큼 줄어듦(배터리 소모 흉내)."""
+    speed_drift: 1분마다 실제 속도가 이 비율만큼 줄어듦(배터리 소모 흉내).
+    turn_slip: 궤도 미끄러짐으로 회전이 덜 되는 비율(0.3이면 좌우 속도 차이로 계산한 회전의 70%만 돎.
+    실효 궤도 폭 = track_mm / (1 - turn_slip)). pivot_slip: 제자리 회전 때의 비율(기본 turn_slip)."""
     rnd = np.random.RandomState(seed)
     os.makedirs(out_dir, exist_ok=True)
     mat = Mat(mat_path)
@@ -54,7 +56,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
     base = cfg["follow"]["base_speed"]
     runner = ExploreRunner(cfg, logger, mode=mode,
                            explorer=Explorer(max_laps=max_laps, branch_order=branch_order),
-                           speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"])
+                           speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"],
+                           trace_path=os.path.join(out_dir, "trace.jsonl"))
     # 실제 속도는 설정값과 조금 다르다(속도 실측 오차 재현)
     true_scale = 1.0 + speed_err * (2 * rnd.rand() - 1)
     if speed_scale is not None:
@@ -89,6 +92,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         vr = right * vmax_mm_s * sc * (1 + slip * rnd.randn()) / bias
         v = (vl + vr) / 2.0
         w = (vl - vr) / track_mm          # 왼쪽이 빠르면 오른쪽(시계방향)으로 돈다
+        w *= 1.0 - (pivot_slip if (pivot_slip is not None and vl * vr < 0) else turn_slip)
         th -= w * dt
         x += v * math.cos(th) * dt
         y += v * math.sin(th) * dt
@@ -126,7 +130,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
                     for c in mat.curves],
           "true_speed_scale": true_scale, "sim_time_s": round(t, 2),
           "finish_reason": runner.finish_reason, "trajectory": traj,
-          "odo_true": odo_true, "speed_drift": speed_drift}
+          "odo_true": odo_true, "speed_drift": speed_drift, "turn_slip": turn_slip,
+          "pivot_slip": turn_slip if pivot_slip is None else pivot_slip, "track_mm": track_mm}
     with open(os.path.join(out_dir, "gt.json"), "w") as f:
         json.dump(gt, f, ensure_ascii=False)
     cv2.imwrite(os.path.join(out_dir, "mat_topdown.png"), mat.image)
@@ -146,12 +151,15 @@ def main():
     ap.add_argument("--right-first", action="store_true", help="갈림길에서 오른쪽부터 탐색")
     ap.add_argument("--speed-scale", type=float, default=None, help="실제 속도 / 설정 속도(예: 0.8 = 20%% 느림)")
     ap.add_argument("--speed-drift", type=float, default=0.0, help="1분마다 실제 속도가 줄어드는 비율(배터리 흉내)")
+    ap.add_argument("--turn-slip", type=float, default=0.0,
+                    help="궤도 미끄러짐으로 회전이 덜 되는 비율(예: 0.3). 맵 모양 계산 시험용")
     ap.add_argument("--patch-length", type=float, default=None,
                     help="패치 진행 방향 길이(mm). 넣으면 패치로 속도 보정. ssafy_v2 도안은 159.3")
     a = ap.parse_args()
     start = [float(v) for v in a.start.split(",")] if a.start else None
     ev, gt = run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, video=a.video, quiet=not a.verbose,
                  raw_video=a.raw_video, start_pose=start, speed_scale=a.speed_scale, speed_drift=a.speed_drift,
+                 turn_slip=a.turn_slip,
                  cfg_override={"patch": {"length_mm": a.patch_length}} if a.patch_length else None,
                  branch_order=("right", "left") if a.right_first else ("left", "right"))
     print("events:", ev)

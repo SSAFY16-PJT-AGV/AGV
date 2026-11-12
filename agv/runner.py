@@ -35,8 +35,17 @@ X자 교차 처리
 이벤트 위치
     odo_mm은 판정한 바닥 지점 위치다(차체 위치 + geom.*_ahead_mm). 확정이 몇 프레임 늦게 나도
     처음 감지한 프레임의 위치를 쓴다.
+
+회전 기록(trace.jsonl)
+    trace_path를 주면 프레임마다 {ts, o, y, p, s}를 한 줄씩 남긴다. o는 이동거리(odo, mm),
+    y는 좌우 모터 명령 차이를 적분한 값(speed_mm_s x (L - R) / base_speed x dt의 누적, mm),
+    p는 그중 제자리 회전(pivot) 때 쌓인 몫이다. 회전각(rad) = y / 실효 궤도 폭(mm)이고 왼쪽이 빠르면
+    +(위에서 볼 때 시계 방향). 궤도 차체는 미끄러져서 실효 폭이 실제 폭보다 크므로, 맵 빌더가
+    같은 패치로 돌아온 고리(한 바퀴 = 360도)로 실효 폭을 맞춘 뒤 맵 모양을 계산한다(topo/shape.py).
 """
 import collections
+import io
+import json
 
 from .linecam import Follower, JunctionTracker, PatchTracker, TeeTracker, analyze
 from .speedcal import SpeedCal
@@ -60,7 +69,7 @@ RECOVER_DEFAULT = {
 
 class ExploreRunner(object):
     def __init__(self, cfg, logger, mode="drive", explorer=None, ask_fn=None,
-                 speed_mm_s=150.0, robot_id="agv1", map_hint=None):
+                 speed_mm_s=150.0, robot_id="agv1", map_hint=None, trace_path=None):
         assert mode in MODES
         self.cfg = cfg
         self.log = logger
@@ -72,6 +81,9 @@ class ExploreRunner(object):
         if mode == "passive":
             self.cal.enabled = False          # 손으로 밀 때는 모터 명령이 없음
         self.u = 0.0                          # 적분한 모터 명령(기본 속도로 달린 초)
+        self.yaw_mm = 0.0                     # 좌우 명령 차이 적분(mm). 회전각 = yaw_mm / 실효 궤도 폭
+        self.pivot_yaw_mm = 0.0               # 그중 제자리 회전 몫
+        self._trace = None
         self.patch = PatchTracker(cfg)
         self.junc = JunctionTracker(cfg)
         self.tee = TeeTracker(cfg)
@@ -109,6 +121,11 @@ class ExploreRunner(object):
                      base_speed=cfg["follow"]["base_speed"],
                      geom={"ctrl_ahead_mm": self.ctrl_ahead, "patch_ahead_mm": self.patch_ahead},
                      map_hint=map_hint)
+        if trace_path and mode != "passive":   # 손으로 밀 때는 모터 명령이 없어서 회전을 모름
+            self._trace = io.open(trace_path, "w", encoding="utf-8")
+            self._trace.write(json.dumps({"trace": "agv-trace-v1", "base_speed": cfg["follow"]["base_speed"],
+                                          "robot": robot_id,
+                                          "patch_length_mm": cfg.get("patch", {}).get("length_mm")}) + u"\n")
 
     # ---------- 기록 ----------
     def _odo(self):
@@ -172,12 +189,33 @@ class ExploreRunner(object):
             self.finished = True
             self.finish_reason = reason
             self.log.log("end", self._odo(), reason=reason, explorer=self.ex.status())
+            self._write_trace()
+            if self._trace is not None:
+                self._trace.close()
+                self._trace = None
 
     # ---------- 한 스텝 ----------
     def step(self, frame, dt):
         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
         if self.finished:
             return 0.0, 0.0
+        pivot = self.state == "pivot"
+        left, right = self._step(frame, dt)
+        if self.mode != "passive":
+            dy = self.speed_mm_s * (left - right) / self.cfg["follow"]["base_speed"] * dt
+            self.yaw_mm += dy
+            if pivot:
+                self.pivot_yaw_mm += dy
+        self._write_trace()
+        return left, right
+
+    def _write_trace(self):
+        if self._trace is None:
+            return
+        self._trace.write(u'{"ts":%.3f,"o":%.1f,"y":%.1f,"p":%.1f,"s":"%s"}\n' % (
+            self.log.clock(), self.odo, self.yaw_mm, self.pivot_yaw_mm, self.state[0]))
+
+    def _step(self, frame, dt):
         an = analyze(frame, self.cfg)
         self.last_an = an
         self._hist.append((self.t, self.odo))

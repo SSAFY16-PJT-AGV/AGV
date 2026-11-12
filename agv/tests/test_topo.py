@@ -263,3 +263,94 @@ class TestExportV1(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _synthetic_loop(b_true=190.0, laps=3, seed=0):
+    """둥근 직사각형(1000 x 600, 모서리 반지름 150) 고리를 반시계로 돈다. 패치 두 개(orange, green).
+    반환: (이벤트, trace dict, 패치 가운데 정답 좌표 {색: (x, y)}). 정답 좌표는 출발점 기준 수학 좌표."""
+    import math
+    import random
+    rnd = random.Random(seed)
+    W, H, R = 1000.0, 600.0, 150.0
+    segs = [("s", W - 2 * R), ("c", R), ("s", H - 2 * R), ("c", R), ("s", W - 2 * R), ("c", R),
+            ("s", H - 2 * R), ("c", R)]
+    per = sum(L if k == "s" else math.pi / 2 * R for k, L in segs)
+    ds = 7.5
+    x = y = th = 0.0
+    o = yaw = 0.0
+    t = 1000.0
+    tr = {"ts": [], "o": [], "y": [], "p": [], "s": [], "meta": {"patch_length_mm": 150.0}}
+    truth_xy = []
+    s_tot = 0.0
+    n = int(per * laps / ds)
+    bounds = []
+    acc = 0.0
+    for k, L in segs:
+        Lk = L if k == "s" else math.pi / 2 * R
+        bounds.append((acc, acc + Lk, k))
+        acc += Lk
+    for i in range(n):
+        sl = s_tot % per
+        kind = next(kk for a, b, kk in bounds if a <= sl < b)
+        dth = ds / R if kind == "c" else 0.0
+        dth_meas = dth * (1 + 0.02 * (rnd.random() - 0.5))
+        yaw += -dth_meas * b_true            # 반시계(왼쪽) 회전은 오른쪽 명령이 커서 y가 줄어듦
+        x += ds * math.cos(th + dth / 2)
+        y += ds * math.sin(th + dth / 2)
+        th += dth
+        o += ds
+        s_tot += ds
+        t += ds / 150.0
+        tr["ts"].append(t)
+        tr["o"].append(o)
+        tr["y"].append(yaw)
+        tr["p"].append(0.0)
+        tr["s"].append("f")
+        truth_xy.append((x, y))
+    centers = {"orange": 200.0, "green": 1300.0}       # 고리 위 위치(mm, 출발점부터)
+    evs = [{"type": "start", "ts": 1000.0, "speed_mm_s": 150, "odo_mm": 0.0}]
+    for lap in range(laps):
+        for color, sc in sorted(centers.items(), key=lambda kv: kv[1]):
+            d = lap * per + sc - 75.0                  # 이벤트는 패치 앞 가장자리(가운데 - 75)
+            evs.append({"type": "patch", "color": color, "odo_mm": d, "ts": 1000.0 + d / 150.0})
+    truth = dict((c, truth_xy[int(round(sc / ds)) - 1]) for c, sc in centers.items())
+    return evs, tr, truth
+
+
+class TestShape(unittest.TestCase):
+    """주행 기록(trace)으로 실효 궤도 폭을 고리로 맞추고 노드 좌표·엣지 곡선을 계산한다."""
+
+    def test_track_width_and_positions_from_loop(self):
+        import math
+        from agv.topo import estimate_shape, to_agv_map_v1, twin_problems
+        evs, tr, truth = _synthetic_loop(b_true=190.0)
+        m = build_map([evs], run_names=["r"])
+        res, why = estimate_shape(m, {"r": tr})
+        self.assertIsNone(why)
+        self.assertAlmostEqual(res["fit"]["track_eff_mm"], 190.0, delta=10.0)
+        # 원점(orange) 기준으로 green이 맞는 자리에: 고리 아래 변(+x)에서 오른쪽 위로 1100mm쯤
+        o, g = truth["orange"], truth["green"]
+        want = math.hypot(g[0] - o[0], g[1] - o[1])
+        P = res["pos"]
+        self.assertEqual(P["P_orange"], (0.0, 0.0))
+        self.assertAlmostEqual(math.hypot(*P["P_green"]), want, delta=25.0)
+        self.assertGreater(P["P_green"][1], 100.0)       # 반시계 고리라 진행 방향 왼쪽(+y, 수학 좌표)
+        # 엣지 곡선: 양 끝이 노드 좌표, 고리 모양이라 중간 점이 있음
+        for e in m["edges"]:
+            pts = res["shapes"][e["id"]]
+            self.assertEqual(tuple(pts[0]), tuple(round(v, 1) for v in P[e["from"]]))
+            self.assertGreater(len(pts), 3)
+        d = to_agv_map_v1(m, shape=res)
+        self.assertEqual(d["pos_source"], "odometry")
+        self.assertEqual(twin_problems(d), [])
+        gx = [n for n in d["nodes"] if n["id"] == "P_green"][0]
+        self.assertLess(gx["y"], -0.1)                  # 내보낼 때는 y가 오른쪽(+)이라 왼쪽은 -
+        self.assertTrue(all(len(e["points"]) > 0 for e in d["edges"] if e["type"] == "main"))
+
+    def test_no_loop_no_shape(self):
+        from agv.topo import estimate_shape
+        evs, tr, _ = _synthetic_loop(laps=1)
+        m = build_map([evs[:3]], run_names=["r"])
+        res, why = estimate_shape(m, {"r": tr})
+        self.assertIsNone(res)
+        self.assertTrue(why)

@@ -6,7 +6,9 @@
 python3 mapping/build_map.py data/runs/<시각>/events.jsonl [다른 주행 로그 ...] -o maps/<이름>.json --map-id <이름>
 ```
 
-여러 주행 로그를 한꺼번에 넣으면 합쳐서 맵 하나를 만든다. 터미널에 엣지 목록, 미탐색 가지, 경고, 트윈 로더 검사 결과가 나온다. 표준 라이브러리만 쓰므로 Jetson에서 바로 돌려도 된다.
+여러 주행 로그를 한꺼번에 넣으면 합쳐서 맵 하나를 만든다. 터미널에 좌표 출처, 모양 계산 결과, 엣지 목록, 미탐색 가지, 경고, 트윈 로더 검사 결과가 나온다. Jetson에서 바로 돌려도 된다.
+
+`events.jsonl` 옆에 `trace.jsonl`(탐색 중 프레임마다 남긴 이동거리·회전 기록)이 있으면 로봇이 실제로 지나간 궤적으로 노드 좌표와 엣지 곡선을 계산한다(아래 [모양 계산](#모양-계산-주행-기록)). 없으면 엣지 길이로 추정한 배치를 쓴다. 모양 계산에는 numpy가 필요하다(Jetson 기본 설치에 있음). `--no-shape`로 끌 수 있다.
 
 결과는 팀 공통 맵 형식(**agv-map-v1**)이다. 예전 형식이 필요하면 `--format topo-v0`.
 
@@ -22,7 +24,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 
 트윈에서 볼 때 알아 둘 것:
 
-- **좌표는 추정 배치다.** 엣지 길이(주행 거리)와 "색 패치는 곧은 라인 위에 있다"는 가정으로 배치를 추정했다. 연결 관계와 길이는 맞지만 모양은 실제 매트와 다를 수 있다(길이만으로는 고리 모양이 하나로 정해지지 않음). `pos_source: "estimated"`로 표시된다. 실측 좌표는 바닥 mm 좌표계 단계에서 채운다.
+- **좌표의 출처는 `pos_source`로 확인한다.** `"odometry"`면 주행 궤적으로 계산한 좌표·곡선이라 매트와 비슷한 모양이다(시뮬레이션 기준 패치 위치 오차 2~3cm). `"estimated"`면 `trace.jsonl`이 없어서 엣지 길이로 추정한 배치다. 연결 관계와 길이는 맞지만 모양은 실제 매트와 다를 수 있다.
 - **길은 한쪽 방향이다.** 트윈 경로 찾기는 지금 엣지를 양방향으로 본다(트윈 코드 주석: 단방향은 추후 확장). 맵에는 `directed: true`가 들어 있어서 트윈이 나중에 읽으면 된다.
 - 트윈 레벨에서 시뮬레이션 출발·도착 노드를 예시 맵 ID(`J01` 등)로 정해 두었다면 새 맵의 노드 ID(`P_orange`, `S1` 등)로 바꿔야 한다.
 
@@ -30,7 +32,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 
 `mapping/viewer/index.html`을 브라우저로 열고 맵 JSON을 끌어다 놓는다. 버튼으로 열거나 붙여넣어도 된다. 처음에는 시뮬레이션 예시 맵이 떠 있다. agv-map-v1, 트윈 맵(`warehouse_map.json`), 예전 topo-v0을 모두 연다.
 
-- **배치**: 맵 파일의 좌표로 그린다. 좌표가 없는 예전 맵은 엣지 길이로 자동 배치한다. 왼쪽 아래에 좌표 출처(추정/파일)가 나온다. 노드는 끌어서 옮길 수 있다.
+- **배치**: 맵 파일의 좌표로 그린다. 엣지에 `points`가 있으면 그 곡선으로, 스퍼는 스퍼 끝 노드 쪽으로 그린다. 좌표가 없는 예전 맵은 엣지 길이로 자동 배치한다. 왼쪽 아래에 좌표 출처(주행 궤적/추정/파일)가 나온다. 노드는 끌어서 옮길 수 있다.
 - **표시**: 색 패치는 실제 색 사각형, 갈라짐은 ◆, 합쳐짐은 ●, 미탐색 가지는 점선으로 그린다. 검출 누락으로 보고 뺀 엣지는 붉은 점선이다. 스퍼 끝(destination) 노드는 따로 그리지 않고 패치 옆 짧은 선으로 그린다.
 - **패널**: 요약, 경고, 선택한 노드·엣지의 값, 엣지 표, 이벤트 로그(`debug.events`)를 보여 준다. 이벤트 행을 누르면 그 관측이 묶인 노드가 선택된다. 노드 식별이 이상할 때 여기서 원인을 찾는다.
 - **배경 사진**: 매트를 위에서 찍어 반듯하게 편 사진을 깔고, 폭과 위치를 mm로 맞춘 뒤 노드를 끌어 비교한다.
@@ -44,17 +46,17 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 {
   "map_id": "sim_ssafy_v2", "version": 0, "schema": "agv-map-v1",
   "coordinate_unit": "meter", "coordinate_frame": "x_forward_y_right",
-  "origin_node": "P_orange", "pos_source": "estimated", "one_way": true,
+  "origin_node": "P_orange", "pos_source": "odometry", "one_way": true,
   "nodes": [
     {"id": "P_orange", "x": 0.0, "y": 0.0, "type": "access", "kind": "patch", "color": "orange", "visits": 4,
      "spur": {"side": "left", "seen": 2, "length_m": null, "node": "D_P_orange"}},
-    {"id": "S1", "x": 0.36, "y": 0.0, "type": "junction", "kind": "split", "visits": 4,
+    {"id": "S1", "x": 0.2908, "y": 0.0052, "type": "junction", "kind": "split", "visits": 4,
      "branches": {"left": "E2", "right": "E14"}},
-    {"id": "D_P_orange", "x": -0.08, "y": -0.13, "type": "destination", "kind": "spur_end",
+    {"id": "D_P_orange", "x": 0.0, "y": -0.15, "type": "destination", "kind": "spur_end",
      "spur_of": "P_orange", "length_estimated": true}
   ],
   "edges": [
-    {"id": "E1", "from": "P_orange", "to": "S1", "type": "main", "points": [],
+    {"id": "E1", "from": "P_orange", "to": "S1", "type": "main", "points": [{"x": 0.1843, "y": -0.0012}],
      "branch": null, "length_m": 0.3625, "length_std_m": 0.0139, "length_src": "odo",
      "traversals": 4, "directed": true, "lanes": 1},
     {"id": "E_D_P_orange", "from": "P_orange", "to": "D_P_orange", "type": "destination", "points": [],
@@ -62,6 +64,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
   ],
   "explore": {"complete": true, "unexplored": []},
   "warnings": [],
+  "shape_fit": {"track_eff_mm": 190.1, "pivot_track_eff_mm": 198.8, "loop_rms_mm": 7.8, "loop_max_mm": 18.9, ...},
   "debug": {"events": [...], "dropped_edges": [...], "runs": [...]}
 }
 ```
@@ -73,14 +76,15 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 | `nodes[].id`, `x`, `y` | 노드 ID와 좌표(m) |
 | `edges[].from`, `to` | 엣지 양 끝 노드 ID |
 | `edges[].type` | `main`(라인), `destination`(스퍼: 패치에서 빠져 비켜서는 곳), `connector`(트윈 예시 맵에만 있음) |
-| `edges[].points` | 곡선 중간 좌표 `[{"x", "y"}]`(m). 지금은 형상을 몰라 항상 빈 배열(직선으로 그려짐) |
+| `edges[].points` | 곡선 중간 좌표 `[{"x", "y"}]`(m, 양 끝 노드는 뺌). 모양 계산을 했을 때만 채워지고, 아니면 빈 배열(직선으로 그려짐) |
 
 **좌표계**
 
 - 단위는 m(트윈과 같음). 설계 문서 v0.3은 mm라서 문서 쪽을 맞춰야 한다(합의 필요).
 - 원점 패치가 (0, 0), 원점 패치에서 나가는 진행 방향이 +x다(설계 문서 v0.3 4장).
 - **+y는 +x의 오른쪽**이다. 언리얼(왼손 좌표계: X 앞, Y 오른쪽, Z 위)과 같아서, 트윈이 x, y를 그대로 X, Y로 써도 위에서 볼 때 실제 매트와 같은 모양(거울상 아님)이 된다. 각도도 언리얼처럼 위에서 볼 때 시계 방향이 +다. 수학 좌표(+y가 왼쪽)로 그리는 프로그램은 y를 뒤집어 그린다(뷰어가 그렇게 함).
-- 거울상은 갈림길의 왼쪽/오른쪽 기록으로 바로잡는다(왼쪽 가지가 진행 방향 왼쪽).
+- 모양 계산을 했으면 원점은 원점 패치의 **가운데**이고 +x는 그 패치를 지나는 로봇의 진행 방향이다. 궤적에서 계산하므로 거울상이 생기지 않는다.
+- 엣지 길이로 추정한 배치는 거울상을 갈림길의 왼쪽/오른쪽 기록으로 바로잡는다(왼쪽 가지가 진행 방향 왼쪽).
 
 **노드**
 
@@ -105,9 +109,47 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 | `traversals` | 지나간 횟수 |
 | `directed` | 한쪽 방향만 다님(`from` → `to`). 스퍼 엣지는 들어갔다 나오므로 `false` |
 
-**맵 전체**: `pos_source`(`estimated` = 길이로 추정한 배치, `measured` = 실측), `one_way`, `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
+**맵 전체**: `pos_source`(`odometry` = 주행 궤적으로 계산, `estimated` = 길이로 추정한 배치, `measured` = 실측), `shape_fit`(모양 계산 요약. 아래 표), `one_way`, `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
 
 아직 정하지 않은 것(트윈·서버 담당과 합의): 설계 문서의 단위(mm)를 m로 맞출지, 선반·벽·구역 필드(설계 문서 4장)를 어떻게 얹을지, 트윈이 `directed`를 읽을지.
+
+### 모양 계산 (주행 기록)
+
+탐색 중 `runner`가 프레임마다 `trace.jsonl`에 한 줄씩 남긴다.
+
+```json
+{"ts": 1700000012.35, "o": 1834.5, "y": -412.0, "p": 0.0, "s": "f"}
+```
+
+`o`는 이동거리(mm, 패치로 보정한 속도 기준), `y`는 좌우 모터 명령 차이를 적분한 값(mm), `p`는 그중 제자리 회전 몫, `s`는 상태(follow/reverse/pivot)다. 첫 줄에는 패치 길이(`patch_length_mm`) 같은 설정이 들어 있다.
+
+회전각은 `y / 실효 궤도 폭`이다. 궤도 차체는 돌 때 미끄러지므로 실효 폭은 실제 궤도 사이 간격보다 크다(보통 1.2~2배). 실효 폭은 바닥·배터리에 따라서도 달라서 미리 재지 않고 주행 기록에서 맞춘다.
+
+1. 맵의 노드 방문(`debug.events`)마다 trace의 어느 프레임인지 찾는다. 이벤트 `odo_mm`은 차체 중심이 그 지점에 오는 이동거리라서 그 값을 지나는 프레임이다.
+2. 실효 폭 후보마다 궤적을 적분하고, 방문마다 자세(x, y, 방향)를 두고 pose graph를 푼다.
+   - 이어진 두 방문 사이: 적분한 상대 자세(오차는 거리·회전량에 비례해 허용)
+   - 같은 노드를 다시 지난 방문끼리: 같은 위치. 같은 엣지로 들어왔으면 같은 방향(바퀴 수만큼 360도 차이)
+   - 패치는 들어오는 방향마다 이벤트 지점(패치 앞 가장자리)이 달라서, 그 지점에서 진행 방향으로 패치 길이의 절반만큼 간 점(가운데)끼리 맞춘다
+   - 같은 자리 교차(`same_spot`)끼리: 같은 위치
+3. 같은 노드 방문끼리 가장 잘 맞는 폭을 고른다. 제자리 회전(되돌아 나오기, 급한 가지)은 미끄러짐이 달라서 폭을 따로 맞춘다.
+4. 노드 좌표 = 방문 위치 평균(패치는 가운데), 엣지 곡선 = 지나간 궤적들을 양 끝 노드에 맞게 편 뒤 평균. 들어가 본 스퍼는 가장 멀리 간 방향으로 스퍼 끝을 놓는다.
+
+| `shape_fit` 필드 | 뜻 |
+| --- | --- |
+| `track_eff_mm`, `pivot_track_eff_mm` | 고른 실효 궤도 폭(주행 중 / 제자리 회전) |
+| `loop_rms_mm`, `loop_max_mm` | 계산 뒤 같은 노드 방문 위치 차이. 크면(80mm 이상) 노드 판정이 틀렸거나 미끄러짐이 심했던 것 |
+| `loop_rms_before_mm` | 계산 전(실효 폭만 맞춘 적분 궤적)의 같은 차이 |
+| `sharpness` | 실효 폭을 ±25% 바꾸면 차이가 몇 배가 되는지. 1.5 아래면 폭이 잘 안 정해진 것(고리가 적거나 짧음) |
+| `patch_center_mm` | 패치 이벤트 지점에서 가운데까지 쓴 거리 |
+| `visits`, `loops`, `edges_with_shape` | 쓴 방문 수, 같은 노드를 다시 지난 횟수, 곡선을 만든 엣지 수 |
+
+시뮬레이션(`ssafy_v2`, 실효 폭 200mm인데 실제 궤도 140mm, 속도 10% 느림)에서 실효 폭은 3~4% 안으로 맞고, 패치 가운데 위치 오차는 2~3cm(가장 큰 것 5cm)다. 카메라 렌즈 보정 없이 이 정도다.
+
+한계
+- 같은 노드를 한 번도 다시 지나지 않으면(고리 없음) 계산하지 않는다. 탐색은 보통 여러 바퀴를 돌므로 문제없다.
+- `patch.length_mm`를 설정에 넣지 않으면 패치 가운데를 앞 가장자리 + 75mm로 본다. 패치가 이보다 크면 그만큼 노드가 앞쪽(진행 방향 반대)으로 치우친다.
+- 같은 자리인데 맵에서 다른 노드로 나뉜 곳(예: 보라 뒤 렌즈 분기의 `S2`와 `T1`)은 서로 묶지 않으므로 몇 cm 떨어져 그려질 수 있다.
+- 곡선 위에서 비스듬히 잡힌 합류처럼 들어오는 방향마다 판정 지점이 다른 노드는 그 차이(수 cm)만큼 곡선 끝이 조금 꺾인다.
 
 ### 노드 식별
 
@@ -135,7 +177,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 
 - **맵 형식 통일은 진행 중이다**: 트윈 형식을 뼈대로 한 agv-map-v1로 트윈은 바로 읽는다. 서버 브랜치 예시 맵(`two-segment-map.json`, 설계 문서 v0.2 4장 형식)과 설계 문서 4장은 아직 맞추지 않았다.
 
-- **실제 축척 형상 없음**: 좌표는 길이로 추정한 배치이고 `points`(곡선 형상)는 비어 있다. 실제 2D 형상은 바닥 mm 좌표계 단계에서 채운다.
+- **모양 정확도**: 주행 궤적으로 계산한 좌표는 수 cm 오차가 있다(위 [모양 계산](#모양-계산-주행-기록)). 더 정확한 바닥 mm 좌표는 카메라·바닥 좌표계 단계에서 다룬다.
 - **길이 정확도**: `patch.length_mm`를 넣으면 패치를 지날 때마다 속도를 다시 재므로 배터리·바닥 차이로 길이가 통째로 틀어지지 않는다(시뮬레이션: 속도가 20% 느리고 계속 느려져도 패치 사이 거리 오차 중앙값 2% 안팎). 시뮬레이션 기준 큰 구간은 ±3%, 노랑 쪽 분기는 −6% 정도다. 보라 쪽처럼 30~40cm짜리 짧은 분기는 카메라가 내다보는 거리보다 짧아서 −20% 이상 틀린다.
 - **같은 색 패치가 두 개인 맵**은 아직 구분하지 못한다.
 - **스퍼 길이**(`spur.length_mm`)는 로봇이 실제로 들어갔다 나온 스퍼만 채워진다. 직각 스퍼는 지나치기만 하므로 비어 있다.
