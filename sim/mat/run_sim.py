@@ -39,11 +39,14 @@ class SimClock(object):
 def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         mode="drive", speed_err=0.05, slip=0.03, vmax_mm_s=500.0, track_mm=140.0,
         cfg_override=None, quiet=True, max_laps=8, raw_video=False, start_pose=None,
-        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None):
+        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None,
+        policy=None, on_step=None):
     """speed_scale: 실제 속도 / 설정 속도를 이 값으로 고정(기본: 1 ± speed_err 무작위).
     speed_drift: 1분마다 실제 속도가 이 비율만큼 줄어듦(배터리 소모 흉내).
     turn_slip: 궤도 미끄러짐으로 회전이 덜 되는 비율(0.3이면 좌우 속도 차이로 계산한 회전의 70%만 돎.
-    실효 궤도 폭 = track_mm / (1 - turn_slip)). pivot_slip: 제자리 회전 때의 비율(기본 turn_slip)."""
+    실효 궤도 폭 = track_mm / (1 - turn_slip)). pivot_slip: 제자리 회전 때의 비율(기본 turn_slip).
+    policy: 탐색 정책 대신 쓸 정책(예: agv.nav.Navigator). 주면 max_laps·branch_order는 안 씀.
+    on_step(runner, t): 프레임마다 부름(대기 중인 로봇을 재개하는 등 시험용)."""
     rnd = np.random.RandomState(seed)
     os.makedirs(out_dir, exist_ok=True)
     mat = Mat(mat_path)
@@ -55,7 +58,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
     logger = EventLogger(ev_path, echo=not quiet, clock=clock)
     base = cfg["follow"]["base_speed"]
     runner = ExploreRunner(cfg, logger, mode=mode,
-                           explorer=Explorer(max_laps=max_laps, branch_order=branch_order),
+                           explorer=policy or Explorer(max_laps=max_laps, branch_order=branch_order),
                            speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"],
                            trace_path=os.path.join(out_dir, "trace.jsonl"))
     # 실제 속도는 설정값과 조금 다르다(속도 실측 오차 재현)
@@ -99,6 +102,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         dist += abs(v) * dt
         t += dt
         clock.t += dt
+        if on_step is not None:
+            on_step(runner, t)
         if int(t / dt) % 4 == 0:
             traj.append([round(x, 1), round(y, 1)])
             odo_true.append([round(clock.t, 3), round(dist, 1)])
@@ -130,6 +135,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
                     for c in mat.curves],
           "true_speed_scale": true_scale, "sim_time_s": round(t, 2),
           "finish_reason": runner.finish_reason, "trajectory": traj,
+          "final_pose": [round(x, 1), round(y, 1), round(math.degrees(th), 1)],
           "odo_true": odo_true, "speed_drift": speed_drift, "turn_slip": turn_slip,
           "pivot_slip": turn_slip if pivot_slip is None else pivot_slip, "track_mm": track_mm}
     with open(os.path.join(out_dir, "gt.json"), "w") as f:

@@ -4,7 +4,7 @@
 실물(explore.py)과 시뮬레이터(sim/mat/run_sim.py)가 같은 이 코드를 쓴다.
 
 모드
-    drive    라인을 따라 자율 주행하고 갈림길은 Explorer가 고른다.
+    drive    라인을 따라 자율 주행하고 갈림길은 정책이 고른다(탐색: Explorer, 이동: nav.Navigator).
     ask      자율 주행하되 갈림길에서 멈추고 사람에게 방향을 묻는다(분기 선택이 불안할 때).
     passive  모터를 쓰지 않는다. 손으로 밀거나 다른 프로그램으로 조종하면서 검출·기록만 한다.
              이동거리를 모르므로 odo_mm은 null(빌더가 시간 x 속도로 대신 계산).
@@ -31,6 +31,12 @@ X자 교차 처리
     고른다. 그 가지를 고르면 차체 중심이 J에 올 때까지 따라간 뒤 그쪽으로 제자리 회전해 그 선을
     탄다. 안 고르면 J를 지날 때까지 갈림길 판정을 쉰다. 이 가지가 사실은 막다른 길이면 위의
     되돌아 나오기가 그대로 처리한다.
+
+정지·대기 (이동 정책)
+    정책에 pop_stop()이 있으면 이벤트마다 부른다. {pos, reason, hold}를 받으면 이동거리가 pos에 닿을 때
+    (pos가 None이면 바로) 선다. hold면 끝내지 않고 대기 상태(state "hold")로 모터를 세운 채 기다리고,
+    resume()을 부르면 다시 따라간다. 정책의 choose_split이 None이면 갈림길에 들어가기 전에 대기하고,
+    재개할 때 다시 묻는다(V자도 같음).
 
 이벤트 위치
     odo_mm은 판정한 바닥 지점 위치다(차체 위치 + geom.*_ahead_mm). 확정이 몇 프레임 늦게 나도
@@ -104,7 +110,10 @@ class ExploreRunner(object):
         self.crossing = None        # 지금 지나는 X자 교차
         self.decision = None        # 마지막으로 고른 갈림길 {pos, side, kind, seq}
         self.split_as_tee = None    # 이번 갈림길이 이미 아는 막다른 길이면 그쪽(스퍼) 방향
-        self.state = "follow"       # follow | reverse | pivot
+        self.state = "follow"       # follow | reverse | pivot | hold
+        self._stop_req = None       # 이동 정책이 요청한 정지 {pos, reason, hold, node}
+        self._resume_split = None   # 갈림길 앞에서 대기 중이면 그 갈림길 시작 (t, odo)
+        self._resume_vee = None     # V자 앞에서 대기 중이면 그 판정
         self.rc = dict(RECOVER_DEFAULT)
         self.rc.update(cfg.get("recover", {}))
         self._end_n = 0
@@ -121,6 +130,9 @@ class ExploreRunner(object):
                      base_speed=cfg["follow"]["base_speed"],
                      geom={"ctrl_ahead_mm": self.ctrl_ahead, "patch_ahead_mm": self.patch_ahead},
                      map_hint=map_hint)
+        bind = getattr(self.ex, "bind_logger", None)    # 이동 정책의 판단 메모를 같은 로그에
+        if bind is not None:
+            bind(lambda msg, **kw: self.log.log("note", self._odo(), msg=msg, **kw))
         if trace_path and mode != "passive":   # 손으로 밀 때는 모터 명령이 없어서 회전을 모름
             self._trace = io.open(trace_path, "w", encoding="utf-8")
             self._trace.write(json.dumps({"trace": "agv-trace-v1", "base_speed": cfg["follow"]["base_speed"],
@@ -167,10 +179,61 @@ class ExploreRunner(object):
         elif ev["type"] == "dead_end":
             if ev["fields"]["ref_kind"] == "split":
                 self.ex.on_dead_end(ev["fields"]["side"], p)
+        self._poll_policy()
+
+    # ---------- 정지·대기(이동 정책) ----------
+    def _poll_policy(self):
+        pop = getattr(self.ex, "pop_stop", None)
+        if pop is None or self.mode == "passive" or self.finished:
+            return
+        req = pop()
+        if req is None:
+            return
+        if req.get("pos") is None or req["pos"] <= self.odo:
+            self._do_stop(req)
+        else:
+            self._stop_req = req
+            self.log.log("note", self._odo(), msg="stop_planned", at=round(req["pos"], 1),
+                         reason=req["reason"], node=req.get("node"))
+
+    def _do_stop(self, req):
+        self._stop_req = None
+        if req.get("hold"):
+            self.state = "hold"
+            self.cal.reset()
+            self.last_cmd = (0.0, 0.0)
+            self.log.log("note", self._odo(), msg="hold", reason=req["reason"], node=req.get("node"))
+        else:
+            self._finish(req["reason"])
+
+    def resume(self):
+        """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
+        if self.state != "hold" or self.finished:
+            return False
+        self.state = "follow"
+        self.follow.prev_err = 0.0
+        self.lost_s = 0.0
+        hook = getattr(self.ex, "resumed", None)
+        if hook is not None:
+            hook()
+        self.log.log("note", self._odo(), msg="resume")
+        if self._resume_split is not None:
+            onset, self._resume_split = self._resume_split, None
+            self._decide_split(onset)
+        elif self._resume_vee is not None:
+            je, self._resume_vee = self._resume_vee, None
+            self._on_vee(je)
+        self._poll_policy()
+        return True
 
     def _emit(self, ev):
         if self.pending is not None:
             self.held.append(ev)
+            # 교차 판정으로 기록은 보류해도, 목표 패치면 정지 위치는 지금 정한다(늦으면 지나침)
+            early = getattr(self.ex, "on_patch_early", None)
+            if ev["type"] == "patch" and early is not None and self.mode != "passive":
+                early(ev["fields"]["color"], ev["pos"])
+                self._poll_policy()
         else:
             self._dispatch(ev)
 
@@ -218,6 +281,10 @@ class ExploreRunner(object):
     def _step(self, frame, dt):
         an = analyze(frame, self.cfg)
         self.last_an = an
+        if self.state == "hold":
+            self.t += dt
+            self.cal.reset()
+            return 0.0, 0.0
         self._hist.append((self.t, self.odo))
         kc = self.cfg["junction"]["confirm_frames"]
         if self.state != "follow":
@@ -243,6 +310,10 @@ class ExploreRunner(object):
             self.junc._pend = 0
             self.junc._gaps = []
             self.junc._last_gap = None
+            if self._stop_req is not None and self.odo >= self._stop_req["pos"]:
+                self._do_stop(self._stop_req)
+            if self.finished or self.state == "hold":
+                return 0.0, 0.0
             return self._drive(an, dt)
 
         color = self.patch.update(an)
@@ -289,19 +360,10 @@ class ExploreRunner(object):
             if self.junc.in_split and self.crossing is None:
                 self.split_onset = onset
                 if self.choice is None and self.mode != "passive":
-                    suggestion = self.ex.choose_split(onset[1] + self.ctrl_ahead)
-                    dead = self.ex.known_dead()
-                    if dead:
-                        self.split_as_tee = dead          # 아는 막다른 길: 묻지 않고 반대쪽
-                        self.choice = suggestion
-                    elif self.mode == "ask" and self.ask_fn is not None:
-                        self.choice = self.ask_fn(suggestion) or suggestion
+                    if self.state == "hold":
+                        self._resume_split = onset      # 대기 중: 재개할 때 새 목표로 고른다
                     else:
-                        self.choice = suggestion
-                    self.choice_t = self.t
-                    if not dead:
-                        self.decision = {"pos": onset[1] + self.ctrl_ahead, "side": self.choice,
-                                         "kind": "split", "seq": None}
+                        self._decide_split(onset)
 
         for je in jevents:
             if je["type"] == "vee":
@@ -311,7 +373,10 @@ class ExploreRunner(object):
                 if (self.mode != "passive" and self.choice is None and self.v_plan is None
                         and self.crossing is None and je["side"] is not None):
                     self._flush_pending()
-                    self._on_vee(je)
+                    if self.state == "hold":
+                        self._resume_vee = je
+                    else:
+                        self._on_vee(je)
                 continue
             if je["type"] == "split":
                 if self.crossing is not None:
@@ -328,7 +393,7 @@ class ExploreRunner(object):
                                 "ev": self._ev("merge", when, self.ctrl_ahead, from_side=je["side"])}
         if self.pending is not None and self.odo - self.pending["odo"] > self._window():
             self._flush_pending()
-        if self.finished:
+        if self.finished or self.state == "hold":
             return 0.0, 0.0
 
         # 갈래로 보였지만 실제로 갈라지지 않았으면(오검출) 선택을 버린다
@@ -341,6 +406,10 @@ class ExploreRunner(object):
         if self.mode != "passive" and self._dead_end_seen(an, dt):
             self._start_recover()
             return 0.0, 0.0
+        if self._stop_req is not None and self.odo >= self._stop_req["pos"]:
+            self._do_stop(self._stop_req)
+            if self.finished or self.state == "hold":
+                return 0.0, 0.0
         if self.v_plan is not None and self.odo >= self.v_plan["stop"]:
             self.state = "pivot"
             self._piv = {"t": 0.0, "away": False, "n": 0, "side": self.v_plan["side"], "kind": "vee"}
@@ -349,14 +418,46 @@ class ExploreRunner(object):
             return 0.0, 0.0
         return self._drive(an, dt)
 
+    def _decide_split(self, onset):
+        """갈라지기 시작함: 정책에 갈 쪽을 묻는다. None이면 갈림길에 들어가기 전에 대기."""
+        suggestion = self.ex.choose_split(onset[1] + self.ctrl_ahead)
+        dead = self.ex.known_dead()
+        if suggestion is None:
+            self._resume_split = onset
+            self._poll_policy()
+            if self.state != "hold":            # 정책이 정지를 안 줬으면 그냥 기본 방향
+                self._resume_split = None
+                suggestion = "left"
+            else:
+                return
+        if dead:
+            self.split_as_tee = dead          # 아는 막다른 길: 묻지 않고 반대쪽
+            self.choice = suggestion
+        elif self.mode == "ask" and self.ask_fn is not None:
+            self.choice = self.ask_fn(suggestion) or suggestion
+        else:
+            self.choice = suggestion
+        self.choice_t = self.t
+        if not dead:
+            self.decision = {"pos": onset[1] + self.ctrl_ahead, "side": self.choice,
+                             "kind": "split", "seq": None}
+
     def _on_vee(self, v):
         """급한 가지를 찾음: 탐색 정책이 고르게 하고, 그 가지면 J에서 회전할 계획을 세운다."""
         side = v["side"]
+        raw_v = v
         v = dict(v, j_mm=self.ctrl_ahead)     # 붙은 순간 만나는 점(J)이 조향 줄 위에 있었다
         when = self._ago(self.cfg["junction"]["confirm_frames"])
         j_pos = when[1] + v["j_mm"]
         suggestion = self.ex.choose_split(j_pos)
         dead = self.ex.known_dead()
+        if suggestion is None:
+            self._resume_vee = raw_v
+            self._poll_policy()
+            if self.state == "hold":
+                return
+            self._resume_vee = None
+            suggestion = "left"
         if dead:
             choice = suggestion
         elif self.mode == "ask" and self.ask_fn is not None:

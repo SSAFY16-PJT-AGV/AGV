@@ -4,7 +4,7 @@
     python3 -m agv.tools.runlog data/runs/<시각>
     python3 -m agv.tools.runlog data/runs/<시각> --all     # 노트(note)까지 전부
 
-출력: 이벤트 타임라인(시간·거리·핵심 값) → 종류별 개수 → 막다른 길·V자 요약 → 종료 이유.
+출력: 이벤트 타임라인(시간·거리·핵심 값) → 종류별 개수 → 막다른 길·V자 요약 → 이동(goto) 요약 → 종료 이유.
 """
 from __future__ import print_function
 
@@ -62,7 +62,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     evs = load(a.run)
     t0 = next((e["ts"] for e in evs if e.get("ts") is not None), None)
-    show_notes = ("speed_cal", "vee_seen", "vee_pivot", "vee_done", "recover_reverse", "recover_pivot", "recover_done")
+    show_notes = ("speed_cal", "vee_seen", "vee_pivot", "vee_done", "recover_reverse", "recover_pivot", "recover_done",
+                  "nav_target", "nav_choice", "nav_reached", "nav_reached_early", "nav_relocalized", "nav_unmatched",
+                  "nav_off_route", "nav_gave_up", "nav_hold_before_split", "nav_unreachable", "stop_planned",
+                  "hold", "resume")
     count = {}
     for e in evs:
         count[e["type"]] = count.get(e["type"], 0) + 1
@@ -102,6 +105,23 @@ def main(argv=None):
                 (u"  [버림: %s]" % e["reject"]) if e.get("reject") else u""))
         ok = [e for e in sc if not e.get("reject")]
         print(u"  받아들임 %d / %d%s" % (len(ok), len(sc), (u", 마지막 %s mm/s" % ok[-1]["k"]) if ok else u""))
+    nav = [e for e in evs if e["type"] == "note" and str(e.get("msg", "")).startswith("nav_")]
+    if nav:
+        print(u"\n== 이동(goto) ==")
+        tg = [e for e in nav if e["msg"] == "nav_target"]
+        if tg:
+            print(u"  목표 %s (끝 %s)%s" % (tg[0].get("target"), tg[0].get("final"),
+                                        u", 경로 " + u"-".join(tg[0]["route"]) if tg[0].get("route") else u""))
+        for e in nav:
+            if e["msg"] == "nav_choice":
+                rg = dict((k, (u"못 감" if v >= 1e5 else u"%dmm" % v)) for k, v in (e.get("regret") or {}).items())
+                print(u"  갈림길 %-5s 손해 왼쪽 %s / 오른쪽 %s  해석 %s" % (
+                    e.get("choice"), rg.get("left"), rg.get("right"), e.get("interps")))
+            elif e["msg"] in ("nav_reached", "nav_reached_early"):
+                print(u"  도착 판정 %s%s" % (e.get("node"), u" (패치 기록 보류 중 먼저)" if e["msg"].endswith("early") else u""))
+        print(u"  다시 위치 잡음 %d, 맵과 안 맞은 이벤트 %d, 경로 벗어남 %d" % (
+            notes.count("nav_relocalized"), notes.count("nav_unmatched"), notes.count("nav_off_route")))
+        print(u"  대기 %d / 재개 %d" % (notes.count("hold"), notes.count("resume")))
     end = [e for e in evs if e["type"] == "end"]
     print(u"\n종료 이유: %s" % (end[-1].get("reason") if end else u"(end 없음 - 비정상 종료)"))
     return 0

@@ -17,6 +17,13 @@
     # 실시간 화면: 어느 모드든 --view를 붙이고 노트북·폰 브라우저에서 http://<젯슨 IP>:8080
     python3 -m agv.explore --mode drive --enable-motors --view
 
+    # 4) 완성된 맵에서 목표 패치로 가기(주황 패치 조금 앞에 놓고 출발, 목표 패치 가운데에서 멈춤)
+    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to P_green --enable-motors
+    #    정해진 경로 따라가기(서버 주문의 nodes와 같은 뜻)
+    python3 -m agv.explore --mode goto --map maps/field_v2.json --route P_orange,S1,M1,P_purple --enable-motors
+    #    모터 없이 위치 추적만 확인(손으로 밀기·녹화 영상): passive에 --map
+    python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4 --map maps/field_v2.json
+
 카메라로 찍을 때는 시작하면서 저장해 둔 카메라 자세(arm.servo_angles, camtool arm으로 정함)로 팔을 맞춘다.
 --no-arm이면 팔을 건드리지 않는다. 녹화 영상 재생은 팔을 건드리지 않는다.
 
@@ -36,6 +43,7 @@ import cv2
 from .hw import JetbotMotors, NullMotors, open_camera
 from .linecam import DEFAULT_CONFIG, draw_debug, merge_config
 from .runner import ExploreRunner
+from .nav import NavMap, Navigator
 from .topo import EventLogger, Explorer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,14 +103,24 @@ def _note_camera_calib(cfg, logger, runner):
                date=d.get("date"), matches_camera=ok, matches_arm=w is None)
 
 
-def _status_rows(a, runner, elapsed, left, right, fps):
+def _nav_rows(nav):
+    if nav is None:
+        return []
+    w = nav.where() or {}
+    here = u"모름" if not w.get("known") else u"%s -> %s (후보 %d)" % (
+        w.get("last_node") or u"?", w.get("next_node"), w.get("candidates", 0))
+    return [(u"목표", u"%s%s" % (nav.target or u"-", u" / 끝 %s" % nav.final if nav.final != nav.target else u"")),
+            (u"위치", here)]
+
+
+def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
     choice = runner.choice or u"-"
-    return [
+    return _nav_rows(nav) + [
         (u"모드", a.mode + (u"" if a.enable_motors or a.mode == "passive" else u" (모터 꺼짐)")),
         (u"경과", u"%.1f초" % elapsed),
         (u"이동거리", u"%.0f mm" % runner.odo),
         (u"주행 상태", {"follow": u"라인 추종", "reverse": u"후진(막다른 길)",
-                     "pivot": u"제자리 회전"}.get(runner.state, runner.state)),
+                     "pivot": u"제자리 회전", "hold": u"대기"}.get(runner.state, runner.state)),
         (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)),
         (u"패치", runner.patch.active or u"-"),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
@@ -114,7 +132,14 @@ def _status_rows(a, runner, elapsed, left, right, fps):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["passive", "ask", "drive"], default="passive")
+    ap.add_argument("--mode", choices=["passive", "ask", "drive", "goto"], default="passive")
+    ap.add_argument("--map", default=None, help="goto: 이동에 쓸 맵 JSON(build_map 결과). passive에 주면 위치 추적만")
+    ap.add_argument("--to", default=None, help="goto: 목표 노드(패치 P_<색> 권장). 최단 경로로 감")
+    ap.add_argument("--route", default=None, help="goto: 따라갈 노드 목록(쉼표로). 서버 주문의 nodes와 같은 뜻")
+    ap.add_argument("--start", default=None,
+                    help="goto: 처음 보게 될 노드(그 노드 조금 앞에 놓음). 없으면 처음 보이는 패치에서 위치를 잡음")
+    ap.add_argument("--stop-offset", type=float, default=None,
+                    help="goto: 목표 패치 앞 가장자리를 본 뒤 더 갈 거리(mm). 기본 patch.length_mm/2, 없으면 80")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
@@ -140,6 +165,33 @@ def main(argv=None):
     if video_mode and a.mode != "passive":
         print(u"영상 재생은 passive 모드로만 돌려요.")
         a.mode = "passive"
+    nav = None
+    if a.mode == "goto" or (a.mode == "passive" and a.map):
+        if not a.map:
+            print(u"goto 모드는 --map(맵 JSON)이 필요해요.")
+            return 2
+        if a.mode == "goto" and not (a.to or a.route):
+            print(u"goto 모드는 --to(목표 노드)나 --route(노드 목록)가 필요해요.")
+            return 2
+        nmap = NavMap.load(a.map)
+        off = a.stop_offset
+        if off is None:
+            plen = cfg.get("patch", {}).get("length_mm")
+            off = float(cfg.get("nav", {}).get("stop_offset_mm") or (plen / 2.0 if plen else 80.0))
+        route = [n.strip() for n in a.route.split(",") if n.strip()] if a.route else None
+        try:
+            # 경로를 주면 그 첫 노드 조금 앞에 놓았다고 본다
+            nav = Navigator(nmap, start=a.start or (route[0] if route else None), stop_offset_mm=off)
+            if route:
+                nav.set_route(route)
+            elif a.to:
+                nav.set_goal(a.to)
+        except ValueError as e:
+            print(u"맵/목표 오류: %s" % e)
+            print(u"맵 노드: " + u", ".join(sorted(nmap.nodes)))
+            return 2
+        print(u"맵 %s: 노드 %d, 엣지 %d / 목표 %s" % (nmap.map_id, len(nmap.nodes), len(nmap.edges),
+                                               nav.final or u"없음(위치 추적만)"))
     if a.mode != "passive" and not a.enable_motors:
         print(u"%s 모드는 로봇이 움직여요. 주변을 확인하고 --enable-motors를 붙여 다시 실행하세요." % a.mode)
         return 2
@@ -159,6 +211,7 @@ def main(argv=None):
     cam = open_camera(a.camera, cfg["camera"])
     rob = cfg["robot"]
     motors = NullMotors()
+    run_mode = "drive" if a.mode == "goto" else a.mode
     if a.mode != "passive":
         motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False),
                               rob.get("trim", 0.0))
@@ -189,9 +242,10 @@ def main(argv=None):
     if a.show and not os.environ.get("DISPLAY"):
         print(u"--show: DISPLAY가 없어요(ssh -X로 접속했거나 모니터가 있어야 함). 창 없이 계속합니다.")
         a.show = False
-    runner = ExploreRunner(cfg, logger, mode=a.mode, explorer=Explorer(max_laps=a.max_laps),
+    runner = ExploreRunner(cfg, logger, mode=run_mode, explorer=nav or Explorer(max_laps=a.max_laps),
                            ask_fn=make_ask_fn(motors, view), speed_mm_s=rob["speed_mm_s"],
-                           robot_id=rob.get("id", "agv1"), map_hint=None,
+                           robot_id=rob.get("id", "agv1"),
+                           map_hint=(nav.m.map_id if nav is not None else None),
                            trace_path=os.path.join(out, "trace.jsonl"))
     _note_camera_calib(cfg, logger, runner)
     if arm_res is not None:
@@ -248,8 +302,10 @@ def main(argv=None):
                 if view.stop_requested and not runner.finished:
                     runner.stop("web_stop")
                 if n % 5 == 0:
-                    view.set_status(_status_rows(a, runner, now - t_start, left, right, fps_meas))
+                    view.set_status(_status_rows(a, runner, now - t_start, left, right, fps_meas, nav))
             n += 1
+            if runner.state == "hold" and a.mode == "goto":
+                runner.stop("nav_off_route")       # 혼자 도는 goto에서는 대기를 풀어 줄 서버가 없음
             if now - last_print > 1.0:
                 last_print = now
                 sys.stdout.write(u"\r[%5.1fs] odo %6.0fmm  ctrl:%s  patch:%s  cmd %.2f/%.2f   " % (
@@ -272,13 +328,17 @@ def main(argv=None):
             runner.stop("error")
         logger.close()
         if view is not None:
-            view.set_status(_status_rows(a, runner, time.time() - t_start, 0.0, 0.0, fps_meas),
+            view.set_status(_status_rows(a, runner, time.time() - t_start, 0.0, 0.0, fps_meas, nav),
                             finished=runner.finish_reason)
             time.sleep(1.0)      # 브라우저가 마지막 상태를 받아 가도록
             view.close()
         if a.show:
             cv2.destroyAllWindows()
     print(u"\n종료: %s" % runner.finish_reason)
+    if nav is not None:
+        print(u"마지막 위치 추정: %s" % json.dumps(nav.where(), ensure_ascii=False))
+        if a.mode == "goto":
+            return 0 if runner.finish_reason == "nav_arrived" else 1
     print(u"맵 만들기: python3 mapping/build_map.py %s -o maps/<이름>.json" % os.path.join(out, "events.jsonl"))
     return 0
 
