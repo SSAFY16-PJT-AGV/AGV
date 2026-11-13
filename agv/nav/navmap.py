@@ -8,7 +8,10 @@
 이동에 쓰는 것은 노드 종류(kind)·색, 엣지 연결·길이·갈림길 방향(branch, branches)과
 패치 위 교차(crossing, through), 스퍼(spur)뿐이다. 좌표는 길이를 모를 때만 쓴다.
 
-길은 한쪽으로만 돈다(라인 엣지). 스퍼 엣지(type destination)는 경로 계산에서 뺀다. 스퍼 끝 노드(D_*)로
+길은 탐색한 방향(from -> to)으로만 다닌다. 맵의 bidirectional: true(build_map 기본)는 "선이 양쪽으로
+따라갈 수 있다"는 뜻이지만, goto는 제자리 유턴이 없고 갈림길 왼쪽·오른쪽(branch)도 탐색 방향 기준이라
+반대 방향 주행은 계획하지 않는다(allow_reverse=True면 예전처럼 반대 엣지도 넣음 - 유턴을 만든 뒤에).
+반대 방향이 필요한 경로(서버 주문)는 route_edges에서 "이어지지 않음"으로 거절된다. 스퍼 엣지(type destination)는 경로 계산에서 뺀다. 스퍼 끝 노드(D_*)로
 가는 길은 "부모 노드(패치·스퍼 갈림)까지 가서 옆으로 들어감"으로 다룬다(spur_parent).
 
 표준 라이브러리만 쓴다. Python 3.6 호환.
@@ -45,7 +48,7 @@ def _pos_mm(n):
 
 
 class NavMap(object):
-    def __init__(self, d):
+    def __init__(self, d, allow_reverse=False):
         self.raw = d
         self.map_id = d.get("map_id")
         self.version = d.get("version")
@@ -76,8 +79,8 @@ class NavMap(object):
                 continue
             self.out[e["from"]].append(eid)
             self.inn[e["to"]].append(eid)
-            # 라인은 한쪽으로만 돈다. bidirectional: true인 라인 엣지만 반대로도 넣는다
-            if e.get("bidirectional") is True and e.get("directed") is not True:
+            # 반대 방향은 유턴을 만든 뒤에(allow_reverse). 지금은 탐색 방향으로만
+            if allow_reverse and e.get("bidirectional") is True and e.get("directed") is not True:
                 rid = eid + "~r"
                 self.edges[rid] = {"id": rid, "from": e["to"], "to": e["from"], "branch": None,
                                    "len": ed["len"], "spur": False}

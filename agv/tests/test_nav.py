@@ -96,6 +96,20 @@ class TestNavMap(unittest.TestCase):
         # 초록에서 보라: 모서리 V자로 S자 선을 타고 노랑 교차를 지나 올라가는 길이 짧다
         self.assertEqual(m.shortest_path("E7", "P_purple"), ["S3", "P_yellow", "X2", "P_purple"])
 
+    def test_bidirectional_map_drives_explored_direction(self):
+        """build_map 기본(모든 엣지 bidirectional: true)이어도 유턴 없이 탐색 방향으로만 계획한다."""
+        with io.open(SIM_MAP, encoding="utf-8") as f:
+            d = json.load(f)
+        for e in d["edges"]:
+            e.pop("directed", None)
+            e["bidirectional"] = True
+        m = NavMap(d)
+        self.assertEqual(m.shortest_path("E7", "P_purple"), ["S3", "P_yellow", "X2", "P_purple"])
+        with self.assertRaises(ValueError):
+            m.route_edges(["S3", "P_green"])          # 반대 방향 경로(서버가 줘도) 거절
+        rev = NavMap(d, allow_reverse=True)
+        self.assertEqual(rev.shortest_path("E7", "P_purple")[:2], ["S3", "P_green"])
+
     def test_unified_format(self):
         m = NavMap(UNIFIED)
         self.assertEqual(m.kind("V_E3"), "via")
