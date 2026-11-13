@@ -29,6 +29,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 저장소 루트에서 실행한다. 주피터 노트북이 카메라를 잡고 있으면 먼저 그 커널을 끈다.
 
 1. **카메라 자세 정하기(처음 한 번)**: `python3 -m agv.tools.camtool arm --view`
+   - Waveshare 서보 라이브러리 `SCSCtrl`이 필요하다. 없다고 나오면 `cd ~ && git clone https://github.com/waveshare/JETANK.git && cd JETANK && pip3 install --user .`(받아만 둬도 `~/JETANK`에서 찾아 씀). 포트 권한·시리얼 콘솔 문제는 [FIELD_TEST.md](FIELD_TEST.md) 0단계.
    - 로봇을 라인 위에 놓고 브라우저(`http://<젯슨 IP>:8080`)로 검출 화면을 보며 키보드로 맞춘다. `1`·`2`·`3`·`5`로 서보(팔 좌우, 팔 아래 관절, 팔 가운데 관절, 카메라 상하)를 고르고 `+`/`-`로 움직인다(`[` 1도씩, `]` 5도씩). 손으로 맞추려면 `f`로 힘을 뺐다가 `f`로 고정한다. `p`로 저장, `q`로 끝.
    - 라인이 화면 아래 절반의 가운데쯤 보이고, 가로줄마다 초록 점이 하나씩 찍히면 된다. 상태 표에 "선 하나로 보이는 줄", "조향 줄 선 위치"가 숫자로 나온다. `--view`가 없으면 `data/snap/arm_preview.png`를 계속 저장한다.
    - 저장한 각도(`config/explore.json`의 `arm.servo_angles`)는 이후 `explore`, `camtool snap`/`ground`, `autocolor --camera`가 시작할 때 자동으로 맞춘다. 맞춘 뒤 다시 읽어 3도 넘게 다르면 경고한다. 팔을 건드리지 않으려면 `--no-arm`. `camtool arm --read`는 지금·저장한 각도 출력, `--apply`는 맞추기만, `--save-now`는 지금 자세를 그대로 저장.

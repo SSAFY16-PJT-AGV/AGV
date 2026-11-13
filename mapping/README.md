@@ -25,7 +25,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 트윈에서 볼 때 알아 둘 것:
 
 - **좌표의 출처는 `pos_source`로 확인한다.** `"odometry"`면 주행 궤적으로 계산한 좌표·곡선이라 매트와 비슷한 모양이다(시뮬레이션 기준 패치 위치 오차 2~3cm). `"estimated"`면 `trace.jsonl`이 없어서 엣지 길이로 추정한 배치다. 연결 관계와 길이는 맞지만 모양은 실제 매트와 다를 수 있다.
-- **길은 한쪽 방향이다.** 트윈 경로 찾기는 지금 엣지를 양방향으로 본다(트윈 코드 주석: 단방향은 추후 확장). 맵에는 `directed: true`가 들어 있어서 트윈이 나중에 읽으면 된다.
+- **엣지는 양방향이다.** 테이프 선은 어느 쪽으로든 따라갈 수 있고 차체는 제자리에서 돌 수 있어서, 탐색은 한 방향으로 돌았어도 맵에는 `bidirectional: true`로 넣는다. 트윈 경로 찾기도 엣지를 양방향으로 보므로 그대로 맞는다. 한쪽으로만 다니게 하려면 `build_map.py --one-way`.
 - 트윈 레벨에서 시뮬레이션 출발·도착 노드를 예시 맵 ID(`J01` 등)로 정해 두었다면 새 맵의 노드 ID(`P_orange`, `S1` 등)로 바꿔야 한다.
 
 ## 뷰어
@@ -46,7 +46,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 {
   "map_id": "sim_ssafy_v2", "version": 0, "schema": "agv-map-v1",
   "coordinate_unit": "meter", "coordinate_frame": "x_forward_y_right",
-  "origin_node": "P_orange", "pos_source": "odometry", "one_way": true,
+  "origin_node": "P_orange", "pos_source": "odometry", "one_way": false,
   "nodes": [
     {"id": "P_orange", "x": 0.0, "y": 0.0, "type": "access", "kind": "patch", "color": "orange", "visits": 4,
      "spur": {"side": "left", "seen": 2, "length_m": null, "node": "D_P_orange"}},
@@ -58,9 +58,9 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
   "edges": [
     {"id": "E1", "from": "P_orange", "to": "S1", "type": "main", "points": [{"x": 0.1843, "y": -0.0012}],
      "branch": null, "length_m": 0.3625, "length_std_m": 0.0139, "length_src": "odo",
-     "traversals": 4, "directed": true, "lanes": 1},
+     "traversals": 4, "bidirectional": true, "lanes": 1},
     {"id": "E_D_P_orange", "from": "P_orange", "to": "D_P_orange", "type": "destination", "points": [],
-     "branch": "left", "length_m": null, "directed": false, "lanes": 1}
+     "branch": "left", "length_m": null, "bidirectional": true, "lanes": 1}
   ],
   "explore": {"complete": true, "unexplored": []},
   "warnings": [],
@@ -98,20 +98,27 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 | `through` | 여러 길이 지나는 노드에서 실제로 지나간 (들어온 엣지, 나간 엣지) 쌍. 교차에서 꺾으면 안 되므로 경로 계획은 이 쌍만 쓴다 |
 | `same_spot` | 같은 자리의 다른 교차 노드. 교차는 선마다 노드가 따로 생기므로 충돌 회피 때 하나로 본다 |
 | `branches` | 갈라짐에서 `left`/`right` 엣지 ID |
+| `inputs` | 합쳐짐으로 들어오는 두 선이 탐색 방향 기준 `left`/`right` 어느 쪽인지(엣지 ID). 반대로 달리면 이 합쳐짐이 갈라짐이 되고 좌우가 뒤집힌다(왼쪽 input이 오른쪽 가지) |
+| `uturn` | 제자리에서 돌아 방향을 바꿔도 되는 노드(`true`): 패치(패치 위 교차가 있는 패치는 빼고)와 스퍼 끝 |
 | `spur_of`, `length_estimated` | 스퍼 끝 노드: 어느 노드의 스퍼인지, 길이를 몰라 그림용 길이(0.15m)로 놓았는지 |
 
 **엣지**
 
 | 필드 | 뜻 |
 | --- | --- |
-| `branch` | 갈라짐에서 나가는 엣지면 `left`/`right`(로봇 진행 방향 기준). 스퍼 엣지는 스퍼 쪽 |
+| `from`, `to` | 탐색할 때 지나간 방향. 양방향 엣지도 이 순서는 의미가 있다(`branch`, `points` 순서가 이 방향 기준) |
+| `branch` | 갈라짐에서 나가는 엣지면 `left`/`right`(탐색할 때 진행 방향 기준. 반대로 지나가면 그 갈라짐은 합쳐짐이 되고 좌우도 바뀜). 스퍼 엣지는 스퍼 쪽 |
 | `length_m`, `length_std_m` | 이벤트 사이 이동거리 평균·표준편차(m). 속도는 패치로 보정(`length_src: "odo"`) |
 | `traversals` | 지나간 횟수 |
-| `directed` | 한쪽 방향만 다님(`from` → `to`). 스퍼 엣지는 들어갔다 나오므로 `false` |
+| `bidirectional` | 양쪽으로 다닐 수 있음(기본 `true`, 서버 맵 형식과 같은 이름). `--one-way`면 본선 엣지가 `false`(`from` → `to`만). 스퍼 엣지는 들어갔다 나오므로 늘 `true`. 예전 맵의 `directed`(true = 한쪽)도 뷰어가 읽는다 |
 
-**맵 전체**: `pos_source`(`odometry` = 주행 궤적으로 계산, `estimated` = 길이로 추정한 배치, `measured` = 실측), `shape_fit`(모양 계산 요약. 아래 표), `one_way`, `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
+맵 맨 위의 `zones`는 서버 구간 예약용 운영 구역이다(설계 문서 4·7장). `{"id", "type", "nodes"}`이고, `type`은 `waiting`(대기 지점: 스퍼 끝마다 하나)과 `shared`(같은 자리 교차 쌍: 선마다 노드가 따로 생겨 노드 예약만으로는 겹침을 모름)다. 합쳐짐·갈라짐은 그 노드를 예약하는 것으로 충분해서 따로 넣지 않는다.
 
-아직 정하지 않은 것(트윈·서버 담당과 합의): 설계 문서의 단위(mm)를 m로 맞출지, 선반·벽·구역 필드(설계 문서 4장)를 어떻게 얹을지, 트윈이 `directed`를 읽을지.
+패치 바로 앞 합쳐짐을 어느 바퀴에서 놓치면 그 선이 패치로 바로 들어오는 엣지가 생긴다. 합쳐짐에서 패치까지가 150mm 안이고 합쳐짐으로 들어오는 선이 하나뿐이면 그 엣지를 합쳐짐에 잇고 경고를 남긴다(반대로 달릴 때 그 자리 갈라짐의 가지를 알아야 해서).
+
+**맵 전체**: `pos_source`(`odometry` = 주행 궤적으로 계산, `estimated` = 길이로 추정한 배치, `measured` = 실측), `shape_fit`(모양 계산 요약. 아래 표), `one_way`(`--one-way`로 만든 맵이면 true), `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
+
+아직 정하지 않은 것(트윈·서버 담당과 합의): 설계 문서의 단위(mm)를 m로 맞출지, 선반·벽·구역 필드(설계 문서 4장)를 어떻게 얹을지. 진행 중인 통일안은 `docs/mapping/map-schema.md`(PR #41).
 
 ### 모양 계산 (주행 기록)
 

@@ -48,6 +48,9 @@ _LIST_ORDER = {"patch": 0, "split": 1, "merge": 2, "cross": 3, "tee": 4}
 _PREFIX = {"split": "S", "merge": "M", "cross": "X", "tee": "T"}
 
 
+MERGE_REPAIR_MM = 150.0   # 합류 -> 패치가 이보다 짧으면 패치로 바로 들어온 다른 선을 합류에 잇는다
+
+
 def _token(ev):
     t = ev["type"]
     if t == "split":
@@ -395,15 +398,72 @@ def build_map(event_lists, map_id="map", version=0, origin_node=None,
              "length_mm": round(m, 1), "length_std_mm": round(s, 1),
              "length_src": "odo" if length_src == {"odo"} else "time",
              "traversals": len(edges[key]), "shape": None,
-             "bidirectional": False, "lanes": 1}
+             "bidirectional": True, "lanes": 1}
         edge_list.append(e)
         if branch and frm in nodes and nodes[frm]["type"] == "split":
             nodes[frm]["branches"][branch] = e["id"]
         if m and s > max(50.0, 0.15 * m) and len(edges[key]) > 1:
             warnings.append(u"%s(%s→%s) 길이 편차가 큼: %.0f±%.0fmm" % (e["id"], frm, to, m, s))
 
-    # --- 노드를 지나간 (들어온 엣지, 나간 엣지) 쌍 ---
+    # 관측 순서 (앞 노드, 뒤 노드, 고른 가지) -> 엣지 ID. 아래 보정으로 엣지 끝이 바뀌어도 관측은 같은 엣지
     eid = dict(((e["from"], e["to"], e["branch"]), e["id"]) for e in edge_list)
+
+    # --- 패치 바로 앞 합류를 놓친 길 보정 ---
+    # 합류 M -> 패치 P(짧은 엣지)인데 M으로 들어오는 선이 하나뿐이고 P로 다른 선이 하나 더 들어오면,
+    # 그 선은 M에서 붙었는데 어느 바퀴에선가 합류를 못 보고 P로 바로 이어진 것이다. 그 선을 M으로 잇는다.
+    # (정방향에서는 상관없지만, 반대로 달리면 그 자리가 갈림길이라 어느 쪽 가지인지 알아야 함)
+    by_id = dict((e["id"], e) for e in edge_list)
+    for nid, n in nodes.items():
+        if n["type"] != "merge":
+            continue
+        ins = [e for e in edge_list if e["to"] == nid]
+        outs = [e for e in edge_list if e["from"] == nid]
+        if len(ins) != 1 or len(outs) != 1:
+            continue
+        mp = outs[0]
+        p = nodes.get(mp["to"])
+        if p is None or p["type"] != "patch" or (mp["length_mm"] or 0) > MERGE_REPAIR_MM:
+            continue
+        others = [e for e in edge_list if e["to"] == mp["to"] and e["id"] != mp["id"]]
+        if len(others) != 1:
+            continue
+        e = by_id[others[0]["id"]]
+        e["to"] = nid
+        if e["length_mm"]:
+            e["length_mm"] = round(max(1.0, e["length_mm"] - (mp["length_mm"] or 0.0)), 1)
+        warnings.append(u"%s(%s→%s)는 %s 합류 검출 누락으로 보고 %s에서 붙게 고침" % (
+            e["id"], e["from"], p["id"], nid, nid))
+
+    # --- 합류: 들어오는 두 선이 (탐색 방향으로 볼 때) 어느 쪽인지 ---
+    # 합류 이벤트의 from_side는 "내가 들어온 쪽"(topo/events.py)이라, 타고 온 엣지가 그쪽 선이다.
+    # 반대 방향으로 달릴 때 이 합류는 갈림길이 되고, 좌우가 뒤집힌 inputs가 그 갈림길의 가지다.
+    join_votes = {}
+    for idx in runs_idx:
+        for a, b in zip(idx[:-1], idx[1:]):
+            oa, ob = obs[a], obs[b]
+            if ob["type"] != "merge" or ob.get("from_side") not in ("left", "right"):
+                continue
+            e_in = eid.get((oa["_node"], ob["_node"], oa.get("choice") if oa["type"] == "split" else None))
+            if e_in:
+                own = ob["from_side"]
+                join_votes.setdefault(ob["_node"], {}).setdefault(e_in, []).append(own)
+    for e in edge_list:
+        nodes[e["to"]].setdefault("_ins", []).append(e["id"])
+    for nid, n in nodes.items():
+        ins = n.pop("_ins", [])
+        if n["type"] != "merge":
+            continue
+        inputs = {}
+        for e_in, vs in sorted(join_votes.get(nid, {}).items()):
+            side = max(set(vs), key=vs.count)
+            if side not in inputs:
+                inputs[side] = e_in
+        if len(inputs) == 1 and len(ins) == 2:
+            known = list(inputs.values())[0]
+            other = [x for x in ins if x != known][0]
+            inputs["left" if "right" in inputs else "right"] = other
+        if inputs:
+            n["inputs"] = inputs
     through = {}
     for idx in runs_idx:
         for a, b, c in zip(idx[:-2], idx[1:-1], idx[2:]):
