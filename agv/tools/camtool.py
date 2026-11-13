@@ -19,7 +19,7 @@
     # 사진의 사각형 영역 HSV 분포 출력 -> config의 patch.colors / line.v_max 조정에 사용
     python3 -m agv.tools.camtool hsv data/snap/raw.png 120 150 40 30      # x y w h (px)
 
-    # 기본 속도로 몇 초 직진 -> 간 거리를 자로 재서 robot.speed_mm_s에 넣는다
+    # (patch.length_mm를 못 쓸 때만) 기본 속도로 몇 초 직진 -> 간 거리를 자로 재서 robot.speed_mm_s에 넣는다
     python3 -m agv.tools.camtool speed --seconds 4 --enable-motors
 """
 import argparse

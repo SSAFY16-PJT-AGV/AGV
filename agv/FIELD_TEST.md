@@ -4,6 +4,8 @@
 
 보정 명령의 자세한 설명은 [README.md](README.md)의 "현장 순서"에 있다. 이 문서는 시험 순서와 판정 기준을 다룬다.
 
+**맵 파일만 빨리 뽑을 때**: 0 → 1(카메라 자세·패치 길이·판정 지점 거리) → 2(첫 바퀴 + 색 보정) → 3(확인 바퀴) → 6(자율 탐색 + `build_map`). 4·5단계(막다른 길, V자)는 6단계 자율 탐색이 그 자리에서 막힐 때 돌아와서 한다. 카메라 자세와 색은 한 번 저장하면 다음 날에도 그대로 쓰므로, 두 번째부터는 0 → 3 → 6만 하면 된다(조명이 크게 바뀌었으면 2도).
+
 ## 0. 준비
 
 **가져갈 것**: 줄자, 마스킹테이프(시작 위치 표시), 노트북(영상 재생·맵 뷰어), 충전된 배터리
@@ -16,6 +18,14 @@ git fetch origin
 git checkout feature/topo-mapping
 git pull
 python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레이션 테스트는 건너뜀
+```
+
+현장에서 저장한 설정(`autocolor --write`, `camtool arm`의 `p`, `calib --write`)은 `agv/config/` 안의 파일을 바꾼다. 그 상태에서 `git pull`이 "local changes would be overwritten"으로 멈추면 설정을 잠깐 치워 두고 받은 뒤 되돌린다.
+
+```
+git stash          # 현장에서 바꾼 설정 잠깐 치우기
+git pull
+git stash pop      # 되돌리기. 충돌이 나면 agv/config/explore.json에서 <<<< 표시 부분을 골라 고친다
 ```
 
 **안전**
@@ -190,7 +200,9 @@ python3 -m agv.tools.runlog data/runs/<시각>
 python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field_v2.json --map-id field_v2
 ```
 
-`maps/field_v2.json`을 노트북의 `mapping/viewer/index.html`에 끌어다 놓는다.
+`maps/field_v2.json`을 노트북의 `mapping/viewer/index.html`에 끌어다 놓는다. 언리얼 트윈에서 보려면 노트북에서 `--twin <트윈 프로젝트 폴더>`를 붙여 다시 실행하면 `Content/Data/warehouse_map.json`으로 복사된다(`mapping/README.md`의 "디지털 트윈(언리얼)에서 보기").
+
+`build_map`은 Jetson에서 돌려도 되고, 폴더를 노트북으로 옮겨 돌려도 된다. 이때 `events.jsonl`과 `trace.jsonl`이 같은 폴더에 있어야 한다. 여러 번 돈 주행을 합치려면 `events.jsonl`을 여러 개 넣는다.
 
 `build_map`은 같은 폴더의 `trace.jsonl`(프레임마다 남긴 이동거리·회전 기록)로 맵 모양을 계산한다. 터미널에 `좌표: 주행 궤적으로 계산`과 `모양 계산: 실효 궤도 폭 ...` 줄이 나와야 한다. 렌즈 보정 없이 패치 위치가 몇 cm 안으로 맞는 것이 목표다. 패치 가운데를 맞추려면 `patch.length_mm`가 설정에 들어 있어야 한다(3단계 속도 보정과 같은 값).
 
@@ -206,6 +218,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field_v2.js
 - `[주의] 실효 궤도 폭이 잘 정해지지 않음`: 고리가 너무 적다. 같은 맵을 한두 바퀴 더 돈다(`--max-laps`를 늘림).
 - 방문 위치 차이 최대가 크다: 그 노드의 판정이 틀렸을 가능성이 크다. `runlog`로 그 무렵 이벤트를 보고, 뷰어 이벤트 표에서 어느 관측이 그 노드로 묶였는지 확인한다.
 - 전체가 조금 크거나 작다: 축척은 이동거리(패치 속도 보정)에서 온다. `speed_cal`이 몇 번 됐는지 `runlog`로 확인한다.
+- `trace.jsonl이 없어서 엣지 길이로 추정한 배치를 씀`: `events.jsonl`만 옮겼거나, 손으로 민(passive) 주행이거나, 녹화 영상을 다시 돌린 결과다. 모터로 달린 원래 주행 폴더로 만든다.
 
 `보라에서 나가는 길 2개` 경고는 보라 스퍼가 렌즈 분기에 가까워서 생긴다. 시뮬레이션에서도 가끔 나므로 이 경고 하나만 있으면 통과로 본다.
 
@@ -223,7 +236,8 @@ python3 -m agv.tools.runlog data/replay --all
 - **모서리에서 `vee_seen`이 안 나옴**: `--all`로 그 시각 근처에 `merge`가 찍혔는지 본다. 찍혔다면 옆 선이 천천히 붙은 것이다. 이때는 `vee_max_frames`를 7로 올려 본다.
 - **엉뚱한 곳에서 `vee_seen`**: 그 `cont` 값보다 `vee_cont_px`를 높인다. 단, 모서리의 `cont`보다는 낮게 유지한다.
 - 고친 값은 `agv/config/explore.json`의 `junction` 아래에 적는다(`DEFAULT_CONFIG`를 덮어씀).
+- 영상 재생은 모터를 쓰지 않아 `trace.jsonl`이 없으므로, 재생 결과로 만든 맵은 모양을 계산하지 않는다(엣지 길이로 추정한 배치). 맵 모양은 원래 주행 폴더로 만든다.
 
 ## 8. 결과 공유
 
-시험한 주행마다 `data/runs/<시각>/` 폴더를 통째로 압축해 공유한다. 폴더에는 `events.jsonl`, `trace.jsonl`(맵 모양 계산용 회전 기록), `config_used.json`, `camera.mp4`, `debug/`가 있다. 어느 단계 시험인지와 통과 여부를 한 줄 적는다. 영상이 있으면 노트북에서 그대로 재현해 원인을 찾을 수 있다. 렌즈 보정·바닥 좌표계 사진(`data/calib/`, `data/ground/`)도 같이 공유하면 다음 단계(실제 축척 맵)를 바로 이어서 만들 수 있다.
+시험한 주행마다 `data/runs/<시각>/` 폴더를 통째로 압축해 공유한다. 폴더에는 `events.jsonl`, `trace.jsonl`(맵 모양 계산용 회전 기록), `config_used.json`, `camera.mp4`, `debug/`가 있다. 어느 단계 시험인지와 통과 여부를 한 줄 적는다. 영상이 있으면 노트북에서 그대로 재현해 원인을 찾을 수 있다. 렌즈 보정·바닥 좌표계 사진(`data/calib/`, `data/ground/`)도 같이 공유하면 다음 단계(카메라로 바닥 mm 좌표를 재서 맵 모양을 더 정확하게)를 바로 이어서 만들 수 있다. 만든 맵 파일(`maps/*.json`)과 `agv/config/explore.json`(현장에서 저장한 카메라 자세·색)도 같이 올린다.
