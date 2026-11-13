@@ -32,8 +32,8 @@ class Client:
     def username_pw_set(self, username, password):
         self.events.append(('auth', username, password))
 
-    def tls_set(self, ca_certs):
-        self.events.append(('tls', ca_certs))
+    def tls_set_context(self, context):
+        self.events.append(('tls-context', context))
 
     def subscribe(self, topic, qos):
         self.events.append(('subscribe', topic, qos))
@@ -128,10 +128,44 @@ class CaptureTest(unittest.TestCase):
             self.connect_and_ack()
             raise KeyboardInterrupt()
         self.client.script = acknowledged_then_stop
-        self.session.run('localhost', 1883, username='user', password='pass', tls_ca='ca.pem')
-        self.assertEqual(self.client.events[0], ('tls', 'ca.pem'))
+        context = SimpleNamespace(check_hostname=True)
+        with patch('server.mqtt_security.ssl.create_default_context', return_value=context):
+            self.session.run('localhost', 1883, username='user', password='pass', tls_ca='ca.pem')
+        self.assertEqual(self.client.events[0], ('tls-context', context))
         self.assertEqual(self.client.events[1], ('auth', 'user', 'pass'))
         self.assertEqual(self.client.events[2][0], 'connect')
+
+    def test_tls_uses_shared_verified_context_before_credentials_and_connection(self):
+        def acknowledged_then_stop():
+            self.connect_and_ack()
+            raise KeyboardInterrupt()
+        self.client.script = acknowledged_then_stop
+        context = SimpleNamespace(check_hostname=True)
+        with patch('server.mqtt_security.ssl.create_default_context', return_value=context) as create:
+            self.session.run('localhost', 1883, username='user', password='pass', tls_ca='ca.pem')
+        create.assert_called_once_with(cafile='ca.pem')
+        self.assertEqual(self.client.events[0], ('tls-context', context))
+        self.assertEqual(self.client.events[1], ('auth', 'user', 'pass'))
+        self.assertEqual(self.client.events[2][0], 'connect')
+        from server.mqtt_security import SafeHandshakeSocket
+        self.assertIs(context.sslsocket_class, SafeHandshakeSocket)
+
+    def test_empty_tls_or_username_does_not_downgrade_to_anonymous(self):
+        cases = ({'tls_ca': ''}, {'tls_ca': '   '}, {'username': ''}, {'username': '   '})
+        for settings in cases:
+            with self.subTest(settings=settings):
+                client = Client()
+                with self.assertRaises(CaptureError):
+                    CaptureSession(client, Recorder()).run('localhost', 1883, **settings)
+                self.assertFalse(any(event[0] == 'connect' for event in client.events))
+
+    def test_invalid_ca_fails_before_connect_without_exposing_password(self):
+        with patch('server.mqtt_security.ssl.create_default_context', side_effect=OSError('bad CA')):
+            with self.assertRaises(CaptureError) as caught:
+                self.session.run('localhost', 1883, username='user', password='private-value',
+                                 tls_ca='bad-ca.pem')
+        self.assertFalse(any(event[0] == 'connect' for event in self.client.events))
+        self.assertNotIn('private-value', str(caught.exception))
 
     def test_credentials_without_tls_are_rejected_before_connect(self):
         with self.assertRaises(CaptureError):
@@ -144,11 +178,9 @@ class CaptureTest(unittest.TestCase):
         self.assertFalse(any(item[0] in ('auth', 'connect') for item in self.client.events))
 
     def test_tls_setup_failure_is_rejected_before_connect(self):
-        def fail(ca_certs):
-            raise OSError('invalid CA')
-        self.client.tls_set = fail
-        with self.assertRaises(CaptureError):
-            self.session.run('localhost', 1883, username='user', password='pass', tls_ca='ca.pem')
+        with patch('server.mqtt_security.ssl.create_default_context', side_effect=OSError('invalid CA')):
+            with self.assertRaises(CaptureError):
+                self.session.run('localhost', 1883, username='user', password='pass', tls_ca='ca.pem')
         self.assertFalse(any(item[0] in ('auth', 'connect') for item in self.client.events))
 
     def test_interrupt_during_write_marks_incomplete_capture(self):

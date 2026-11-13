@@ -1,8 +1,13 @@
 import json
+import io
+import os
+import ssl
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from server.mqtt_client import MqttService
+from server.mqtt_client import MqttService, start_mqtt
 
 
 class FakeClient:
@@ -176,6 +181,102 @@ class MqttServiceTest(unittest.TestCase):
                 stop.assert_called_once_with(self.service)
 
         asyncio.run(run())
+
+
+class MqttSecurityConfigTest(unittest.TestCase):
+    class RecordingClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+            self.tls_error = None
+
+        def tls_set_context(self, context):
+            self.events.append(('tls', context.cafile))
+            if self.tls_error:
+                raise self.tls_error
+
+        def username_pw_set(self, username, password):
+            self.events.append(('auth', username, password))
+
+        def connect(self, host, port, keepalive):
+            self.events.append(('connect', host, port, keepalive))
+            return super().connect(host, port, keepalive)
+
+    def setUp(self):
+        self.client = self.RecordingClient()
+        self.base_env = {'MQTT_HOST': '127.0.0.1', 'MQTT_PORT': '1883'}
+
+    def start_with(self, extra=None):
+        settings = dict(self.base_env)
+        settings.update(extra or {})
+        with patch.dict(os.environ, settings, clear=True), \
+             patch('server.mqtt_client.load_dotenv'), \
+             patch('ssl.create_default_context', side_effect=lambda *, cafile: SimpleNamespace(
+                 cafile=cafile, check_hostname=True, verify_mode=ssl.CERT_REQUIRED)), \
+             patch('server.mqtt_client.mqtt.Client', return_value=self.client):
+            return start_mqtt()
+
+    def test_default_anonymous_connection_remains_supported(self):
+        service = self.start_with()
+        self.assertIs(service.client, self.client)
+        self.assertEqual(self.client.events, [('connect', '127.0.0.1', 1883, 60)])
+        self.assertTrue(self.client.started)
+
+    def test_tls_and_authentication_are_configured_before_connect(self):
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            self.start_with({'MQTT_USERNAME': 'user', 'MQTT_PASSWORD': 'secret',
+                             'MQTT_TLS_CA': 'example-ca.pem'})
+        self.assertEqual(self.client.events, [('tls', 'example-ca.pem'),
+                                             ('auth', 'user', 'secret'),
+                                             ('connect', '127.0.0.1', 1883, 60)])
+        self.assertNotIn('secret', output.getvalue())
+
+    def test_username_with_tls_and_no_password_is_supported(self):
+        self.start_with({'MQTT_USERNAME': 'user', 'MQTT_TLS_CA': 'example-ca.pem'})
+        self.assertEqual(self.client.events, [('tls', 'example-ca.pem'),
+                                             ('auth', 'user', None),
+                                             ('connect', '127.0.0.1', 1883, 60)])
+
+    def test_tls_only_is_supported(self):
+        self.start_with({'MQTT_TLS_CA': 'example-ca.pem'})
+        self.assertEqual(self.client.events, [('tls', 'example-ca.pem'),
+                                             ('connect', '127.0.0.1', 1883, 60)])
+
+    def test_explicit_empty_tls_or_username_never_downgrades_to_anonymous(self):
+        for settings in ({'MQTT_TLS_CA': ''}, {'MQTT_TLS_CA': '   '},
+                         {'MQTT_USERNAME': ''}, {'MQTT_USERNAME': '   '}):
+            with self.subTest(settings=list(settings)):
+                self.client = self.RecordingClient()
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.start_with(settings)
+                self.assertFalse(any(event[0] == 'connect' for event in self.client.events))
+
+    def test_password_without_username_is_rejected_before_connect(self):
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.start_with({'MQTT_PASSWORD': 'secret', 'MQTT_TLS_CA': 'example-ca.pem'})
+        self.assertFalse(any(event[0] == 'connect' for event in self.client.events))
+
+    def test_authenticated_connection_without_tls_is_rejected_before_connect(self):
+        for credentials in ({'MQTT_USERNAME': 'user'},
+                            {'MQTT_USERNAME': 'user', 'MQTT_PASSWORD': 'secret'},
+                            {'MQTT_USERNAME': 'user', 'MQTT_PASSWORD': 'secret', 'MQTT_TLS_CA': ''}):
+            with self.subTest(credentials=list(credentials)):
+                self.client = self.RecordingClient()
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.start_with(credentials)
+                self.assertFalse(any(event[0] == 'connect' for event in self.client.events))
+
+    def test_ca_configuration_failure_does_not_connect_or_expose_password(self):
+        self.client.tls_error = OSError('invalid CA')
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            with self.assertRaises((ValueError, RuntimeError)) as caught:
+                self.start_with({'MQTT_USERNAME': 'user', 'MQTT_PASSWORD': 'secret-value',
+                                 'MQTT_TLS_CA': 'bad-ca.pem'})
+        self.assertFalse(any(event[0] == 'connect' for event in self.client.events))
+        self.assertNotIn('secret-value', str(caught.exception))
+        self.assertNotIn('secret-value', output.getvalue())
 
 
 if __name__ == '__main__':

@@ -1,0 +1,14 @@
+diff --git a/Source/agvSimulation/AGVWebSocketClient.cpp b/Source/agvSimulation/AGVWebSocketClient.cpp
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -74 +74,9 @@ void AAGVWebSocketClient::ConnectToServer()
+-    Socket = WebSocketsModule.CreateWebSocket(ServerURL);
++    // The token is supplied at process start; never embed it in the project or URL.
++    const FString TwinToken = FPlatformMisc::GetEnvironmentVariable(TEXT("AGV_TWIN_UNREAL_TOKEN"));
++    TMap<FString, FString> UpgradeHeaders;
++    if (!TwinToken.IsEmpty() && ServerURL.Equals(
++            TEXT("ws://127.0.0.1:8000/ws/digital-twin"), ESearchCase::CaseSensitive))
++    {
++        UpgradeHeaders.Add(TEXT("X-AGV-Twin-Token"), TwinToken);
++    }
++    Socket = WebSocketsModule.CreateWebSocket(ServerURL, FString(), UpgradeHeaders);

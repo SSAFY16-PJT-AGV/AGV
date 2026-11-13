@@ -1,5 +1,7 @@
 # 관제 서버
 
+현재 진행 상황과 검증 범위는 [서버·통신 진행 보고](docs/progress_report.md)를 참고한다.
+
 FastAPI와 MQTT 기반 관제 서버의 초기 구현이다. MQTT 상태 수신과 별도로
 경로 계산, 구간 예약 자료구조, 기록·재생 구성요소를 단계적으로 개발한다.
 
@@ -13,9 +15,38 @@ python -m venv .venv
 ```
 
 저장소 루트의 `.env`에 `MQTT_HOST`, `MQTT_PORT`를 설정하고, 해당 MQTT
-브로커를 실행한 뒤 서버를 시작한다. 브로커 접속 정보와 비밀번호는
-저장소에 커밋하지 않는다. 현재 상태 수신기는 사용자 인증·TLS 설정을
-아직 지원하지 않으므로 인증이 필요한 팀 브로커에는 그대로 연결할 수 없다.
+브로커를 실행한 뒤 서버를 시작한다. 브로커 접속 정보와 비밀번호는 저장소에
+커밋하지 않는다. 팀 브로커의 실제 주소와 포트, 인증 및 CA 설정은 사용 전
+확인한다.
+
+상태 수신기와 격리 시뮬레이션의 이벤트 수신·명령 발행기는 선택적으로
+`MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA`를
+읽는다. 인증을 사용하려면 신뢰할 CA 파일 경로인 `MQTT_TLS_CA`가 반드시
+필요하며, `MQTT_PASSWORD`가 설정돼 있으면 비어 있지 않은 `MQTT_USERNAME`이
+필요하다. 사용자명만 설정하는 경우에도 TLS CA가 필요하다. 사용자명과
+비밀번호 없이 `MQTT_TLS_CA`만 설정하는 TLS 전용 연결도 가능하다. 예를 들어
+`.env`에 아래와 같이 설정한다(주소·포트·경로와 인증 정보는 예시다).
+
+```dotenv
+MQTT_HOST=broker.example.invalid
+MQTT_PORT=8883
+MQTT_TLS_CA=D:/path/to/trusted-ca.pem
+MQTT_USERNAME=example-user
+MQTT_PASSWORD=replace-with-private-value
+```
+
+TLS만 쓴다면 사용자명과 비밀번호 설정을 모두 제거한다. 인증 또는 TLS를
+사용하지 않는 격리 브로커에 연결할 때는 세 선택 설정을 모두 제거해 기존
+연결 방식으로 사용한다. `MQTT_PASSWORD`는 빈 값으로 설정해도 설정된 것으로
+취급되므로 사용하지 않을 때는 항목 자체를 제거한다. `MQTT_USERNAME` 또는
+`MQTT_TLS_CA`를 명시했다면 빈 값이나 공백만 넣을 수 없다. 인증 설정 조합이나 CA
+파일에 오류가 있으면 브로커 접속 전에 실패하며, 자격증명이 잘못되면 브로커가
+접속을 거부한다. 서버는 브로커 인증서와 호스트 이름 검증을 유지한다.
+관측 브로커와 시뮬레이션 브로커가 다르더라도 이 클라이언트들은 같은
+인증정보와 CA 설정을 사용한다. 시뮬레이션 런타임은 생성할 때 설정을 읽으므로
+인증정보를 변경하려면 런타임을 다시 시작해야 한다. 시뮬레이션 브로커는 기존대로
+`127.0.0.1`에 한정되며 TLS를 사용할 때 인증서가 이 주소에 유효해야 한다.
+이 지원은 격리 시뮬레이션 전용으로, 실제 로봇 운행을 의미하지 않는다.
 
 ```powershell
 .\.venv\Scripts\python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
@@ -126,3 +157,82 @@ SQLite에 먼저 저장되지만, 브로커 재시작 이후까지 MQTT 미전�
 ```
 
 단위 테스트는 실제 로봇과 모터를 사용하지 않는다.
+
+## 트윈 로컬 관측 연결 제안
+
+현식님 트윈의 WebSocket 클라이언트와 연결하기 위한 기본 비활성화된
+실험 기능이다. [연결 제안과 제한](docs/twin_websocket_proposal.md)을 먼저
+읽는다. 실물과 공유하지 않는 MQTT 브로커 및 가상 로봇을 준비하고, 서버를
+단일 프로세스로 실행할 때만 아래 환경 변수를 설정한다.
+
+```powershell
+$env:AGV_TWIN_WEBSOCKET = '1'
+$env:AGV_TWIN_ROBOT_ID = 'sim-r1'
+# Unreal 테스트를 할 때 이 셸에서 새 토큰을 생성하고, 같은 환경을 상속해
+# 서버와 Unreal 테스트 사본을 각각 실행한다. 토큰 값을 출력하거나 저장하지 않는다.
+$env:AGV_TWIN_UNREAL_TOKEN = .\.venv\Scripts\python -c "import secrets; print(secrets.token_urlsafe(32))"
+Start-Process -FilePath 'D:\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe' -ArgumentList '"D:\AGV-Twin-Validation\agvSimulation.uproject"', '-NoSplash'
+.\.venv\Scripts\python -m uvicorn server.main:app --host 127.0.0.1 --port 8000 --workers 1 --no-proxy-headers
+```
+
+`/ws/digital-twin`은 연결 후 선택한 ID의 새 실시간 MQTT 상태를 관측용
+`robot.state`로 보낸다. 루프백 외 접속은 거부한다. Origin이 없는 로컬
+클라이언트는 기존처럼 토큰 없이 접속 가능하다. Origin이 있으면 정확히 하나의
+`Origin: http://127.0.0.1`과 하나의 `X-AGV-Twin-Token`이 필요하며, 헤더 값은
+서버의 `AGV_TWIN_UNREAL_TOKEN`과 일치해야 한다. 토큰은 영문 대소문자, 숫자,
+`_`, `-`로 구성된 32~128자다. 다른 Origin, 중복 헤더, 누락·불일치 토큰은
+거부한다. 기본값에는 토큰이 없어서 Origin이 있는 접속은 허용되지 않는다.
+
+위 예시의 환경변수를 서버와 Unreal 테스트 사본 양쪽에 전달해야 한다. 현재
+토큰 헤더를 보내도록 변경한 것은 `D:\AGV-Twin-Validation`의 Unreal 테스트
+사본뿐이며, 현식님의 원본 프로젝트나 GitHub 브랜치에 반영된 것은 아니다.
+테스트 사본은 정확히 `ws://127.0.0.1:8000/ws/digital-twin`으로 접속할 때만
+토큰을 전송한다.
+토큰을 소스·URL·로그에 기록하거나 공개하지 않는다. 이 기능은 Origin이 없는
+로컬 프로세스 인증을 제공하지 않고, 같은 계정의 프로세스에서 환경변수를
+읽을 가능성도 있으므로 외부 네트워크나 실물 브로커에 노출하지 않는다.
+
+ID만으로 가상 장비와 네트워크의 격리를 보장할 수 없다. 오래된 상태는 다시
+보내지 않고 경로 주문은 전송하지 않는다. 기본 모드는 노드 상태만 보내며,
+현재 트윈은 노드 메시지를 받으면 표시 위치를 바꿀 수 있으므로 같은 맵의
+노드 ID를 쓰는지 확인해야 한다. 실물 운행이나 안전 판단에 사용하지 않는다.
+
+### 격리된 가상 pose 시험
+
+실물과 분리된 브로커 및 가상 발행기를 사용할 때만 서버 환경변수
+`AGV_TWIN_POSE_MAP_ID=twin-validation-v1`을 선택적으로 설정할 수 있다.
+미설정 또는 빈 값이면 기존 노드 상태만 보내고, 이 값이 아닌 비어 있지 않은
+설정값은 pose 시험을 활성화하지 않고 상태 전송을 거부한다. 시험 발행기가
+보내는 상태의 `map_id`도 정확히 `twin-validation-v1`이어야 한다.
+
+```json
+{"map_id":"twin-validation-v1", "last_node":"J01", "status":"MOVING", "battery":0.8,
+ "pose":{"x":1500,"y":2000,"th":90}}
+```
+
+입력 `pose.x`, `pose.y`는 mm, `pose.th`는 도이며 서버는 이를 WebSocket의
+최상위 `data.x=1.5`, `data.y=2.0`(m), `data.yaw=90`(도)으로 변환한다.
+셋 모두 유한한 숫자여야 하며 x/y는 각각 ±1,000,000 mm, 각도는 ±3,600도
+안에 있어야 한다. 불리언·누락·범위 초과·맵 불일치는 상태 메시지 전체를
+보내지 않는다. 이는 노드만 전송했을 때 Unreal이 순간 이동하는 것을 피한다.
+이 수치 한계나 맵 ID 일치가 실제 맵 경계 또는 물리적 안전을 보장하지 않는다.
+
+이 실험은 가상 발행기와 Unreal 맵이 원점과 축, 각도 방향을 공유한다고
+가정한다. 실물 좌표계와의 정합은 팀 합의 및 검증이 필요하다. Unreal의 첫
+pose는 초기 위치로 즉시 배치되고 그 뒤의 좌표가 보간된다. 이 기능은 로봇의
+명령·경로 전송이나 실물 주행 검증이 아니다.
+
+### 격리 브로커 연결 시험
+
+아래 선택 시험은 별도의 테스트 전용 aMQTT 브로커와 FastAPI를 임시 루프백
+포트에 띄우고, 가상 로봇 발행과 실제 WebSocket 수신을 확인한 뒤 종료한다.
+브로커 의존성은 서버와 별도 경로에 설치한다.
+
+```powershell
+.\.venv\Scripts\python -m pip install --target .venv\broker-deps amqtt==0.11.3
+$env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
+.\.venv\Scripts\python -m unittest server.tests.test_twin_broker_integration -v
+```
+
+이 시험의 WebSocket 클라이언트는 Unreal을 대체하는 테스트 클라이언트다.
+Unreal Editor 화면의 수신·시각화나 실물 로봇의 동작을 검증하지 않는다.

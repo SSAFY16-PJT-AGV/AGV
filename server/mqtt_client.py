@@ -9,10 +9,12 @@ import json
 import math
 import os
 import threading
+import time
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
+from server.mqtt_security import configure_mqtt_client, read_mqtt_security
 
 # Temporary defensive limits; agree on operational limits with the team.
 MAX_PAYLOAD_BYTES = 256 * 1024
@@ -89,6 +91,8 @@ class MqttService:
         self._stopped = False
         self._pending_mid = None
         self._robots = {}
+        self._twin_revisions = {}
+        self._twin_received_at = {}
 
     def start(self):
         with self._lock:
@@ -118,6 +122,16 @@ class MqttService:
         with self._lock:
             return copy.deepcopy({'connected': self._connected, 'ready': self._ready,
                                   'robots': self._robots})
+
+    def twin_observation(self, robot_id):
+        """Return a copied observation and its receive revision for the local twin."""
+        with self._lock:
+            return copy.deepcopy({
+                'connected': self._connected, 'ready': self._ready,
+                'observation': self._robots.get(robot_id),
+                'revision': self._twin_revisions.get(robot_id, 0),
+                'received_at': self._twin_received_at.get(robot_id),
+            })
 
     def _mark_disconnected(self):
         with self._lock:
@@ -192,6 +206,8 @@ class MqttService:
             if parts[2] == 'state':
                 observation['state'] = value
                 observation['state_received_live'] = not message.retain
+                self._twin_revisions[parts[1]] = self._twin_revisions.get(parts[1], 0) + 1
+                self._twin_received_at[parts[1]] = time.monotonic()
             else:
                 observation['connection_report'] = value
                 observation['connection_received_live'] = not message.retain
@@ -213,7 +229,9 @@ def start_mqtt():
         raise RuntimeError('MQTT_PORT must be a valid port number') from error
     if not 1 <= port <= 65535:
         raise RuntimeError('MQTT_PORT must be a valid port number')
-    return MqttService(host, port).start()
+    service = MqttService(host, port)
+    configure_mqtt_client(service.client, *read_mqtt_security())
+    return service.start()
 
 
 def stop_mqtt(service):

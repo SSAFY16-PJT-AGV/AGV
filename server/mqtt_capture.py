@@ -9,6 +9,7 @@ import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
 from server.mqtt_log import JsonlRecorder
+from server.mqtt_security import configure_mqtt_client
 
 
 class CaptureError(RuntimeError):
@@ -86,18 +87,10 @@ class CaptureSession:
             self._fail('MQTT connection lost; log may have a gap')
 
     def run(self, host, port, username=None, password=None, tls_ca=None):
-        if password is not None and not username:
-            raise CaptureError('MQTT_USERNAME is required when MQTT_PASSWORD is set')
-        if (username or password is not None) and not tls_ca:
-            raise CaptureError('MQTT_TLS_CA is required for authenticated MQTT')
-        if tls_ca:
-            try:
-                # Paho defaults to certificate-required and hostname checking.
-                self.client.tls_set(ca_certs=tls_ca)
-            except Exception as exc:
-                raise CaptureError('MQTT TLS configuration failed') from exc
-        if username:
-            self.client.username_pw_set(username, password)
+        try:
+            configure_mqtt_client(self.client, username, password, tls_ca)
+        except RuntimeError as exc:
+            raise CaptureError(str(exc)) from None
         try:
             try:
                 result = self.client.connect(host, port, keepalive=60)

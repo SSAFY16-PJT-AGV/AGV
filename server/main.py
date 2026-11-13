@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from server.mqtt_client import start_mqtt, stop_mqtt
 from server.sim_api import router as sim_router
+from server.twin_websocket import router as twin_router
 
 
 def load_sim_runtime():
@@ -74,6 +75,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="스마트 마트 관제 서버", lifespan=lifespan)
 app.include_router(sim_router)
+app.include_router(twin_router)
 
 
 @app.get("/robots")

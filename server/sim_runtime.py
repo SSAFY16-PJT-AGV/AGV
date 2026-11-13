@@ -17,6 +17,7 @@ from server.allocation_store import AllocationStore, _id
 from server.coordinator import Coordinator
 from server.dispatch import RobotCandidate
 from server.order_publisher import OrderPublisher, _topic
+from server.mqtt_security import configure_mqtt_client, read_mqtt_security
 from server.recovery import RecoveryGate
 from server.segment_progress import SegmentProgress
 from sim.event_inbox import SimEventInbox
@@ -91,6 +92,7 @@ class SimRuntime:
             raise ValueError('file-backed database required')
         self.map_data, self.host, self.port = copy.deepcopy(map_data), host, port
         self.client_id, self.connect_timeout, self.ack_timeout = client_id, float(connect_timeout), float(ack_timeout)
+        self._mqtt_security = read_mqtt_security()
         self._lock = threading.RLock()
         self._owner = _DatabaseOwner(self.path)
         self._started = False
@@ -103,6 +105,7 @@ class SimRuntime:
                              clean_session=not persistent, protocol=mqtt.MQTTv311,
                              reconnect_on_failure=False)
         client.connect_timeout = self.connect_timeout
+        configure_mqtt_client(client, *self._mqtt_security)
         return client
 
     @staticmethod
