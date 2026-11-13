@@ -28,6 +28,18 @@ git pull
 git stash pop      # 되돌리기. 충돌이 나면 agv/config/explore.json에서 <<<< 표시 부분을 골라 고친다
 ```
 
+**팔 서보 라이브러리 (처음 한 번)**: 카메라 자세(`camtool arm`)는 Waveshare 서보 라이브러리 `SCSCtrl`을 쓴다. `서보를 못 써요: SCSCtrl ... 못 찾았어요`가 나오면 설치한다.
+
+```
+cd ~ && git clone https://github.com/waveshare/JETANK.git
+cd ~/JETANK && pip3 install --user .      # pyserial도 같이 설치됨. 설치 없이 ~/JETANK에 받아만 둬도 찾아 씀
+python3 -m agv.tools.camtool arm --read   # 확인: 1·2·3·5번 각도가 숫자로 나오면 됨
+```
+
+- `접근 권한이 없어요`: `sudo chmod 666 /dev/ttyTHS1`(재부팅하면 풀림). 계속 쓰려면 JETANK의 `config.sh`처럼 udev 규칙(`KERNEL=="ttyTHS1",MODE="0666"`)을 넣는다.
+- 각도가 `?`로 나오거나 서보가 반응하지 않음: 시리얼 콘솔이 포트를 잡고 있을 수 있다. `sudo systemctl stop nvgetty && sudo systemctl disable nvgetty` 후 재부팅. 주피터에서 서보 노트북을 열어 두었으면 그 커널을 끈다.
+- JETANK의 `config.sh`를 통째로 돌리지는 않는다. 카메라 색 보정 파일(`camera_overrides.isp`)을 바꾸고 재부팅까지 해서, 색 보정을 다시 해야 할 수 있다.
+
 **안전**
 - `ask`·`drive` 모드는 `--enable-motors`를 붙여야만 바퀴가 돈다.
 - **Ctrl+C**를 누르면 모터를 세우고 기록을 닫는다. 첫 주행은 손을 로봇 옆에 두고 한다.

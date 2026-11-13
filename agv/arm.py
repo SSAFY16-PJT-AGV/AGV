@@ -48,14 +48,40 @@ def _ttl():
         raise RuntimeError(u"서보 포트 %s가 없어요(Jetson이 아니거나 시리얼이 꺼져 있음)" % DEVICE)
     if not os.access(DEVICE, os.R_OK | os.W_OK):
         raise RuntimeError(u"서보 포트 %s에 접근 권한이 없어요(sudo chmod 666 %s 또는 dialout 그룹)" % (DEVICE, DEVICE))
+    _add_scsctrl_path()
     try:
         from SCSCtrl import TTLServo
-    except ImportError:
-        raise RuntimeError(u"SCSCtrl(Waveshare 서보 라이브러리)이 없어요. JETANK 이미지의 설치 스크립트를 확인하세요")
+    except ImportError as e:
+        if "serial" in str(e):
+            raise RuntimeError(u"pyserial이 없어요: pip3 install --user pyserial")
+        raise RuntimeError(INSTALL_HINT)
     except SystemExit:
         raise RuntimeError(u"서보 포트를 못 열었어요(다른 프로그램, 예: 주피터 커널이 쓰는 중인지 확인)")
     _backend = TTLServo
     return _backend
+
+
+# Waveshare JETANK 저장소의 SCSCtrl 폴더(설치 안 하고 받아만 둔 경우)를 찾는 곳. SCSCTRL_PATH로 지정 가능
+SCSCTRL_DIRS = ["~/JETANK", "~/jetbot/JETANK", "~/Notebooks/JETANK", "/workspace/JETANK",
+                "/workspace/jetbot/notebooks/JETANK"]
+INSTALL_HINT = (u"SCSCtrl(Waveshare 서보 라이브러리)을 못 찾았어요. 한 번만 설치하세요:\n"
+                u"    cd ~ && git clone https://github.com/waveshare/JETANK.git\n"
+                u"    cd ~/JETANK && pip3 install --user .\n"
+                u"  (설치 없이 ~/JETANK에 받아만 둬도 찾아 써요. 다른 곳이면 SCSCTRL_PATH=<JETANK 폴더>)")
+
+
+def _add_scsctrl_path():
+    """SCSCtrl이 설치돼 있지 않으면 받아 둔 JETANK 폴더를 import 경로에 더한다."""
+    import importlib.util
+    import sys
+    if importlib.util.find_spec("SCSCtrl") is not None:
+        return
+    dirs = [os.environ.get("SCSCTRL_PATH", "")] + SCSCTRL_DIRS
+    for d in dirs:
+        d = os.path.expanduser(d) if d else ""
+        if d and os.path.isfile(os.path.join(d, "SCSCtrl", "TTLServo.py")):
+            sys.path.insert(0, d)
+            return
 
 
 def raw_to_deg(raw):
