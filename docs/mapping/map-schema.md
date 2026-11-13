@@ -115,10 +115,10 @@
 | 필드 | 필수 | 읽는 쪽 | 뜻 |
 | --- | --- | --- | --- |
 | `id` | O | - | 엣지 ID. `branches`, `through`가 가리킴 |
-| `from`, `to` | O | 서버·트윈 | 노드 ID |
+| `from`, `to` | O | 서버·트윈 | 노드 ID. 탐색기가 만든 맵에서는 탐색할 때 지나간 방향이고, `branch`·`shape` 순서도 이 방향 기준 |
 | `shape` | O | 서버 | [[x, y], ...] mm. 첫 점 = `from`의 `pos`, 끝 점 = `to`의 `pos` |
 | `points` | O | 트윈 | `shape`의 중간 점들([{x, y}], m) |
-| `bidirectional` | O | 서버 | 라인은 false(한쪽으로만 돎), 스퍼 엣지는 true(들어갔다 후진으로 나옴) |
+| `bidirectional` | O | 서버 | 기본 true. 테이프 선은 양쪽으로 따라갈 수 있고 차체가 제자리에서 돌 수 있어서, 탐색은 한 방향으로 했어도 양방향으로 둔다. 스퍼 엣지도 true(들어갔다 후진으로 나옴). 한쪽으로만 다니게 할 맵만 라인을 false로(탐색기 `--one-way`) |
 | `lanes` | O | 서버 | 1 |
 | `type` | O | 트윈 | `main`(라인), `destination`(스퍼) |
 | `length_mm` | - | - | 실측 주행 거리 평균. `shape` 길이와 다를 수 있음 |
@@ -148,7 +148,7 @@
 
 ## 5. 예시
 
-갈라졌다 합쳐지는 짧은 구간(렌즈)과 왼쪽 스퍼가 있는 작은 맵이다. 서버 `MapGraph`(최단 경로 `P_orange → S1 → M1 → P_green`, 1300mm), 서버 `plan_segment`(`P_orange → D_P_orange` 구간), 트윈 로더 검사를 모두 통과한다.
+갈라졌다 합쳐지는 짧은 구간(렌즈)과 왼쪽 스퍼가 있는 작은 맵이다. 서버 `MapGraph`(최단 경로 `P_orange → S1 → M1 → P_green`, 1300mm, 반대 방향도 같은 거리), 서버 `plan_segment`(`P_orange → D_P_orange` 구간, 반대 방향 `P_green → M1 → V_E3 → S1 → P_orange → D_P_orange` 구간), 트윈 로더 검사를 모두 통과한다.
 
 `E3`를 `S1 → M1`로 바로 이으면 서버가 "multiple edges in one direction are ambiguous"로 거부한다. 그래서 중간 노드 `V_E3`로 나눴다.
 
@@ -174,15 +174,15 @@
   ],
   "edges": [
     {"id": "E1", "from": "P_orange", "to": "S1", "shape": [[0, 0], [400, 0]], "points": [],
-     "bidirectional": false, "lanes": 1, "type": "main", "length_mm": 402, "traversals": 4},
+     "bidirectional": true, "lanes": 1, "type": "main", "length_mm": 402, "traversals": 4},
     {"id": "E2", "from": "S1", "to": "M1", "shape": [[400, 0], [900, 0]], "points": [],
-     "bidirectional": false, "lanes": 1, "type": "main", "branch": "left", "length_mm": 505, "traversals": 2},
+     "bidirectional": true, "lanes": 1, "type": "main", "branch": "left", "length_mm": 505, "traversals": 2},
     {"id": "E3", "from": "S1", "to": "V_E3", "shape": [[400, 0], [650, 120]], "points": [],
-     "bidirectional": false, "lanes": 1, "type": "main", "branch": "right", "length_mm": 290, "traversals": 2},
+     "bidirectional": true, "lanes": 1, "type": "main", "branch": "right", "length_mm": 290, "traversals": 2},
     {"id": "E3b", "from": "V_E3", "to": "M1", "shape": [[650, 120], [900, 0]], "points": [],
-     "bidirectional": false, "lanes": 1, "type": "main", "length_mm": 290, "traversals": 2},
+     "bidirectional": true, "lanes": 1, "type": "main", "length_mm": 290, "traversals": 2},
     {"id": "E4", "from": "M1", "to": "P_green", "shape": [[900, 0], [1300, 0]], "points": [],
-     "bidirectional": false, "lanes": 1, "type": "main", "length_mm": 398, "traversals": 4},
+     "bidirectional": true, "lanes": 1, "type": "main", "length_mm": 398, "traversals": 4},
     {"id": "E_D_P_orange", "from": "P_orange", "to": "D_P_orange", "shape": [[0, 0], [0, -180]], "points": [],
      "bidirectional": true, "lanes": 1, "type": "destination", "length_mm": 180}
   ],
@@ -214,7 +214,7 @@
    추천: (가). 실측 좌표 단계 뒤에는 둘이 같아진다.
 4. **구역 확정 절차.** 자동으로 만든 대기·공유 구역(`auto: true`)을 누가 어떤 기준으로 확인할지. 서버 문서도 실제 안전 구역 크기·정지 거리는 사람이 확인해야 한다고 적고 있다.
 5. **노드 ID 안정성.** 패치 ID(`P_<색>`)는 맵을 다시 만들어도 같지만, 갈림길 번호(`S1`, `M2` 등)는 탐색 순서에 따라 바뀔 수 있다. 서버 설정이나 트윈 레벨이 갈림길 ID를 직접 가리키면 맵을 바꿀 때마다 고쳐야 한다. 추천: 작업 지점은 패치·스퍼 끝 ID로만 가리킨다.
-6. **트윈 단방향.** 트윈 경로 찾기가 `bidirectional: false`를 언제부터 반영할지. 우리 매트는 한쪽으로만 도는 길이다.
+6. **양방향 주행.** 엣지를 기본 양방향으로 둔다(PR #40에 반영). 트윈은 원래 양방향으로 보고, 서버는 반대 방향 경로도 계획하며 엣지 예약을 방향과 상관없이 잡으므로 마주 오는 두 로봇이 한 엣지에 같이 들어가지 않는다. 남는 것: (가) 로봇이 탐색과 반대 방향으로 갈 때 갈라짐이 합쳐짐으로 보이고 좌우가 바뀌는 것을 주행 쪽에서 처리하는 방법, (나) 급한 가지(V자)를 반대로 지날 때의 제자리 회전, (다) 한쪽으로만 다니게 할 구간을 정할지. 추천: 양방향으로 두고, 막히는 구간만 나중에 `false`로 바꾼다.
 
 ## 8. 진행 순서
 
