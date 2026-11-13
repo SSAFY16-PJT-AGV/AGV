@@ -244,6 +244,8 @@ python3 -m agv.tools.runlog data/replay --all
 
 ## 9. 완성된 맵에서 목표 패치로 가기 (goto)
 
+코드는 아직 `feature/goto-nav` 브랜치에 있다(`feature/topo-mapping`에서 갈라짐). Jetson에서 `git fetch origin && git checkout feature/goto-nav && git pull`. 맵 파일(`maps/field_v2.json`)이 topo-mapping 쪽에만 있으면 `git checkout feature/topo-mapping -- maps/field_v2.json`으로 가져온다.
+
 6단계에서 만든 맵(`maps/field_v2.json`)을 쓴다. 시뮬레이션 맵(`maps/sim_ssafy_v2.json`)은 실제 매트와 길이가 달라서 실기체에는 쓰지 않는다. 6단계 전이라도 1~3단계(카메라 자세, 색, 속도 보정)는 끝나 있어야 한다. 로봇은 패치 색과 갈림길로 위치를 알기 때문이다.
 
 **9-1. 모터 없이 위치 추적 확인** — 손으로 바깥쪽 큰 고리를 한 바퀴 민다.
