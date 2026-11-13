@@ -21,6 +21,8 @@
     python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to P_green --enable-motors
     #    스퍼 끝에 주차했다가 3초 뒤 후진해 나와 파랑으로(--then은 쉼표로 여러 개)
     python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to D_P_red --then P_blue --enable-motors
+    #    반대 방향(탐색과 반대로 놓음)으로 출발. 목표가 뒤쪽이면 패치 가운데·스퍼 끝에서 유턴
+    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --reverse --to P_blue --enable-motors
     #    정해진 경로 따라가기(서버 주문의 nodes와 같은 뜻)
     python3 -m agv.explore --mode goto --map maps/field_v2.json --route P_orange,S1,M1,P_purple --enable-motors
     #    모터 없이 위치 추적만 확인(손으로 밀기·녹화 영상): passive에 --map
@@ -109,8 +111,9 @@ def _nav_rows(nav):
     if nav is None:
         return []
     w = nav.where() or {}
-    here = u"모름" if not w.get("known") else u"%s -> %s (후보 %d)" % (
-        w.get("last_node") or u"?", w.get("next_node"), w.get("candidates", 0))
+    here = u"모름" if not w.get("known") else u"%s -> %s %s(후보 %d)" % (
+        w.get("last_node") or u"?", w.get("next_node"), u"[반대 방향] " if w.get("dir") == "rev" else u"",
+        w.get("candidates", 0))
     return [(u"목표", u"%s%s" % (nav.target or u"-", u" / 끝 %s" % nav.final if nav.final != nav.target else u"")),
             (u"위치", here)]
 
@@ -144,6 +147,8 @@ def main(argv=None):
     ap.add_argument("--route", default=None, help="goto: 따라갈 노드 목록(쉼표로). 서버 주문의 nodes와 같은 뜻")
     ap.add_argument("--start", default=None,
                     help="goto: 처음 보게 될 노드(그 노드 조금 앞에 놓음). 없으면 처음 보이는 패치에서 위치를 잡음")
+    ap.add_argument("--reverse", action="store_true",
+                    help="goto: 탐색한 방향과 반대로 놓았음(--start/--route 첫 노드로 반대 방향에서 다가감)")
     ap.add_argument("--stop-offset", type=float, default=None,
                     help="goto: 목표 패치 앞 가장자리를 본 뒤 더 갈 거리(mm). 기본 patch.length_mm/2, 없으면 80")
     ap.add_argument("--enable-motors", action="store_true",
@@ -190,7 +195,7 @@ def main(argv=None):
         try:
             # 경로를 주면 그 첫 노드 조금 앞에 놓았다고 본다
             nav = Navigator(nmap, start=a.start or (route[0] if route else None), stop_offset_mm=off,
-                            hold_at_end=bool(then))
+                            hold_at_end=bool(then), start_dir="r" if a.reverse else "f")
             for n in then:
                 nav.check_node(n)
             if route:
@@ -201,8 +206,9 @@ def main(argv=None):
             print(u"맵/목표 오류: %s" % e)
             print(u"맵 노드: " + u", ".join(sorted(nmap.nodes)))
             return 2
-        print(u"맵 %s: 노드 %d, 엣지 %d / 목표 %s" % (nmap.map_id, len(nmap.nodes), len(nmap.edges),
-                                               nav.final or u"없음(위치 추적만)"))
+        print(u"맵 %s(%s): 노드 %d / 목표 %s" % (
+            nmap.map_id, u"양방향, 패치 가운데·스퍼 끝에서 유턴" if nmap.reversible else u"탐색한 방향으로만",
+            len(nmap.nodes), nav.final or u"없음(위치 추적만)"))
     if a.mode != "passive" and not a.enable_motors:
         print(u"%s 모드는 로봇이 움직여요. 주변을 확인하고 --enable-motors를 붙여 다시 실행하세요." % a.mode)
         return 2

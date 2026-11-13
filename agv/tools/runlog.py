@@ -67,7 +67,8 @@ def main(argv=None):
                   "nav_off_route", "nav_gave_up", "nav_hold_before_split", "nav_unreachable", "stop_planned",
                   "hold", "resume", "nav_spur_armed", "nav_spur_enter", "nav_spur_retry", "nav_spur_missed",
                   "nav_spur_exited", "spur_enter", "spur_in_pivot", "spur_in_done", "spur_end_seen", "spur_parked",
-                  "spur_deadline", "spur_out_reverse", "spur_out_pivot", "spur_out_done")
+                  "spur_deadline", "spur_out_reverse", "spur_out_pivot", "spur_out_done",
+                  "nav_uturn", "uturn_planned", "uturn_pivot", "uturn_done", "nav_near_branch", "nav_spur_exit")
     count = {}
     for e in evs:
         count[e["type"]] = count.get(e["type"], 0) + 1
@@ -132,8 +133,16 @@ def main(argv=None):
             elif m == "spur_end_seen":
                 print(u"  스퍼 끝 봄: 잰 스퍼 길이 %smm (맵 %s)" % (
                     e.get("spur_mm"), u"%.0fmm" % e["map_spur_mm"] if e.get("map_spur_mm") else u"-"))
+            elif m == "nav_uturn":
+                print(u"  유턴: %s 가운데에서 %s쪽으로 돌기" % (e.get("node"), e.get("side")))
+            elif m == "nav_near_branch":
+                print(u"  회전 직후 바로 앞 %s(갈림길)에서 %s 가지를 고른 채로 출발" % (e.get("node"), e.get("want")))
+            elif m == "nav_spur_exit":
+                print(u"  스퍼에서 나가기: %s쪽으로 돌아 %s" % (e.get("side"), u"되돌아감" if e.get("back") else u"이어 감"))
             elif m == "nav_spur_retry":
                 print(u"  스퍼를 못 봐서 한 바퀴 돌아 다시 (%s번째)" % e.get("tries"))
+        print(u"  유턴: 지시 %d, 완료 %d / 시작 %d" % (
+            notes.count("nav_uturn"), notes.count("uturn_done"), notes.count("uturn_pivot")))
         print(u"  스퍼: 주차 %d, 빠져나옴 %d / 후진 시작 %d, 못 봄 %d" % (
             notes.count("spur_parked"), notes.count("spur_out_done"), notes.count("spur_out_reverse"),
             notes.count("nav_spur_missed")))

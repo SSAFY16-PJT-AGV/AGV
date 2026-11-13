@@ -91,24 +91,40 @@ class TestNavMap(unittest.TestCase):
         # 스퍼 엣지는 경로에서 뺌
         self.assertNotIn("E_D_P_red", m.out["P_red"])
         # 주황 뒤 첫 갈림길에서 빨강은 오른쪽(아래로)이 짧고, 보라는 왼쪽(위 선)
-        self.assertEqual(m.shortest_path("E1", "P_red"), ["S1", "P_red"])
+        self.assertEqual(m.shortest_path("E1", "P_red"), ["S1", "M3", "P_red"])
         self.assertEqual(m.shortest_path("E1", "P_purple"), ["S1", "M1", "P_purple"])
         # 초록에서 보라: 모서리 V자로 S자 선을 타고 노랑 교차를 지나 올라가는 길이 짧다
-        self.assertEqual(m.shortest_path("E7", "P_purple"), ["S3", "P_yellow", "X2", "P_purple"])
+        self.assertEqual(m.shortest_path("E7", "P_purple"), ["S3", "P_yellow", "X2", "M1", "P_purple"])
+        # 반대 방향: 합류가 갈림길로 보이고 가지는 inputs를 좌우 뒤집은 것, 스퍼는 오른쪽
+        self.assertEqual(m.kind_seen("M3", "r"), "split")
+        self.assertEqual(m.branches_seen("M3", "r"), {"left": "E14~r", "right": "E10~r"})
+        self.assertEqual(m.kind_seen("S1", "r"), "merge")
+        self.assertEqual(m.spur_side_at("P_red", "r"), "right")
+        # 교차 패치(노랑)는 반대로도 들어온 선 그대로
+        self.assertEqual(m.next_edges("E17~r"), ["E16~r"])
+        # 보라에서 주황: 한 바퀴(약 5m)보다 보라 가운데에서 유턴해 되돌아가는 게 싸다
+        self.assertEqual(m.shortest_path("E3", "P_orange"), ["P_purple", "M1", "S1", "P_orange"])
+        self.assertTrue(m.best_next("E3", "P_orange")[1])
+        self.assertFalse(m.uturn_ok("P_yellow"))                    # 교차 패치에서는 안 돎
 
-    def test_bidirectional_map_drives_explored_direction(self):
-        """build_map 기본(모든 엣지 bidirectional: true)이어도 유턴 없이 탐색 방향으로만 계획한다."""
+    def test_one_way_maps_and_uturn_routes(self):
+        """한쪽 방향 맵(--one-way, 예전 directed)이나 allow_reverse=False면 반대 방향을 계획하지 않는다.
+        경로(주문)의 유턴은 패치 가운데·스퍼 끝에서만."""
         with io.open(SIM_MAP, encoding="utf-8") as f:
             d = json.load(f)
-        for e in d["edges"]:
-            e.pop("directed", None)
-            e["bidirectional"] = True
-        m = NavMap(d)
-        self.assertEqual(m.shortest_path("E7", "P_purple"), ["S3", "P_yellow", "X2", "P_purple"])
+        one = NavMap(d, allow_reverse=False)
+        self.assertNotIn("E3~r", one.edges)
         with self.assertRaises(ValueError):
-            m.route_edges(["S3", "P_green"])          # 반대 방향 경로(서버가 줘도) 거절
-        rev = NavMap(d, allow_reverse=True)
-        self.assertEqual(rev.shortest_path("E7", "P_purple")[:2], ["S3", "P_green"])
+            one.route_edges(["S3", "P_green"])
+        two = NavMap(d)
+        self.assertTrue(two.reversible)
+        self.assertEqual(two.route_edges(["M1", "P_purple", "M1"]), {"E3", "E3~r"})   # 보라에서 유턴
+        with self.assertRaises(ValueError):
+            two.route_edges(["P_purple", "M1", "P_purple"])        # 합류(M1)에서는 유턴 못 함
+        with self.assertRaises(ValueError):
+            two.route_edges(["P_orange", "S1", "P_orange"])       # 갈림길에서 되돌아가기
+        with self.assertRaises(ValueError):
+            two.route_edges(["P_red", "P_yellow"])                 # 이어지지 않음
 
     def test_unified_format(self):
         m = NavMap(UNIFIED)
@@ -140,6 +156,63 @@ class TestNavigator(unittest.TestCase):
     def setUp(self):
         self.m = NavMap.load(SIM_MAP)
 
+    def test_reverse_tracking(self):
+        """반대 방향(반시계): 빨강에서 합류 M3이 갈림길로 보이고, 주황으로 가는 가지는 왼쪽."""
+        nav = Navigator(self.m, goal="P_orange", start="P_red", start_dir="r")
+        f = Feed(nav)
+        f.patch("red", 0)
+        nav.on_tee(70, side="right")                # 반대 방향이라 빨강 스퍼는 오른쪽
+        self.assertEqual(f.split(30), ("left", None))
+        self.assertEqual(nav.where()["edge"], "E14~r")
+        nav.on_merge(600)                           # S1이 합류로 보임
+        stop = f.patch("orange", 960)
+        self.assertEqual((stop["node"], stop["reason"]), ("P_orange", "nav_arrived"))
+        self.assertEqual(nav.relocalized, 0)
+
+    def test_uturn_at_patch_while_moving(self):
+        """보라 앞에서 주황으로: 보라 가운데에서 유턴(스퍼 반대쪽으로 돎). 돌고 나면 바로 앞 M1(반대로는
+        갈림길)에서 S1 쪽(오른쪽) 가지를 고른 채로 따라가게 한다."""
+        nav = Navigator(self.m, goal="P_orange", start="M1")
+        f = Feed(nav)
+        nav.on_merge(0)
+        u = f.patch("purple", 40)
+        self.assertEqual((u["type"], u["pos"], u["side"], u["prefer"]), ("uturn", 120, "right", "right"))
+        nav.on_tee(110, side="left")                # 돌기 전에 본 보라 스퍼
+        nav.uturned(120)
+        self.assertEqual((nav.where()["edge"], nav.where()["dir"]), ("E3~r", "rev"))
+        nav.on_split("right", 150)
+        nav.on_merge(500)
+        stop = f.patch("orange", 880)
+        self.assertEqual(stop["reason"], "nav_arrived")
+
+    def test_uturn_after_hold(self):
+        nav = Navigator(self.m, goal="P_purple", start="P_orange", hold_at_end=True)
+        f = Feed(nav)
+        f.patch("orange", 0)
+        f.split(370)
+        nav.on_merge(820)
+        self.assertEqual(f.patch("purple", 860)["reason"], "nav_hold")
+        nav.set_goal("P_orange")                    # 보라 가운데에 서 있는 채로 새 목표
+        u = nav.pop_stop()
+        self.assertEqual((u["type"], u["pos"]), ("uturn", None))
+
+    def test_spur_exit_backwards(self):
+        """보라 스퍼에 주차 -> 주황: 스퍼 쪽으로 돌아 나와(되돌아감) 바로 앞 M1에서 오른쪽 가지."""
+        nav = Navigator(self.m, goal="D_P_purple", start="P_orange", hold_at_end=True)
+        f = Feed(nav)
+        f.patch("orange", 0)
+        f.split(370)
+        nav.on_merge(820)
+        f.patch("purple", 860)
+        nav.on_tee(930, side="left")
+        self.assertEqual(nav.pop_stop()["type"], "enter_spur")
+        nav.spur_arrived("left")
+        nav.set_goal("P_orange")
+        nav.resumed()
+        self.assertEqual(nav.spur_exit_side(), ("left", "right"))
+        nav.spur_exited(940)
+        self.assertEqual(nav.where()["edge"], "E3~r")
+
     def test_shortest_choice_and_patch_spur(self):
         nav = Navigator(self.m, goal="P_red", start="P_orange", stop_offset_mm=70)
         f = Feed(nav)
@@ -164,8 +237,11 @@ class TestNavigator(unittest.TestCase):
         f = Feed(nav)
         f.patch("blue", 5000)
         w = nav.where(5100)
-        self.assertEqual((w["last_node"], w["next_node"], w["candidates"]), ("P_blue", "P_orange", 1))
+        # 방향은 아직 모름: 정방향(-> 주황)과 반대 방향(-> 빨강) 둘 다 후보
+        self.assertEqual((w["last_node"], w["candidates"]), ("P_blue", 2))
         f.patch("orange", 6010)
+        w = nav.where(6100)
+        self.assertEqual((w["dir"], w["candidates"]), ("fwd", 1))
         self.assertEqual(f.split(6380), ("left", None))   # 초록은 위 선
 
     def test_missed_merge_and_unexpected_patch(self):
@@ -202,13 +278,13 @@ class TestNavigator(unittest.TestCase):
 
     def test_route_forbids_other_branch_and_stops_off_route(self):
         nav = Navigator(self.m, start="P_orange")
-        nav.set_route(["P_orange", "S1", "P_red"])
+        nav.set_route(["P_orange", "S1", "M3", "P_red"])
         f = Feed(nav)
         f.patch("orange", 0)
         self.assertEqual(f.split(370)[0], "right")
         # 선을 잘못 타서 위 선(왼쪽)으로 감: 예약 안 된 길이니 바로 대기
         nav2 = Navigator(self.m, start="P_orange")
-        nav2.set_route(["P_orange", "S1", "P_red"])
+        nav2.set_route(["P_orange", "S1", "M3", "P_red"])
         Feed(nav2).patch("orange", 0)
         nav2.choose_split(370)
         nav2.on_split("left", 470)
@@ -217,7 +293,7 @@ class TestNavigator(unittest.TestCase):
 
     def test_hold_before_split_target(self):
         nav = Navigator(self.m, start="P_orange")
-        nav.set_route(["P_orange", "S1", "P_red"], release="S1")
+        nav.set_route(["P_orange", "S1", "M3", "P_red"], release="S1")
         f = Feed(nav)
         f.patch("orange", 0)
         self.assertEqual(f.split(370), (None, None))
@@ -298,7 +374,7 @@ class TestNavigator(unittest.TestCase):
     def test_route_into_and_out_of_spur(self):
         """주문처럼: 스퍼 끝까지 경로 -> 주차 -> 스퍼 끝에서 시작하는 다음 경로. 나오면 부모 패치 뒤 위치로 이어 감."""
         nav = Navigator(self.m, start="P_orange", hold_at_end=True)
-        nav.set_route(["P_orange", "S1", "P_red", "D_P_red"])
+        nav.set_route(["P_orange", "S1", "M3", "P_red", "D_P_red"])
         f = Feed(nav)
         f.patch("orange", 0)
         self.assertEqual(f.split(370)[0], "right")
@@ -312,7 +388,8 @@ class TestNavigator(unittest.TestCase):
         nav.set_route(["D_P_red", "P_red", "P_blue"])
         nav.resumed()
         nav.on_patch("red", 1170)                  # 나오는 동안 패치를 다시 봐도 무시
-        nav.spur_exited()
+        self.assertEqual(nav.spur_exit_side(), ("right", None))   # 파랑은 들어온 방향 그대로: 스퍼 반대쪽
+        nav.spur_exited(1170)
         self.assertEqual(nav.where()["edge"], "E12")
         stop = f.patch("blue", 1500)
         self.assertEqual((stop["node"], stop["hold"]), ("P_blue", True))
@@ -336,7 +413,7 @@ class TestNavigator(unittest.TestCase):
         self.assertEqual((ent["type"], ent["pos"]), ("enter_spur", 395))
 
     def test_gives_up_after_laps(self):
-        nav = Navigator(self.m, goal="P_yellow", start="P_orange")
+        nav = Navigator(NavMap.load(SIM_MAP, allow_reverse=False), goal="P_yellow", start="P_orange")
         f = Feed(nav)
         stop = None
         loop = ["orange", "red", "blue"]               # 계속 아래 고리만 돎(노랑을 못 감)
@@ -539,6 +616,78 @@ class TestSimSpur(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestSimReverse(unittest.TestCase):
+    """양방향 맵: 반시계 방향 주행, 패치 가운데 유턴, 스퍼에서 되돌아 나오기."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = NavMap.load(SIM_MAP)
+        cls.centers = dict((p["color"], p["center"]) for p in Mat(MAT_V2).d["patches"])
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, goals, start="P_orange", start_dir="f", pose=None, seed=1):
+        nav = Navigator(self.m, start=start, start_dir=start_dir, hold_at_end=len(goals) > 1)
+        st = {"i": 0, "t": None}
+
+        def go(g):
+            nav.set_route(g) if isinstance(g, list) else nav.set_goal(g)
+        go(goals[0])
+
+        def on_step(runner, t):
+            if runner.state != "hold":
+                return
+            if st["t"] is None:
+                st["t"] = t
+            elif t - st["t"] > 1.0 and st["i"] + 1 < len(goals):
+                st["i"] += 1
+                nav.hold_at_end = st["i"] + 1 < len(goals)
+                go(goals[st["i"]])
+                runner.resume()
+                st["t"] = None
+        ev, gt = run_sim.run(MAT_V2, self.tmp, seed=seed, max_time_s=90, policy=nav, start_pose=pose,
+                             on_step=on_step)
+        with io.open(ev, encoding="utf-8") as f:
+            evs = [json.loads(l) for l in f]
+        last = goals[-1][-1] if isinstance(goals[-1], list) else goals[-1]
+        self.assertEqual(gt["finish_reason"], "nav_arrived", [e.get("msg") for e in evs])
+        if last.startswith("P_"):
+            c = self.centers[last[2:]]
+            self.assertLess(math.hypot(gt["final_pose"][0] - c[0], gt["final_pose"][1] - c[1]), 35.0)
+        msgs = [e.get("msg") for e in evs]
+        self.assertNotIn("nav_relocalized", msgs)
+        return gt, msgs
+
+    def test_counterclockwise(self):
+        gt, msgs = self._run(["P_blue"], start_dir="r", pose=[700, 842, 180])
+        h = (gt["final_pose"][2] + 180.0) % 360.0 - 180.0
+        self.assertLess(abs(h), 20.0)          # 아래 선을 오른쪽(+x)으로 달려 파랑에 섬 = 반시계
+
+    def test_uturn_after_hold_and_while_moving(self):
+        gt, msgs = self._run(["P_purple", "P_orange"])
+        self.assertIn("uturn_done", msgs)
+        self.assertAlmostEqual(abs(gt["final_pose"][2]), 180.0, delta=20)       # 돌아서 왔던 쪽을 봄
+        gt, msgs = self._run(["P_orange"], start="M1", pose=[1050, 842, 0], seed=2)
+        self.assertIn("uturn_done", msgs)
+
+    def test_route_spur_round_trip(self):
+        """주문처럼: 빨강 스퍼에 주차 -> 스퍼에서 되돌아 나와 바로 앞 M3에서 S1 쪽 가지 -> 주황."""
+        gt, msgs = self._run([["P_orange", "S1", "M3", "P_red", "D_P_red"],
+                              ["D_P_red", "P_red", "M3", "S1", "P_orange"]])
+        self.assertIn("spur_out_done", msgs)
+        self.assertNotIn("nav_off_route", msgs)
+
+    def test_reverse_into_spur_then_forward(self):
+        """반시계로 와서 빨강 스퍼(오른쪽)에 주차 -> 시계 방향으로 나가 보라."""
+        gt, msgs = self._run(["D_P_red", "P_purple"], start_dir="r", pose=[700, 842, 180])
+        self.assertIn("spur_out_done", msgs)
 
 
 @unittest.skipIf(run_sim is None, "sim/mat/ 없음")

@@ -32,6 +32,14 @@ ExploreRunner가 탐색 정책(topo/explorer.py)과 똑같이 부른다(on_patch
     부모 패치를 지나 SPUR_WINDOW_MM 안에 스퍼를 못 보면, 자유 목표(set_goal)면 한 바퀴 돌아 SPUR_RETRIES번까지
     다시 시도하고, 정해진 경로(set_route)면 예약 밖으로 돌 수 없으니 그 자리에서 선다(nav_spur_missed).
 
+반대 방향·유턴
+    가설의 엣지는 주행 엣지(정방향 E, 반대 방향 E~r)라서 방향을 품는다. 노드가 어떻게 보이는지(갈림길이냐
+    합류냐, 스퍼가 어느 쪽이냐)는 NavMap이 방향에 따라 알려 준다. 경로 비용에는 유턴(패치 가운데·스퍼 끝)이
+    들어 있어서, 패치에 닿았을 때 "여기서 돌아가는 게 싸다"면 runner에 유턴을 지시한다
+    ({type: uturn, pos: 패치 가운데, side: 스퍼 반대쪽}). runner가 돌고 나서 uturned(odo)를 부르면 가설을
+    반대 방향 엣지로 바꾼다. 스퍼 끝에서 나갈 때는 spur_exit_side()로 들어온 방향을 이어 갈지(스퍼 반대쪽으로
+    회전) 되돌아갈지(스퍼 쪽으로 회전) 정한다.
+
 정지
     목표 노드에 맞는 이벤트가 오면 정지를 요청한다(pop_stop). 패치는 패치 가운데에 차체가 오도록
     stop_offset_mm만큼 더 간 뒤 멈춘다. 정해진 경로(set_route)의 해제 노드(released_until)가 끝이
@@ -41,6 +49,8 @@ ExploreRunner가 탐색 정책(topo/explorer.py)과 똑같이 부른다(on_patch
 표준 라이브러리만 쓴다. Python 3.6 호환.
 """
 import collections
+
+from .navmap import FWD, REV
 
 SKIP_COST = {"via": 0.0, "merge": 1.0, "cross": 1.0, "tee": 1.0, "split": 2.0}
 SPURIOUS_COST = {"merge": 1.0, "cross": 1.0, "tee": 1.0}
@@ -54,16 +64,19 @@ SPUR_PENALTY = 2000.0      # 스퍼로 잘못 들어가면 되돌아 나오는 �
 SPUR_WINDOW_MM = 260.0     # 부모 패치 앞 가장자리를 본 뒤 이 거리 안에서 스퍼를 찾음
 SPUR_RETRIES = 2           # 스퍼를 못 봤을 때 한 바퀴 돌아 다시 시도하는 횟수(자유 목표만)
 UNREACHABLE = 1e6
+NEAR_SPLIT_MM = 200.0      # 유턴·스퍼 탈출 회전 직후 이 거리 안의 갈림길은 회전으로 가지를 고른다
 OPP = {"left": "right", "right": "left"}
 
-Hyp = collections.namedtuple("Hyp", "edge s0 cost last")
+Hyp = collections.namedtuple("Hyp", "edge s0 cost last came")   # came: last 노드에 들어올 때 탄 엣지
+Hyp.__new__.__defaults__ = (None,)
 
 
 class Navigator(object):
     def __init__(self, navmap, goal=None, start=None, stop_offset_mm=80.0, hold_at_end=False,
-                 log=None, default_side="left"):
+                 log=None, default_side="left", start_dir=FWD):
         """start: 처음 보게 될 노드(그 노드 조금 앞에 로봇을 놓음). None이면 위치를 모르는 채로
         출발해 처음 보이는 패치에서 위치를 잡는다.
+        start_dir: 탐색한 방향(FWD, 기본)으로 놓았는지 반대(REV)인지. None이면 둘 다 후보.
         hold_at_end: 최종 목표에 도착해도 끝내지 않고 대기한다(서버 주문을 이어 받을 때)."""
         self.m = navmap
         self.stop_offset_mm = float(stop_offset_mm)
@@ -74,6 +87,8 @@ class Navigator(object):
         self.final = None           # 경로의 마지막 노드
         self.allowed = None         # 정해진 경로의 엣지 집합(None이면 최단 경로 자유)
         self.route = None
+        self._route_pos = 0         # 경로에서 마지막으로 지난(또는 서 있는) 노드의 순번
+        self._target_i = None       # 해제 노드의 경로 순번(같은 노드가 경로에 두 번 나올 수 있음)
         self.at_node = None         # 대기 중인 노드
         self._stop = None
         self._early = None          # 미리 정지를 요청한 목표 패치(on_patch_early)
@@ -82,6 +97,7 @@ class Navigator(object):
         self._pre_split = None
         self.spur = None            # 스퍼 진입 상태 {state: armed|entering|parked|exiting, parent, side, pos, hyps}
         self._spur_tries = 0
+        self._uturn = None          # 지시한 유턴 {edge: 돈 뒤 탈 엣지, node, came}
         self.done = False           # 탐색 정책과 같은 이름(runner가 봄). 이동은 pop_stop으로 멈춘다
         self.done_reason = None
         self.n_obs = 0
@@ -90,9 +106,10 @@ class Navigator(object):
         if start is not None:
             if start not in self.m.nodes:
                 raise ValueError(u"맵에 없는 시작 노드: %s" % start)
-            self.hyps = [Hyp(e, None, 0.0, None) for e in self.m.inn[start]]
+            self.hyps = [Hyp(e, None, 0.0, None) for e in self.m.edges_into(start, start_dir)]
             if not self.hyps:
-                raise ValueError(u"시작 노드로 들어오는 길이 없어요: %s" % start)
+                raise ValueError(u"시작 노드로 들어오는 길이 없어요: %s (%s)" % (
+                    start, u"반대 방향" if start_dir == REV else u"탐색 방향"))
         else:
             self.hyps = self._unknown()
         if goal is not None:
@@ -131,17 +148,46 @@ class Navigator(object):
             raise ValueError(u"해제 노드가 경로에 없어요: %s" % release)
         self.allowed = self.m.route_edges(nodes)
         self.route = list(nodes)
+        self._route_pos = 0
         self.final = nodes[-1]
         self.target = release
+        self._target_i = self._route_index(release)
         self._after_new_target()
+
+    def _route_index(self, node):
+        """경로에서 node의 순번: 지금 위치 다음에 처음 나오는 곳(경로 첫 노드에 서 있으면 0)."""
+        for i in range(max(1, self._route_pos), len(self.route)):
+            if self.route[i] == node:
+                return i
+        return 0 if self.route and self.route[0] == node else None
+
+    def _route_advance(self, node):
+        """경로 다음 몇 노드 안에서 node를 지났으면 진행 순번을 올린다."""
+        if self.route is None:
+            return
+        for i in range(self._route_pos + 1, min(len(self.route), self._route_pos + 5)):
+            if self.route[i] == node:
+                self._route_pos = i
+                return
+
+    def _route_reached(self, node):
+        """경로 모드에서 node가 지금 멈출 해제 노드(진행 순번까지 맞음)인가."""
+        if self.route is None:
+            return node == self._approach(self.target)
+        if node != self._approach(self.target):
+            return False
+        need = self._target_i if self._approach(self.target) == self.target else (self._target_i or 0) - 1
+        return self._route_pos >= (need or 0)
 
     def extend(self, release):
         """해제 노드를 늘린다. 대기 중이었으면 runner.resume()을 불러야 다시 간다."""
         if self.route is None or release not in self.route:
             raise ValueError(u"지금 경로에 없는 해제 노드: %s" % release)
-        if self.route.index(release) < self.route.index(self.target or self.route[0]):
+        i = self._route_index(release)
+        if i is None or (self._target_i is not None and i < self._target_i):
             raise ValueError(u"해제 노드를 줄일 수는 없어요")
         self.target = release
+        self._target_i = i
         self._after_new_target()
 
     def check_node(self, n):
@@ -173,6 +219,9 @@ class Navigator(object):
             # 이미 그 자리에 서 있음
             self._request_stop(None, self.target)
             return
+        if self.at_node is not None and self.m.kind(self.at_node) == "patch" and self.spur is None:
+            # 패치 가운데에 서 있다가 새 목표: 되돌아가는 게 싸면 그 자리에서 유턴
+            self._maybe_uturn(self.at_node, None)
         R = self._R()
         if R is not None and self._confident() and not any(h.edge in R for h in self._best()):
             self._note("nav_unreachable", target=self.target, edges=[h.edge for h in self._best()])
@@ -206,9 +255,60 @@ class Navigator(object):
         if self.spur is not None and self.spur["state"] == "parked":
             self.spur["state"] = "exiting"
 
+    # ---------- 유턴 ----------
+    def _maybe_uturn(self, node, pos):
+        """node(패치)에 막 닿았거나 서 있을 때, 목표로 가는 가장 싼 길이 되돌아가는 것이면 유턴을 지시한다."""
+        if self.target is None or not self.m.uturn_ok(node) or self.m.kind(node) != "patch":
+            return False
+        if node == self._approach(self.target) and self._route_reached(node):
+            return False            # 도착한 곳(스퍼 부모면 스퍼로 들어감)
+        best = self._best()
+        cames = set(h.came for h in best if h.last == node)
+        if len(cames) != 1 or None in cames:
+            return False
+        came = cames.pop()
+        nxt = self.m.best_next(came, self._approach(self.target), self.allowed)
+        if nxt is None or not nxt[1]:
+            return False
+        sp = self.m.spur_side_at(node, self.m.dir(came))
+        side = OPP[sp] if sp else self.default_side         # 스퍼 쪽으로 돌면 스퍼에 걸려 멈춤
+        self._uturn = {"edge": nxt[0], "node": node, "came": came}
+        self._stop = {"type": "uturn", "pos": None if pos is None else pos + self.stop_offset_mm,
+                      "side": side, "node": node, "prefer": self._near_branch(nxt[0])}
+        self._note("nav_uturn", node=node, side=side, then=nxt[0])
+        return True
+
+    def _near_branch(self, edge_after):
+        """회전해서 edge_after를 탈 때 바로 앞(NEAR_SPLIT_MM 안)이 갈림길이면 탈 가지 쪽(left/right).
+        회전이 끝나면 갈라지는 모습이 이미 화면에 있어 갈림길 판정을 못 하므로, runner가 회전 직후
+        그쪽 가지를 고른 채로 따라가게 한다. 아니면 None."""
+        e = self.m.edges[edge_after]
+        n2, d = e["to"], e["dir"]
+        if e["len"] > NEAR_SPLIT_MM or self.m.kind_seen(n2, d) != "split":
+            return None
+        br = self.m.branches_seen(n2, d)
+        R = self._R()
+        if R is None or len(br) < 2:
+            return None
+        want = min(br, key=lambda s_: self.m.edges[br[s_]]["len"] + R.get(br[s_], UNREACHABLE))
+        if br[want] not in R:
+            return None
+        self._note("nav_near_branch", node=n2, want=want)
+        return want
+
+    def uturned(self, odo=None):
+        """runner가 유턴을 마쳤을 때 부른다: 반대 방향 엣지로 이어 간다."""
+        u, self._uturn = self._uturn, None
+        if u is None:
+            return
+        self.hyps = [Hyp(u["edge"], odo, 0.0, u["node"], u["came"])]
+        self._note("nav_uturned", where=self.where(odo))
+
     # ---------- 스퍼 끝 ----------
     def _arm_spur(self, parent, pos):
-        side = self.m.spur_side_at(parent)
+        best = self._best()
+        d = self.m.dir(best[0].edge) if best else FWD
+        side = self.m.spur_side_at(parent, d)
         self.spur = {"state": "armed", "parent": parent, "side": side, "pos": pos, "hyps": None,
                      "node": self.target}
         self._note("nav_spur_armed", parent=parent, side=side, node=self.target)
@@ -223,6 +323,7 @@ class Navigator(object):
         sp["state"] = "entering"
         if sp["hyps"] is None:
             sp["hyps"] = list(self.hyps)
+        sp["dir"] = self.m.dir(sp["hyps"][0].edge) if sp["hyps"] else FWD
         self._stop = {"type": "enter_spur", "via": via, "pos": pos, "side": sp["side"], "node": sp["node"]}
         self._note("nav_spur_enter", via=via, side=sp["side"], node=sp["node"])
 
@@ -267,11 +368,36 @@ class Navigator(object):
         return {"hold": hold, "reason": "nav_hold" if hold else "nav_arrived", "node": node,
                 "spur_mm": self.m.spur_length(node)}
 
-    def spur_exited(self):
+    def spur_exit_side(self):
+        """runner가 스퍼에서 후진해 갈림 지점에 왔을 때 돌 쪽을 묻는다. 들어온 방향을 이어 가면 스퍼 반대쪽,
+        되돌아가면 스퍼 쪽으로 돈다(어느 쪽이든 90도)."""
+        sp = self.spur
+        if sp is None:
+            return None
+        cont = sp.get("hyps") or []
+        par, d = sp["parent"], sp.get("dir", FWD)
+        back = [Hyp(f, None, 0.0, par) for f in self.m.edges_out_of(par, REV if d == FWD else FWD)]
+        sp["exit_hyps"] = cont
+        side = OPP[sp["side"]]
+        R = self._R()
+        if R is not None and back:
+            def cost(hs):
+                vs = [self.m.edges[h.edge]["len"] + R[h.edge] for h in hs if h.edge in R]
+                return min(vs) if vs else None
+            c_cont, c_back = cost(cont), cost(back)
+            if c_back is not None and (c_cont is None or c_back < c_cont):
+                sp["exit_hyps"] = back
+                side = sp["side"]
+        prefer = self._near_branch(sp["exit_hyps"][0].edge) if len(sp["exit_hyps"]) == 1 else None
+        self._note("nav_spur_exit", side=side, back=side == sp["side"], prefer=prefer)
+        return side, prefer
+
+    def spur_exited(self, odo=None):
         """runner가 스퍼에서 후진해 본선에 다시 올랐을 때 부른다."""
         sp, self.spur = self.spur, None
-        if sp is not None and sp.get("hyps"):
-            self.hyps = sp["hyps"]
+        hs = (sp or {}).get("exit_hyps") or (sp or {}).get("hyps")
+        if hs:
+            self.hyps = [h._replace(s0=odo) if h.s0 is None else h for h in hs]
         self._note("nav_spur_exited", where=self.where())
 
     # ---------- 가설 ----------
@@ -296,12 +422,13 @@ class Navigator(object):
             L2 = L + self.m.edges[e]["len"]
             node = self.m.edges[e]["to"]
             yield e, node, L2, c
-            k = self.m.kind(node)
+            d = self.m.dir(e)
+            k = self.m.kind_seen(node, d)
             if k in SKIP_COST:
                 step = 0 if k == "via" else 1
                 if dep + step > MAX_SKIP:
                     continue
-                nexts = list(self.m.nodes[node]["branches"].values()) if k == "split" else self.m.next_edges(e)
+                nexts = list(self.m.branches_seen(node, d).values()) if k == "split" else self.m.next_edges(e)
                 for f in nexts:
                     if f in self.m.edges and not self.m.edges[f]["spur"]:
                         stack.append((f, L2, c + SKIP_COST[k], dep + step))
@@ -336,7 +463,8 @@ class Navigator(object):
         if self._spur_busy():
             sp = self.spur
             par = self.m.nodes[sp["parent"]]
-            if not (kind == "patch" and par["kind"] == "patch" and par["color"] == color):
+            if not (sp["state"] == "entering" and kind == "patch" and par["kind"] == "patch"
+                    and par["color"] == color):
                 return              # 스퍼 안·드나들 때 본 것은 위치 추적에 안 씀
             # 교차 판정으로 늦게 온 부모 패치: 위치만 갱신하고 나올 때 쓸 가설로 둔다
             sp["hyps"] = None
@@ -349,23 +477,23 @@ class Navigator(object):
             d = None if h.s0 is None else odo - h.s0
             for e, node, L, sc in self._walk(h):
                 n = self.m.nodes[node]
-                if n["kind"] != want or (kind == "patch" and n["color"] != color):
+                if self.m.kind_seen(node, self.m.dir(e)) != want or (kind == "patch" and n["color"] != color):
                     continue
                 if kind == "split":
-                    br = n["branches"]
+                    br = self.m.branches_seen(node, self.m.dir(e))
                     succ = [br[side]] if side in br else []
                 else:
                     succ = self.m.next_edges(e)
                 pen = self._dist_pen(d, L)
                 for f in succ:
-                    cands.append(Hyp(f, odo, h.cost + sc + pen, node))
+                    cands.append(Hyp(f, odo, h.cost + sc + pen, node, e))
                 if not succ and node == self.target:
                     # 목표가 막다른 노드(나가는 길 없음)여도 도착은 인정
-                    cands.append(Hyp(e, odo, h.cost + sc + pen, node))
+                    cands.append(Hyp(e, odo, h.cost + sc + pen, node, e))
         if not cands:
             if kind == "patch" and color in self.m.by_color:
                 p = self.m.by_color[color]
-                self.hyps = [Hyp(f, odo, 0.0, p) for f in self.m.out[p]]
+                self.hyps = [Hyp(f, odo, 0.0, p) for f in self.m.out[p]]    # 방향도 모름
                 self.relocalized += 1
                 self._note("nav_relocalized", node=p)
             else:
@@ -391,12 +519,15 @@ class Navigator(object):
         패치 색은 맵에 하나씩이라 색만으로 목표인지 안다. 스퍼 끝 목표면 그 부모 패치에서 무장한다."""
         par = self._approach(self.target)
         if par is not None and par != self.target and self.spur is None \
-                and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color:
+                and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color \
+                and (self.route is None or (self._target_i or 0) - 1 - self._route_pos <= 3):
             self._arm_spur(par, pos)
             return
         t = self.target
         if t is None or self._early == t or self.m.kind(t) != "patch" or self.m.nodes[t]["color"] != color:
             return
+        if self.route is not None and (self._target_i or 0) - self._route_pos > 3:
+            return                  # 경로상 아직 멀었음(같은 패치를 나중에 다시 지나는 경로)
         self._early = t
         self._note("nav_reached_early", node=t)
         self._request_stop(pos, t)
@@ -415,11 +546,14 @@ class Navigator(object):
                 return
         best = self._best()
         par = self._approach(self.target)
+        just = best and all(h.s0 == odo for h in best) and len(set(h.last for h in best)) == 1
+        if just:
+            self._route_advance(best[0].last)
         if par != self.target:
-            if self.spur is None and best and all(h.last == par and h.s0 == odo for h in best):
+            if self.spur is None and just and best[0].last == par and self._route_reached(par):
                 self._arm_spur(par, odo)
-            return
-        if best and all(h.last == self.target and h.s0 == odo for h in best):
+                return
+        elif just and best[0].last == self.target and self._route_reached(self.target):
             node = self.target
             if self._early == node:          # 이미 정지를 요청함
                 self._early = None
@@ -427,6 +561,9 @@ class Navigator(object):
             self._note("nav_reached", node=node, final=node == self.final)
             self._request_stop(odo, node)
             return
+        if kind == "patch" and just:
+            if self._maybe_uturn(best[0].last, odo):
+                return
         if self.allowed is not None and self._confident() and best:
             # 정해진 경로를 벗어남: 예약 안 된 길로 더 가지 않게 바로 선다
             if all(h.edge not in self.allowed for h in best):
@@ -486,18 +623,20 @@ class Navigator(object):
         interps = []
         for h in self.hyps:
             d = None if h.s0 is None else odo - h.s0
-            if h.last is not None and self.m.spur_side_at(h.last) and self.m.kind(h.last) == "patch" \
+            hd = self.m.dir(h.edge)
+            if h.last is not None and self.m.spur_side_at(h.last, hd) and self.m.kind(h.last) == "patch" \
                     and (d is None or d < ABSORB_MM):
-                interps.append((h.cost, "spur", self.m.spur_side_at(h.last), None))
+                interps.append((h.cost, "spur", self.m.spur_side_at(h.last, hd), None))
             for e, node, L, sc in self._walk(h):
-                k = self.m.kind(node)
+                ed = self.m.dir(e)
+                k = self.m.kind_seen(node, ed)
                 pen = self._dist_pen(d, L)
                 if k == "split":
                     interps.append((h.cost + sc + pen, "split", node, e))
-                elif k == "tee" and self.m.spur_side_at(node):
-                    interps.append((h.cost + sc + pen, "spur", self.m.spur_side_at(node), None))
-                elif k == "patch" and self.m.spur_side_at(node) and (d is None or abs(L - d) < ABSORB_MM):
-                    interps.append((h.cost + sc, "spur", self.m.spur_side_at(node), None))
+                elif k == "tee" and self.m.spur_side_at(node, ed):
+                    interps.append((h.cost + sc + pen, "spur", self.m.spur_side_at(node, ed), None))
+                elif k == "patch" and self.m.spur_side_at(node, ed) and (d is None or abs(L - d) < ABSORB_MM):
+                    interps.append((h.cost + sc, "spur", self.m.spur_side_at(node, ed), None))
         if not interps:
             self._note("nav_split_unknown")
             return self.default_side
@@ -514,7 +653,7 @@ class Navigator(object):
                 v = {"left": 0.0, "right": 0.0}
                 v[a] = SPUR_PENALTY
             else:
-                br = self.m.nodes[a]["branches"]
+                br = self.m.branches_seen(a, self.m.dir(_e))
                 v = {}
                 for s in ("left", "right"):
                     f = br.get(s)
@@ -552,6 +691,7 @@ class Navigator(object):
         h = best[0]
         e = self.m.edges[h.edge]
         out = {"last_node": h.last, "edge": h.edge, "next_node": e["to"],
+               "dir": "rev" if e["dir"] == REV else "fwd",
                "candidates": len(set(b.edge for b in best)), "known": h.s0 is not None}
         if odo is not None and h.s0 is not None:
             out["along_mm"] = round(odo - h.s0, 1)

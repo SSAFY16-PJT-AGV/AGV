@@ -46,6 +46,11 @@ X자 교차 처리
     (state "park" -> 대기 또는 끝). 대기 중 resume()하면 후진으로 J까지 돌아와 반대쪽으로 회전해 본선을
     다시 타고, 정책의 spur_exited()를 부른다.
 
+유턴 (이동 정책)
+    pop_stop()이 {type: uturn, pos, side}를 주면 pos(없으면 지금)에서 side 쪽으로 제자리 회전해 왔던 선을
+    거꾸로 탄다. 90도쯤에서 스퍼·다른 선에 걸려 멈추지 않도록, 화면에서 선이 다 사라지는 순간을 한 번 거친
+    뒤에야 가운데에 온 선을 받는다. 마치면 정책의 uturned(odo)를 부른다.
+
 이벤트 위치
     odo_mm은 판정한 바닥 지점 위치다(차체 위치 + geom.*_ahead_mm). 확정이 몇 프레임 늦게 나도
     처음 감지한 프레임의 위치를 쓴다.
@@ -207,6 +212,17 @@ class ExploreRunner(object):
         if req.get("type") == "enter_spur":
             self._enter_spur(req)
             return
+        if req.get("type") == "uturn":
+            self._stop_req = None
+            if req.get("pos") is None or req["pos"] <= self.odo:
+                self._start_uturn(req["side"], req.get("prefer"))
+            else:
+                self.v_plan = {"stop": req["pos"], "side": req["side"], "kind": "uturn",
+                               "prefer": req.get("prefer")}
+                self.vee_mute_until = req["pos"] + 120.0
+                self.log.log("note", self._odo(), msg="uturn_planned", at=round(req["pos"], 1),
+                             side=req["side"], node=req.get("node"))
+            return
         if req.get("pos") is None or req["pos"] <= self.odo:
             self._do_stop(req)
         else:
@@ -234,6 +250,15 @@ class ExploreRunner(object):
             self.v_plan = {"stop": j, "side": side, "kind": "spur_in"}
             self.decision = {"pos": j, "side": side, "kind": "spur", "seq": None}
             self.vee_mute_until = j + 120.0     # 회전 전까지 갈림길 판정 쉼
+
+    def _start_uturn(self, side, prefer=None):
+        self.state = "pivot"
+        self.v_plan = None
+        self.choice = None
+        self.decision = None
+        self._piv = {"t": 0.0, "away": False, "n": 0, "side": side, "kind": "uturn", "empty": False,
+                     "prefer": prefer}
+        self.log.log("note", self._odo(), msg="uturn_pivot", dir=side, prefer=prefer)
 
     def _start_park(self, d, res):
         first = self._end_odo if self._end_odo is not None else self.odo
@@ -512,8 +537,11 @@ class ExploreRunner(object):
         if self.state == "park":
             return 0.0, 0.0
         if self.v_plan is not None and self.odo >= self.v_plan["stop"]:
-            self.state = "pivot"
             kind = self.v_plan.get("kind", "vee")
+            if kind == "uturn":
+                self._start_uturn(self.v_plan["side"], self.v_plan.get("prefer"))
+                return 0.0, 0.0
+            self.state = "pivot"
             self._piv = {"t": 0.0, "away": False, "n": 0, "side": self.v_plan["side"], "kind": kind}
             self.log.log("note", self._odo(), msg=kind + "_pivot", dir=self.v_plan["side"])
             self.v_plan = None
@@ -522,6 +550,8 @@ class ExploreRunner(object):
 
     def _decide_split(self, onset):
         """갈라지기 시작함: 정책에 갈 쪽을 묻는다. None이면 갈림길에 들어가기 전에 대기."""
+        if self.state != "follow":
+            return                  # 같은 프레임에 회전·주차를 시작함: 다시 따라갈 때 새로 본다
         suggestion = self.ex.choose_split(onset[1] + self.ctrl_ahead)
         dead = self.ex.known_dead()
         if suggestion is None:
@@ -717,7 +747,15 @@ class ExploreRunner(object):
         if self.odo <= r["target"]:
             self.state = "pivot"
             kind = r.get("kind", "recover")
-            self._piv = {"t": 0.0, "away": False, "n": 0, "side": OPP[r["side"]], "kind": kind}
+            side, prefer = OPP[r["side"]], None
+            if kind == "spur_out":
+                ask = getattr(self.ex, "spur_exit_side", None)     # 이어 갈지 되돌아갈지 정책이 정함
+                got = ask() if ask is not None else None
+                if isinstance(got, tuple):
+                    side, prefer = got[0] or side, got[1]
+                elif got:
+                    side = got
+            self._piv = {"t": 0.0, "away": False, "n": 0, "side": side, "kind": kind, "prefer": prefer}
             self.log.log("note", self._odo(), msg=kind + "_pivot", dir=self._piv["side"])
             return 0.0, 0.0
         if r["t"] > r["limit_s"]:
@@ -734,6 +772,12 @@ class ExploreRunner(object):
         c = an.w / 2.0
         best = min(segs, key=lambda v: abs(v - c)) if segs else None
         e = None if best is None else abs(best - c) / c
+        if p.get("kind") == "uturn" and not p.get("empty"):
+            # 유턴: 선이 화면에서 다 사라지는 순간(옆을 보는 중)을 거쳐야 뒤쪽 선을 받는다
+            if p["t"] > 0.3 and all(len(r) == 0 for r in an.raw):
+                p["empty"] = True
+                p["away"] = True
+            e = None
         if not p["away"]:
             if p["t"] > 0.3 and (e is None or e > 0.35):
                 p["away"] = True
@@ -770,11 +814,19 @@ class ExploreRunner(object):
         self.suppress_until = self.odo + self.rc["suppress_mm"]
         self.lost_s = 0.0
         kind = self._piv.get("kind", "recover")
+        self.choice = None
+        self.split_onset = None
+        if self._piv.get("prefer") in ("left", "right"):
+            # 회전 직후 바로 앞 갈림길: 이미 갈라져 보여 판정을 못 하니 그 가지를 고른 채로 따라간다
+            self.choice = self._piv["prefer"]
+            self.choice_t = self.t
+        if kind in ("uturn", "spur_out"):
+            self.decision = None
         self.log.log("note", self._odo(), msg=kind + "_done")
-        if kind == "spur_out":
-            hook = getattr(self.ex, "spur_exited", None)
+        if kind in ("spur_out", "uturn"):
+            hook = getattr(self.ex, "spur_exited" if kind == "spur_out" else "uturned", None)
             if hook is not None:
-                hook()
+                hook(self.odo)
             self._poll_policy()
 
     def _is_crossing(self, pend, ons):
