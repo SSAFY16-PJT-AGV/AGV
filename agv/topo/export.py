@@ -190,6 +190,12 @@ def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
     제자리에서 돌 수 있기 때문이다. `from` -> `to`는 탐색할 때 지나간 방향이고 `branch`(왼쪽/오른쪽)도
     그 방향 기준이다. one_way=True면 탐색한 방향으로만 다니는 맵으로 내보낸다.
 
+    반대 방향 주행·운영용으로 더 내보내는 것:
+      - 합류 노드 `inputs`: {"left": 엣지, "right": 엣지} 들어오는 두 선이 탐색 방향 기준 어느 쪽인지.
+        반대로 달리면 이 합류가 갈림길이 되고 좌우가 뒤집힌다.
+      - `uturn: true`: 제자리에서 돌아 방향을 바꿔도 되는 노드(패치 가운데 - 패치 위 교차 제외, 스퍼 끝).
+      - `zones`: 대기 지점(waiting, 스퍼 끝마다 하나)과 같은 자리 교차 쌍(shared). 서버 구간 예약용.
+
     shape: topo.shape.estimate_shape 결과(노드 좌표·진행 방향·엣지 곡선). 있으면 그 좌표를 쓴다.
     pos_mm: 노드 좌표를 직접 줄 때. 둘 다 없으면 엣지 길이로 배치를 추정한다."""
     if shape is not None:
@@ -212,6 +218,10 @@ def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
                 o[k] = nd[k]
         if nd.get("branches"):
             o["branches"] = nd["branches"]
+        if nd.get("inputs"):
+            o["inputs"] = nd["inputs"]
+        if nd["type"] == "patch" and not nd.get("crossing"):
+            o["uturn"] = True
         sp = nd.get("spur")
         if sp:
             o["spur"] = {"side": sp.get("side"), "seen": sp.get("seen"), "length_m": _m(sp.get("length_mm")),
@@ -241,7 +251,7 @@ def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
         did = "D_" + nid
         pos[did] = spur_end.get(nid) or (p[0] + nx * length, p[1] + ny * length)
         nodes_out.append({"id": did, "x": None, "y": None, "type": "destination", "kind": "spur_end",
-                          "spur_of": nid, "length_estimated": not L})
+                          "spur_of": nid, "length_estimated": not L, "uturn": True})
         edges_out.append({"id": "E_" + did, "from": nid, "to": did, "type": "destination", "points": [],
                           "branch": side, "length_m": _m(L), "length_std_m": None,
                           "length_src": "odo" if L else None, "traversals": None,
@@ -253,6 +263,16 @@ def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
             o["x"], o["y"] = round(p[0] / 1000.0, 4), round(-p[1] / 1000.0, 4) + 0.0
         else:
             o["x"] = o["y"] = 0.0
+    # 운영 구역: 스퍼 끝 = 대기 지점, 같은 자리 교차 쌍 = 공유 구역(선마다 노드가 따로라 노드 예약만으로는
+    # 겹침을 모름)
+    zones = [{"id": "Z_" + o["id"], "type": "waiting", "nodes": [o["id"]]}
+             for o in nodes_out if o.get("kind") == "spur_end"]
+    seen = set()
+    for o in nodes_out:
+        if o.get("kind") == "cross" and o.get("same_spot") and o["id"] not in seen:
+            group = sorted(set([o["id"]] + list(o["same_spot"])))
+            seen.update(group)
+            zones.append({"id": "Z_" + "_".join(group), "type": "shared", "nodes": group})
     dbg = dict(m.get("debug") or {})
     if dbg.get("dropped_edges"):
         dbg["dropped_edges"] = [dict(d, length_m=_m(d.get("length_mm"))) for d in dbg["dropped_edges"]]
@@ -268,6 +288,7 @@ def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
         "one_way": bool(one_way),
         "nodes": nodes_out,
         "edges": edges_out,
+        "zones": zones,
         "explore": m.get("explore"),
         "warnings": m.get("warnings", []),
     }

@@ -184,6 +184,64 @@ class TestDeadEnd(unittest.TestCase):
         self.assertEqual(ex.known_dead(), "left")
 
 
+class TestReverseInfo(unittest.TestCase):
+    """반대 방향 주행용 맵 정보: 합류의 좌우(inputs), 놓친 합류 보정, 유턴 노드, 운영 구역."""
+
+    def test_merge_inputs(self):
+        evs = drive_world(["left", "left", "right", "right", "left", "right"], laps=3)
+        m = build_map([evs], map_id="mat")
+        nodes = dict((n["id"], n) for n in m["nodes"])
+        S = [n for n in m["nodes"] if n["type"] == "split" and set(n["branches"].values())
+             & set(e["id"] for e in m["edges"] if e["to"].startswith("M"))]
+        for s in S:
+            for side, eid in s["branches"].items():
+                e = [x for x in m["edges"] if x["id"] == eid][0]
+                if nodes[e["to"]]["type"] == "merge":
+                    # 갈림길 왼쪽 가지는 합류에서도 왼쪽으로 들어온다(from_side = 내가 들어온 쪽)
+                    self.assertEqual(nodes[e["to"]]["inputs"][side], eid)
+
+    def test_missed_merge_before_patch_is_repaired(self):
+        def lap(t0, side, see_merge):
+            ev = [{"type": "patch", "color": "orange", "odo_mm": t0},
+                  {"type": "split", "choice": side, "cmd": side, "odo_mm": t0 + 300}]
+            d = 600 if side == "left" else 700
+            if see_merge:
+                ev.append({"type": "merge", "from_side": side, "odo_mm": t0 + 300 + d})
+            ev.append({"type": "patch", "color": "red", "odo_mm": t0 + 300 + d + 40})
+            return ev
+        evs = [{"type": "start", "ts": 0, "speed_mm_s": 150, "odo_mm": 0}]
+        evs += lap(0, "left", True) + lap(2000, "right", False) + lap(4000, "left", True)
+        for i, e in enumerate(evs):
+            e.setdefault("ts", i)
+        evs.append({"type": "end", "ts": 99})
+        m = build_map([evs], map_id="t")
+        M = [n for n in m["nodes"] if n["type"] == "merge"][0]
+        to_red = [e for e in m["edges"] if e["to"] == "P_red"]
+        self.assertEqual(len(to_red), 1)                       # 빨강으로는 합류에서 한 줄만
+        right = [e for e in m["edges"] if e.get("branch") == "right"][0]
+        self.assertEqual(right["to"], M["id"])
+        self.assertAlmostEqual(right["length_mm"], 700.0, delta=1.0)   # 740(패치까지) - 40(합류->패치)
+        self.assertEqual(M["inputs"]["right"], right["id"])
+        self.assertTrue(any(u"합류 검출 누락" in w for w in m["warnings"]))
+
+    def test_export_uturn_and_zones(self):
+        from agv.topo import to_agv_map_v1
+        evs = drive_world(["left", "left", "right", "right", "left", "right"], laps=3)
+        m = build_map([evs], map_id="mat")
+        for n in m["nodes"]:
+            if n["id"] == "P_green":
+                n["spur"] = {"side": "left", "seen": 3, "length_mm": 180.0}
+            if n["id"] == "P_yellow":
+                n["crossing"] = True
+        d = to_agv_map_v1(m)
+        nodes = dict((n["id"], n) for n in d["nodes"])
+        self.assertTrue(nodes["P_orange"]["uturn"])
+        self.assertNotIn("uturn", nodes["P_yellow"])           # 패치 위 교차에서는 돌지 않음
+        self.assertTrue(nodes["D_P_green"]["uturn"])
+        self.assertNotIn("uturn", nodes["S1"])
+        self.assertIn({"id": "Z_D_P_green", "type": "waiting", "nodes": ["D_P_green"]}, d["zones"])
+
+
 class TestExplorer(unittest.TestCase):
     def test_explorer_covers_all_branches_and_stops(self):
         ex = Explorer()
