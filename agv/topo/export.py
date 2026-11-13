@@ -183,8 +183,12 @@ def _travel_dir(m, nid, pos):
     return (1.0, 0.0) if L < 1e-9 else (sx / L, sy / L)
 
 
-def to_agv_map_v1(m, pos_mm=None, shape=None):
+def to_agv_map_v1(m, pos_mm=None, shape=None, one_way=False):
     """build_map 결과를 agv-map-v1 dict로.
+
+    엣지는 기본으로 양방향(`bidirectional: true`)이다. 테이프 선은 어느 쪽으로든 따라갈 수 있고 차체는
+    제자리에서 돌 수 있기 때문이다. `from` -> `to`는 탐색할 때 지나간 방향이고 `branch`(왼쪽/오른쪽)도
+    그 방향 기준이다. one_way=True면 탐색한 방향으로만 다니는 맵으로 내보낸다.
 
     shape: topo.shape.estimate_shape 결과(노드 좌표·진행 방향·엣지 곡선). 있으면 그 좌표를 쓴다.
     pos_mm: 노드 좌표를 직접 줄 때. 둘 다 없으면 엣지 길이로 배치를 추정한다."""
@@ -225,7 +229,7 @@ def to_agv_map_v1(m, pos_mm=None, shape=None):
             "points": [{"x": round(q[0] / 1000.0, 4), "y": round(-q[1] / 1000.0, 4) + 0.0} for q in pts[1:-1]],
             "branch": e.get("branch"), "length_m": _m(e.get("length_mm")),
             "length_std_m": _m(e.get("length_std_mm")), "length_src": e.get("length_src"),
-            "traversals": e.get("traversals"), "directed": True, "lanes": e.get("lanes", 1)})
+            "traversals": e.get("traversals"), "bidirectional": not one_way, "lanes": e.get("lanes", 1)})
     # 스퍼 끝 = 트윈의 destination 노드(작업하는 로봇이 비켜서는 곳)
     for nid, side, L in dest:
         if nid not in pos:
@@ -241,7 +245,7 @@ def to_agv_map_v1(m, pos_mm=None, shape=None):
         edges_out.append({"id": "E_" + did, "from": nid, "to": did, "type": "destination", "points": [],
                           "branch": side, "length_m": _m(L), "length_std_m": None,
                           "length_src": "odo" if L else None, "traversals": None,
-                          "directed": False, "lanes": 1})
+                          "bidirectional": True, "lanes": 1})
     # 미터. 원점 패치가 (0, 0). 내부(수학 좌표, y가 왼쪽)를 언리얼 방향(y가 오른쪽)으로 뒤집는다
     for o in nodes_out:
         p = pos.get(o["id"])
@@ -261,7 +265,7 @@ def to_agv_map_v1(m, pos_mm=None, shape=None):
         "created_at": m.get("created_at"),
         "origin_node": m.get("origin_node"),
         "pos_source": "estimated" if estimated else ("odometry" if shape is not None else "measured"),
-        "one_way": True,
+        "one_way": bool(one_way),
         "nodes": nodes_out,
         "edges": edges_out,
         "explore": m.get("explore"),

@@ -395,7 +395,7 @@ def build_map(event_lists, map_id="map", version=0, origin_node=None,
              "length_mm": round(m, 1), "length_std_mm": round(s, 1),
              "length_src": "odo" if length_src == {"odo"} else "time",
              "traversals": len(edges[key]), "shape": None,
-             "bidirectional": False, "lanes": 1}
+             "bidirectional": True, "lanes": 1}
         edge_list.append(e)
         if branch and frm in nodes and nodes[frm]["type"] == "split":
             nodes[frm]["branches"][branch] = e["id"]

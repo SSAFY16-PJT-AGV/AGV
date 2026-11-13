@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--format", choices=["v1", "topo-v0"], default="v1",
                     help="v1: 팀 공통(트윈 호환, 기본). topo-v0: 예전 위상 맵 형식")
     ap.add_argument("--no-shape", action="store_true", help="trace.jsonl이 있어도 모양 계산을 하지 않음")
+    ap.add_argument("--one-way", action="store_true",
+                    help="탐색한 방향으로만 다니는 맵으로 내보냄(기본은 모든 엣지 양방향)")
     ap.add_argument("--twin", default=None, metavar="트윈_프로젝트_폴더",
                     help="결과를 <트윈 폴더>/Content/Data/warehouse_map.json 에도 복사(원래 파일은 .bak)")
     a = ap.parse_args()
@@ -58,7 +60,7 @@ def main():
                 print(u"모양 계산 안 함: %s -> 엣지 길이로 추정한 배치를 씀" % why)
         else:
             print(u"trace.jsonl이 없어서 엣지 길이로 추정한 배치를 씀")
-    doc = m if a.format == "topo-v0" else to_agv_map_v1(m, shape=shape)
+    doc = m if a.format == "topo-v0" else to_agv_map_v1(m, shape=shape, one_way=a.one_way)
     with io.open(a.out, "w", encoding="utf-8") as f:
         f.write(json.dumps(doc, ensure_ascii=False, indent=1))
     if a.format == "v1":

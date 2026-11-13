@@ -4,10 +4,10 @@
  "schema": "agv-map-v1",
  "coordinate_unit": "meter",
  "coordinate_frame": "x_forward_y_right",
- "created_at": "2026-11-12T17:39:48",
+ "created_at": "2026-11-13T11:39:34",
  "origin_node": "P_orange",
  "pos_source": "odometry",
- "one_way": true,
+ "one_way": false,
  "nodes": [
   {
    "id": "P_blue",
@@ -245,7 +245,7 @@
    "length_std_m": 0.0231,
    "length_src": "odo",
    "traversals": 3,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -259,7 +259,7 @@
    "length_std_m": 0.0063,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -273,7 +273,7 @@
    "length_std_m": 0.0005,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -287,7 +287,7 @@
    "length_std_m": 0.01,
    "length_src": "odo",
    "traversals": 3,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -301,7 +301,7 @@
    "length_std_m": 0.0074,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -315,7 +315,7 @@
    "length_std_m": 0.0025,
    "length_src": "odo",
    "traversals": 3,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -370,7 +370,7 @@
    "length_std_m": 0.0294,
    "length_src": "odo",
    "traversals": 3,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -413,7 +413,7 @@
    "length_std_m": 0.0213,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -427,7 +427,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -441,7 +441,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -455,7 +455,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -469,7 +469,7 @@
    "length_std_m": 0.0025,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -483,7 +483,7 @@
    "length_std_m": 0.0026,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -566,7 +566,7 @@
    "length_std_m": 0.0078,
    "length_src": "odo",
    "traversals": 2,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -629,7 +629,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -648,7 +648,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -687,7 +687,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -726,7 +726,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -797,7 +797,7 @@
    "length_std_m": 0.0,
    "length_src": "odo",
    "traversals": 1,
-   "directed": true,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -811,7 +811,7 @@
    "length_std_m": null,
    "length_src": null,
    "traversals": null,
-   "directed": false,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -825,7 +825,7 @@
    "length_std_m": null,
    "length_src": null,
    "traversals": null,
-   "directed": false,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -839,7 +839,7 @@
    "length_std_m": null,
    "length_src": null,
    "traversals": null,
-   "directed": false,
+   "bidirectional": true,
    "lanes": 1
   },
   {
@@ -853,7 +853,7 @@
    "length_std_m": null,
    "length_src": null,
    "traversals": null,
-   "directed": false,
+   "bidirectional": true,
    "lanes": 1
   }
  ],

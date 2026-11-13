@@ -237,7 +237,12 @@ class TestExportV1(unittest.TestCase):
         self.assertLess(P["D_P_o"][1], -0.15)
         de = [e for e in d["edges"] if e["type"] == "destination"][0]
         self.assertEqual((de["from"], de["to"], de["length_m"]), ("P_o", "D_P_o", 0.2))
-        self.assertTrue(all(e["type"] == "main" and e["directed"] for e in d["edges"] if e["to"] != "D_P_o"))
+        self.assertTrue(all(e["type"] == "main" and e["bidirectional"] for e in d["edges"] if e["to"] != "D_P_o"))
+        self.assertFalse(d["one_way"])
+        ow = to_agv_map_v1(self._map(), one_way=True)
+        self.assertTrue(ow["one_way"])
+        self.assertTrue(all(not e["bidirectional"] for e in ow["edges"] if e["type"] == "main"))
+        self.assertTrue(all(e["bidirectional"] for e in ow["edges"] if e["type"] == "destination"))
 
     def test_mirror_fix_is_independent_of_layout_flip(self):
         from agv.topo import to_agv_map_v1
