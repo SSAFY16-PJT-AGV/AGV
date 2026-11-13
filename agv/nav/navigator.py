@@ -22,6 +22,16 @@ ExploreRunner가 탐색 정책(topo/explorer.py)과 똑같이 부른다(on_patch
     해석들의 손해 합이 작은 쪽을 고른다. 모두 스퍼 해석이면 runner에 "아는 막다른 길"로 알려
     묻지 않고 반대쪽으로 지나가게 한다.
 
+스퍼 끝(D_*) 목표
+    부모 노드(패치·스퍼 갈림 T)까지 가는 길을 고른다. 부모 패치를 지나면 "무장"하고, 그 패치 근처에서
+    스퍼가 보이면(tee) runner에 진입을 지시한다(pop_stop이 {type: enter_spur, via: tee, pos: J, side}).
+    runner는 J에서 스퍼 쪽으로 제자리 회전해 스퍼를 탄다. 스퍼가 갈림길로 보이면(choose_split) 스퍼 쪽을
+    고른다(via: split). 스퍼 갈림(T) 노드가 부모면 T를 본 순간 진입한다. 선 끝에서 runner가 spur_arrived()를
+    부르면 도착으로 처리하고, runner는 조금 더 가서 주차한다. 다음 목표로 재개하면 runner가 후진해 J로
+    돌아와 반대쪽으로 돌아 본선에 오르고 spur_exited()를 부른다. 스퍼 안에서 본 이벤트는 위치 추적에 안 쓴다.
+    부모 패치를 지나 SPUR_WINDOW_MM 안에 스퍼를 못 보면, 자유 목표(set_goal)면 한 바퀴 돌아 SPUR_RETRIES번까지
+    다시 시도하고, 정해진 경로(set_route)면 예약 밖으로 돌 수 없으니 그 자리에서 선다(nav_spur_missed).
+
 정지
     목표 노드에 맞는 이벤트가 오면 정지를 요청한다(pop_stop). 패치는 패치 가운데에 차체가 오도록
     stop_offset_mm만큼 더 간 뒤 멈춘다. 정해진 경로(set_route)의 해제 노드(released_until)가 끝이
@@ -41,6 +51,8 @@ CHOICE_SLACK = 0.5         # 갈림길 고를 때 쓰는 해석의 비용 폭
 MAX_HYPS = 40
 MAX_SKIP = 3
 SPUR_PENALTY = 2000.0      # 스퍼로 잘못 들어가면 되돌아 나오는 손해(mm 환산)
+SPUR_WINDOW_MM = 260.0     # 부모 패치 앞 가장자리를 본 뒤 이 거리 안에서 스퍼를 찾음
+SPUR_RETRIES = 2           # 스퍼를 못 봤을 때 한 바퀴 돌아 다시 시도하는 횟수(자유 목표만)
 UNREACHABLE = 1e6
 OPP = {"left": "right", "right": "left"}
 
@@ -68,6 +80,8 @@ class Navigator(object):
         self._dead_now = None
         self._choice_ctx = None
         self._pre_split = None
+        self.spur = None            # 스퍼 진입 상태 {state: armed|entering|parked|exiting, parent, side, pos, hyps}
+        self._spur_tries = 0
         self.done = False           # 탐색 정책과 같은 이름(runner가 봄). 이동은 pop_stop으로 멈춘다
         self.done_reason = None
         self.n_obs = 0
@@ -130,16 +144,31 @@ class Navigator(object):
         self.target = release
         self._after_new_target()
 
+    def check_node(self, n):
+        """목표로 쓸 수 있는 노드인지 확인한다(아니면 ValueError)."""
+        self._check_node(n)
+
     def _check_node(self, n):
         if n not in self.m.nodes:
             raise ValueError(u"맵에 없는 노드: %s" % n)
         if self.m.kind(n) == "spur_end":
-            raise ValueError(u"스퍼 끝(%s)으로 가기는 아직 지원하지 않아요. 그 패치를 목표로 하세요." % n)
+            par = self.m.spur_parent(n)
+            if par is None or not self.m.spur_side_at(par):
+                raise ValueError(u"스퍼 끝(%s)의 부모 노드나 스퍼 방향을 맵에서 못 찾았어요" % n)
+
+    def _approach(self, node):
+        """그 노드에 가려면 본선에서 도착해야 하는 노드(스퍼 끝이면 부모)."""
+        if node is not None and self.m.kind(node) == "spur_end":
+            return self.m.spur_parent(node)
+        return node
 
     def _after_new_target(self):
         self._stop = None
         self._early = None
         self._patches_seen = 0
+        if self.spur is not None and self.spur["state"] == "armed":
+            self.spur = None
+        self._spur_tries = 0
         if self.at_node is not None and self.at_node == self.target:
             # 이미 그 자리에 서 있음
             self._request_stop(None, self.target)
@@ -153,7 +182,7 @@ class Navigator(object):
     def _R(self):
         if self.target is None:
             return None
-        return self.m.dist_to(self.target, self.allowed)
+        return self.m.dist_to(self._approach(self.target), self.allowed)
 
     def pop_stop(self):
         """runner가 이벤트마다 부른다. None 또는 {pos, reason, hold, node}(pos None이면 지금 바로)."""
@@ -174,6 +203,76 @@ class Navigator(object):
     def resumed(self):
         """runner가 대기를 풀 때 부른다."""
         self.at_node = None
+        if self.spur is not None and self.spur["state"] == "parked":
+            self.spur["state"] = "exiting"
+
+    # ---------- 스퍼 끝 ----------
+    def _arm_spur(self, parent, pos):
+        side = self.m.spur_side_at(parent)
+        self.spur = {"state": "armed", "parent": parent, "side": side, "pos": pos, "hyps": None,
+                     "node": self.target}
+        self._note("nav_spur_armed", parent=parent, side=side, node=self.target)
+        if self.m.kind(parent) == "tee":
+            self._enter_spur("tee", pos)           # 스퍼 갈림을 본 순간이 곧 갈림 지점
+        else:
+            # 패치 근처에서 스퍼를 못 보면 runner가 spur_missed()를 부른다
+            self._stop = {"type": "spur_deadline", "pos": pos + SPUR_WINDOW_MM, "node": parent}
+
+    def _enter_spur(self, via, pos):
+        sp = self.spur
+        sp["state"] = "entering"
+        if sp["hyps"] is None:
+            sp["hyps"] = list(self.hyps)
+        self._stop = {"type": "enter_spur", "via": via, "pos": pos, "side": sp["side"], "node": sp["node"]}
+        self._note("nav_spur_enter", via=via, side=sp["side"], node=sp["node"])
+
+    def _spur_busy(self):
+        return self.spur is not None and self.spur["state"] in ("entering", "parked", "exiting")
+
+    def on_tee_early(self, pos, side=None):
+        """runner가 교차 판정으로 스퍼(tee) 기록을 보류할 때 부른다. 무장 중이면 바로 진입 지시."""
+        sp = self.spur
+        if sp is not None and sp["state"] == "armed" and (side is None or side == sp["side"]) \
+                and pos - sp["pos"] < SPUR_WINDOW_MM:
+            self._enter_spur("tee", pos)
+
+    def spur_missed(self):
+        """부모 패치를 지났는데 스퍼를 못 봄(runner가 부름)."""
+        sp = self.spur
+        if sp is None or sp["state"] != "armed":
+            return
+        self._spur_tries += 1
+        self.spur = None
+        if self.allowed is None and self._spur_tries <= SPUR_RETRIES:
+            self._note("nav_spur_retry", node=sp["node"], tries=self._spur_tries)
+            return                  # 목표는 그대로: 한 바퀴 돌아 부모 패치에서 다시 무장
+        self._note("nav_spur_missed", node=sp["node"], tries=self._spur_tries)
+        self._request_stop(None, sp["parent"], reason="nav_spur_missed")
+        self._stop["hold"] = True
+        self.at_node = None         # 패치는 이미 지나서 그 자리에 있는 게 아님
+
+    def spur_arrived(self, side=None):
+        """runner가 고른 쪽 선이 끝난 것을 봤을 때 부른다. 스퍼 끝 목표로 들어가는 중이면 도착 정보, 아니면 None
+        (그러면 runner는 보통처럼 되돌아 나온다)."""
+        sp = self.spur
+        if sp is None or sp["state"] != "entering":
+            return None
+        sp["state"] = "parked"
+        node = sp["node"]
+        hold = self.hold_at_end or node != self.final
+        self._note("nav_reached", node=node, final=node == self.final)
+        self.at_node = node
+        if node == self.final and not hold:
+            self.target = None
+        return {"hold": hold, "reason": "nav_hold" if hold else "nav_arrived", "node": node,
+                "spur_mm": self.m.spur_length(node)}
+
+    def spur_exited(self):
+        """runner가 스퍼에서 후진해 본선에 다시 올랐을 때 부른다."""
+        sp, self.spur = self.spur, None
+        if sp is not None and sp.get("hyps"):
+            self.hyps = sp["hyps"]
+        self._note("nav_spur_exited", where=self.where())
 
     # ---------- 가설 ----------
     def _best(self):
@@ -234,6 +333,13 @@ class Navigator(object):
 
     def _observe(self, kind, odo, color=None, side=None):
         self.n_obs += 1
+        if self._spur_busy():
+            sp = self.spur
+            par = self.m.nodes[sp["parent"]]
+            if not (kind == "patch" and par["kind"] == "patch" and par["color"] == color):
+                return              # 스퍼 안·드나들 때 본 것은 위치 추적에 안 씀
+            # 교차 판정으로 늦게 온 부모 패치: 위치만 갱신하고 나올 때 쓸 가설로 둔다
+            sp["hyps"] = None
         want = NODE_OF_EVENT[kind]
         cands = []
         for h in self.hyps:
@@ -274,11 +380,20 @@ class Navigator(object):
                 if h.edge not in best:
                     best[h.edge] = h._replace(cost=h.cost - m)
             self.hyps = sorted(best.values(), key=lambda h: h.cost)[:MAX_HYPS]
+        if self._spur_busy():
+            if self.spur["hyps"] is None:
+                self.spur["hyps"] = list(self.hyps)
+            return
         self._check_arrival(odo, kind)
 
     def on_patch_early(self, color, pos):
         """runner가 교차 판정 때문에 패치 기록을 보류할 때 부른다. 목표 패치면 정지 위치만 먼저 정한다.
-        패치 색은 맵에 하나씩이라 색만으로 목표인지 안다."""
+        패치 색은 맵에 하나씩이라 색만으로 목표인지 안다. 스퍼 끝 목표면 그 부모 패치에서 무장한다."""
+        par = self._approach(self.target)
+        if par is not None and par != self.target and self.spur is None \
+                and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color:
+            self._arm_spur(par, pos)
+            return
         t = self.target
         if t is None or self._early == t or self.m.kind(t) != "patch" or self.m.nodes[t]["color"] != color:
             return
@@ -299,6 +414,11 @@ class Navigator(object):
                 self.target = None
                 return
         best = self._best()
+        par = self._approach(self.target)
+        if par != self.target:
+            if self.spur is None and best and all(h.last == par and h.s0 == odo for h in best):
+                self._arm_spur(par, odo)
+            return
         if best and all(h.last == self.target and h.s0 == odo for h in best):
             node = self.target
             if self._early == node:          # 이미 정지를 요청함
@@ -324,10 +444,19 @@ class Navigator(object):
     def on_cross(self, odo):
         self._observe("cross", odo)
 
-    def on_tee(self, odo):
-        self._observe("tee", odo)
+    def on_tee(self, odo, side=None):
+        sp = self.spur
+        if sp is not None and sp["state"] == "armed":
+            if (side is None or side == sp["side"]) and odo - sp["pos"] < SPUR_WINDOW_MM:
+                self._enter_spur("tee", odo)
+                return
+        if sp is not None and sp["state"] == "entering" and sp["hyps"] is None:
+            sp["hyps"] = list(self.hyps)
+        self._observe("tee", odo, side=side)
 
     def on_split(self, choice, odo):
+        if self._spur_busy():
+            return                  # 스퍼로 들어간 갈림(via split)
         self._pre_split = list(self.hyps)
         self._choice_ctx = None
         self._observe("split", odo, side=choice)
@@ -348,6 +477,12 @@ class Navigator(object):
 
     def choose_split(self, odo):
         """갈림길(또는 V자)을 앞에서 봤을 때 갈 쪽. 목표 갈림길 앞에서 대기해야 하면 None."""
+        sp = self.spur
+        if sp is not None and sp["state"] == "armed" and odo - sp["pos"] < SPUR_WINDOW_MM:
+            self._enter_spur("split", odo)          # 스퍼가 갈림길로 보임: 스퍼 쪽으로
+            return sp["side"]
+        if self._spur_busy():
+            return self.default_side
         interps = []
         for h in self.hyps:
             d = None if h.s0 is None else odo - h.s0
@@ -425,4 +560,5 @@ class Navigator(object):
 
     def status(self):
         return {"target": self.target, "final": self.final, "where": self.where(),
+                "spur": None if self.spur is None else self.spur["state"],
                 "relocalized": self.relocalized, "observations": self.n_obs}

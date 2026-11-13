@@ -19,6 +19,8 @@
 
     # 4) 완성된 맵에서 목표 패치로 가기(주황 패치 조금 앞에 놓고 출발, 목표 패치 가운데에서 멈춤)
     python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to P_green --enable-motors
+    #    스퍼 끝에 주차했다가 3초 뒤 후진해 나와 파랑으로(--then은 쉼표로 여러 개)
+    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to D_P_red --then P_blue --enable-motors
     #    정해진 경로 따라가기(서버 주문의 nodes와 같은 뜻)
     python3 -m agv.explore --mode goto --map maps/field_v2.json --route P_orange,S1,M1,P_purple --enable-motors
     #    모터 없이 위치 추적만 확인(손으로 밀기·녹화 영상): passive에 --map
@@ -120,7 +122,8 @@ def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
         (u"경과", u"%.1f초" % elapsed),
         (u"이동거리", u"%.0f mm" % runner.odo),
         (u"주행 상태", {"follow": u"라인 추종", "reverse": u"후진(막다른 길)",
-                     "pivot": u"제자리 회전", "hold": u"대기"}.get(runner.state, runner.state)),
+                     "pivot": u"제자리 회전", "hold": u"대기",
+                     "park": u"스퍼 끝 주차"}.get(runner.state, runner.state)),
         (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)),
         (u"패치", runner.patch.active or u"-"),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
@@ -134,7 +137,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["passive", "ask", "drive", "goto"], default="passive")
     ap.add_argument("--map", default=None, help="goto: 이동에 쓸 맵 JSON(build_map 결과). passive에 주면 위치 추적만")
-    ap.add_argument("--to", default=None, help="goto: 목표 노드(패치 P_<색> 권장). 최단 경로로 감")
+    ap.add_argument("--to", default=None,
+                    help="goto: 목표 노드. 패치 P_<색>이면 패치 가운데, 스퍼 끝 D_<노드>면 스퍼에 들어가 끝에 주차")
+    ap.add_argument("--then", default=None, help="goto: 도착한 뒤 이어서 갈 목표들(쉼표로). 스퍼에서는 후진해 나옴")
+    ap.add_argument("--wait", type=float, default=3.0, help="goto: --then 목표로 떠나기 전 서 있는 시간(초)")
     ap.add_argument("--route", default=None, help="goto: 따라갈 노드 목록(쉼표로). 서버 주문의 nodes와 같은 뜻")
     ap.add_argument("--start", default=None,
                     help="goto: 처음 보게 될 노드(그 노드 조금 앞에 놓음). 없으면 처음 보이는 패치에서 위치를 잡음")
@@ -166,6 +172,7 @@ def main(argv=None):
         print(u"영상 재생은 passive 모드로만 돌려요.")
         a.mode = "passive"
     nav = None
+    then = []
     if a.mode == "goto" or (a.mode == "passive" and a.map):
         if not a.map:
             print(u"goto 모드는 --map(맵 JSON)이 필요해요.")
@@ -179,9 +186,13 @@ def main(argv=None):
             plen = cfg.get("patch", {}).get("length_mm")
             off = float(cfg.get("nav", {}).get("stop_offset_mm") or (plen / 2.0 if plen else 80.0))
         route = [n.strip() for n in a.route.split(",") if n.strip()] if a.route else None
+        then = [n.strip() for n in a.then.split(",") if n.strip()] if a.then else []
         try:
             # 경로를 주면 그 첫 노드 조금 앞에 놓았다고 본다
-            nav = Navigator(nmap, start=a.start or (route[0] if route else None), stop_offset_mm=off)
+            nav = Navigator(nmap, start=a.start or (route[0] if route else None), stop_offset_mm=off,
+                            hold_at_end=bool(then))
+            for n in then:
+                nav.check_node(n)
             if route:
                 nav.set_route(route)
             elif a.to:
@@ -259,6 +270,7 @@ def main(argv=None):
     n = 0
     fps_meas = 0.0
     print(u"결과 폴더: " + out)
+    held_since = None
     try:
         while not runner.finished:
             frame = cam.read()
@@ -305,7 +317,18 @@ def main(argv=None):
                     view.set_status(_status_rows(a, runner, now - t_start, left, right, fps_meas, nav))
             n += 1
             if runner.state == "hold" and a.mode == "goto":
-                runner.stop("nav_off_route")       # 혼자 도는 goto에서는 대기를 풀어 줄 서버가 없음
+                if then and runner.hold_reason == "nav_hold":
+                    if held_since is None:
+                        held_since = now
+                    elif now - held_since >= a.wait:
+                        held_since = None
+                        nxt = then.pop(0)
+                        nav.hold_at_end = bool(then)
+                        nav.set_goal(nxt)
+                        print(u"\n다음 목표: %s" % nxt)
+                        runner.resume()
+                else:
+                    runner.stop(runner.hold_reason or "nav_hold")   # 혼자 도는 goto에서는 대기를 풀어 줄 서버가 없음
             if now - last_print > 1.0:
                 last_print = now
                 sys.stdout.write(u"\r[%5.1fs] odo %6.0fmm  ctrl:%s  patch:%s  cmd %.2f/%.2f   " % (

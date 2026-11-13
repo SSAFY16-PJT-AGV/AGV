@@ -225,9 +225,101 @@ class TestNavigator(unittest.TestCase):
         nav.on_patch("purple", 760)
         self.assertIsNone(nav.pop_stop())
 
-    def test_spur_end_goal_rejected(self):
-        with self.assertRaises(ValueError):
-            Navigator(self.m, goal="D_P_red")
+    def test_spur_goal_enters_on_tee(self):
+        """스퍼 끝 목표: 부모 패치에서 무장(못 볼 때 대비 기한), 근처에서 스퍼(tee)를 보면 그 자리에서 진입."""
+        nav = Navigator(self.m, goal="D_P_blue", start="P_red")
+        f = Feed(nav)
+        f.patch("red", 0)
+        nav.on_tee(70, side="left")                 # 빨강 스퍼: 목표가 아니니 그냥 지나감
+        self.assertIsNone(nav.pop_stop())
+        dl = f.patch("blue", 340)
+        self.assertEqual((dl["type"], dl["node"]), ("spur_deadline", "P_blue"))
+        nav.on_tee(410, side="left")
+        ent = nav.pop_stop()
+        self.assertEqual((ent["type"], ent["via"], ent["pos"], ent["side"]), ("enter_spur", "tee", 410, "left"))
+        nav.on_merge(450)                           # 스퍼 안에서 본 것은 무시
+        res = nav.spur_arrived("left")
+        self.assertEqual((res["node"], res["hold"], res["reason"]), ("D_P_blue", False, "nav_arrived"))
+        self.assertEqual(nav.where()["last_node"], "P_blue")
+
+    def test_spur_goal_enters_on_split(self):
+        """스퍼가 갈림길로 보이면 스퍼 쪽을 고른다(아는 막다른 길로 피하지 않음)."""
+        nav = Navigator(self.m, goal="D_P_red", start="P_orange")
+        f = Feed(nav)
+        f.patch("orange", 0)
+        self.assertEqual(f.split(370)[0], "right")
+        nav.pop_stop()
+        f.patch("red", 1090)
+        nav.pop_stop()
+        self.assertEqual(nav.choose_split(1190), "left")
+        self.assertIsNone(nav.known_dead())
+        self.assertEqual(nav.pop_stop()["via"], "split")
+        nav.on_split("left", 1200)                  # 스퍼로 들어간 갈림은 위치 추적에 안 씀
+        self.assertEqual(nav.where()["last_node"], "P_red")
+        self.assertIsNotNone(nav.spur_arrived("left"))
+
+    def test_spur_missed_retry_then_stop(self):
+        nav = Navigator(self.m, goal="D_P_blue", start="P_red")
+        for lap in range(3):
+            base = 4000 * lap
+            nav.on_patch("red", base)
+            nav.on_patch("blue", base + 340)
+            self.assertEqual(nav.pop_stop()["type"], "spur_deadline")
+            nav.spur_missed()
+            stop = nav.pop_stop()
+            if lap < 2:
+                self.assertIsNone(stop)             # 한 바퀴 돌아 다시
+                nav.on_patch("orange", base + 1350)
+            else:
+                self.assertEqual((stop["reason"], stop["hold"]), ("nav_spur_missed", True))
+        # 정해진 경로면 바로 선다(예약 밖으로 돌 수 없음)
+        nav = Navigator(self.m, start="P_red")
+        nav.set_route(["P_red", "P_blue", "D_P_blue"])
+        nav.on_patch("red", 0)
+        nav.on_patch("blue", 340)
+        nav.pop_stop()
+        nav.spur_missed()
+        self.assertEqual(nav.pop_stop()["reason"], "nav_spur_missed")
+
+    def test_route_into_and_out_of_spur(self):
+        """주문처럼: 스퍼 끝까지 경로 -> 주차 -> 스퍼 끝에서 시작하는 다음 경로. 나오면 부모 패치 뒤 위치로 이어 감."""
+        nav = Navigator(self.m, start="P_orange", hold_at_end=True)
+        nav.set_route(["P_orange", "S1", "P_red", "D_P_red"])
+        f = Feed(nav)
+        f.patch("orange", 0)
+        self.assertEqual(f.split(370)[0], "right")
+        nav.pop_stop()
+        f.patch("red", 1090)
+        nav.pop_stop()
+        nav.on_tee(1160, side="left")
+        self.assertEqual(nav.pop_stop()["type"], "enter_spur")
+        res = nav.spur_arrived("left")
+        self.assertEqual((res["hold"], res["node"]), (True, "D_P_red"))
+        nav.set_route(["D_P_red", "P_red", "P_blue"])
+        nav.resumed()
+        nav.on_patch("red", 1170)                  # 나오는 동안 패치를 다시 봐도 무시
+        nav.spur_exited()
+        self.assertEqual(nav.where()["edge"], "E12")
+        stop = f.patch("blue", 1500)
+        self.assertEqual((stop["node"], stop["hold"]), ("P_blue", True))
+
+    def test_spur_of_tee_node(self):
+        """스퍼 갈림(T) 노드의 스퍼 끝: T를 본 순간이 갈림 지점이라 바로 진입."""
+        d = {"map_id": "t", "nodes": [
+            {"id": "P_a", "kind": "patch", "color": "orange", "pos": [0, 0]},
+            {"id": "T1", "kind": "tee", "side": "left", "pos": [400, 0]},
+            {"id": "D_T1", "kind": "spur_end", "pos": [400, -150]},
+            {"id": "P_b", "kind": "patch", "color": "green", "pos": [800, 0]}],
+            "edges": [
+                {"id": "E1", "from": "P_a", "to": "T1", "length_mm": 400},
+                {"id": "E2", "from": "T1", "to": "P_b", "length_mm": 400},
+                {"id": "E3", "from": "P_b", "to": "P_a", "length_mm": 1000},
+                {"id": "ED", "from": "T1", "to": "D_T1", "type": "destination", "length_mm": 150}]}
+        nav = Navigator(NavMap(d), goal="D_T1", start="P_a")
+        nav.on_patch("orange", 0)
+        nav.on_tee(395, side="left")
+        ent = nav.pop_stop()
+        self.assertEqual((ent["type"], ent["pos"]), ("enter_spur", 395))
 
     def test_gives_up_after_laps(self):
         nav = Navigator(self.m, goal="P_yellow", start="P_orange")
@@ -351,5 +443,162 @@ class TestSimGoto(unittest.TestCase):
         self.assertLess(self._err(gt["final_pose"], "blue"), 35.0)
 
 
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestSimSpur(unittest.TestCase):
+    """가상 매트에서 스퍼 끝에 주차하고, 다음 목표로 후진해 빠져나간다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = NavMap.load(SIM_MAP)
+        mat = Mat(MAT_V2)
+        cls.centers = dict((p["color"], p["center"]) for p in mat.d["patches"])
+        cls.spurs = dict(("D_P_" + p["to"][4:], (p["points"][0], p["points"][-1]))
+                         for p in mat.d["paths"] if p["to"].startswith("end_"))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _in_spur(self, pose, node):
+        """(스퍼 따라 들어간 거리, 스퍼 선에서 옆으로 벗어난 거리, 스퍼 길이) mm."""
+        (jx, jy), (ex, ey) = self.spurs[node]
+        L = math.hypot(ex - jx, ey - jy)
+        ux, uy = (ex - jx) / L, (ey - jy) / L
+        dx, dy = pose[0] - jx, pose[1] - jy
+        return dx * ux + dy * uy, abs(-dx * uy + dy * ux), L
+
+    def _park_then(self, goal, nxt, seed, start="P_orange"):
+        nav = Navigator(self.m, goal=goal, start=start, hold_at_end=True)
+        st = {"t": None, "pose": None, "sent": False}
+        orig = Mat.camera_view
+
+        def cam(mat, pose, c, w=320, h=240):
+            cam.pose = pose
+            return orig(mat, pose, c, w, h)
+
+        def on_step(runner, t):
+            if runner.state == "hold" and st["pose"] is None:
+                st["t"], st["pose"] = t, cam.pose
+            elif st["pose"] is not None and runner.state == "hold" and t - st["t"] > 1.0 and not st["sent"]:
+                st["sent"] = True
+                nav.hold_at_end = False
+                nav.set_goal(nxt)
+                self.assertTrue(runner.resume())
+        Mat.camera_view = cam
+        try:
+            ev, gt = run_sim.run(MAT_V2, self.tmp, seed=seed, max_time_s=120, policy=nav, on_step=on_step)
+        finally:
+            Mat.camera_view = orig
+        with io.open(ev, encoding="utf-8") as f:
+            msgs = [json.loads(l).get("msg") for l in f]
+        return st["pose"], gt, msgs
+
+    def _check(self, goal, nxt, seed, min_depth):
+        pose, gt, msgs = self._park_then(goal, nxt, seed)
+        self.assertIsNotNone(pose, msgs)
+        depth, side, L = self._in_spur(pose, goal)
+        self.assertGreater(depth, min_depth, (depth, L))
+        self.assertLess(depth, L + 5.0, (depth, L))            # 선 끝을 넘어가지 않음
+        self.assertLess(side, 25.0)
+        self.assertIn("spur_out_done", msgs)
+        self.assertEqual(gt["finish_reason"], "nav_arrived")
+        c = self.centers[nxt[2:]]
+        self.assertLess(math.hypot(gt["final_pose"][0] - c[0], gt["final_pose"][1] - c[1]), 35.0)
+        self.assertNotIn("nav_relocalized", msgs)
+        return msgs
+
+    def test_tee_spur_park_and_leave(self):
+        msgs = self._check("D_P_orange", "P_purple", 1, 120.0)
+        self.assertIn("spur_in_done", msgs)                     # J에서 제자리 회전해 들어감
+
+    def test_spur_seen_as_split(self):
+        """빨강 스퍼(곡선에서 합류한 직후)는 갈림길로 보여 그 가지를 타고 들어간다."""
+        self._check("D_P_red", "P_blue", 1, 120.0)
+
+    def test_missed_spur_retries_next_lap(self):
+        """렌즈 오른쪽 가지로 와서 흔들리는 채로 초록을 지나면 스퍼를 놓친다: 한 바퀴 돌아 다시 들어간다."""
+        msgs = self._check("D_P_green", "P_red", 3, 120.0)
+        self.assertIn("nav_spur_retry", msgs)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestExploreCliGoto(unittest.TestCase):
+    """explore.py goto 실행 루프 그대로(카메라·모터·시계만 가상 매트로 바꿔 끼움)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, args):
+        import agv.explore as ex
+        mat = Mat(MAT_V2)
+        clock = {"t": 1.7e9}
+        pose = list(mat.d["start_pose"][:2]) + [math.radians(mat.d["start_pose"][2])]
+
+        class Motors(object):
+            l = r = 0.0
+
+            def __init__(self, *a, **k):
+                pass
+
+            def set(self, l, r):
+                Motors.l, Motors.r = l, r
+
+            def stop(self):
+                Motors.l = Motors.r = 0.0
+
+        class Cam(object):
+            fps = 20.0
+            last = [None]
+
+            def read(self):
+                t = clock["t"]
+                dt = 0.0 if Cam.last[0] is None else t - Cam.last[0]
+                Cam.last[0] = t
+                vl, vr = Motors.l * 500.0, Motors.r * 500.0
+                pose[2] -= (vl - vr) / 140.0 * dt
+                v = (vl + vr) / 2.0
+                pose[0] += v * math.cos(pose[2]) * dt
+                pose[1] += v * math.sin(pose[2]) * dt
+                clock["t"] += 0.05
+                return mat.camera_view(tuple(pose), run_sim.CAM)
+
+            def close(self):
+                pass
+
+        saved = (ex.open_camera, ex.JetbotMotors, ex.time.time, ex.time.sleep)
+        ex.open_camera = lambda *a, **k: Cam()
+        ex.JetbotMotors = Motors
+        ex.time.time = lambda: clock["t"]
+        ex.time.sleep = lambda s: None
+        try:
+            rc = ex.main(args + ["--map", SIM_MAP, "--out", os.path.join(self.tmp, "run"), "--no-arm",
+                                 "--debug-every", "0", "--max-time", "120", "--enable-motors"])
+        finally:
+            ex.open_camera, ex.JetbotMotors, ex.time.time, ex.time.sleep = saved
+        with io.open(os.path.join(self.tmp, "run", "events.jsonl"), encoding="utf-8") as f:
+            evs = [json.loads(l) for l in f]
+        return rc, evs, pose
+
+    def test_goto_spur_then_patch(self):
+        rc, evs, pose = self._run(["--mode", "goto", "--start", "P_orange", "--to", "D_P_red",
+                                   "--then", "P_blue", "--wait", "1"])
+        msgs = [e.get("msg") for e in evs]
+        self.assertEqual(rc, 0)
+        self.assertEqual(evs[-1]["reason"], "nav_arrived")
+        for m in ("spur_parked", "spur_out_done", "resume"):
+            self.assertIn(m, msgs)
+        blue = [p["center"] for p in Mat(MAT_V2).d["patches"] if p["color"] == "blue"][0]
+        self.assertLess(math.hypot(pose[0] - blue[0], pose[1] - blue[1]), 40.0)
+
+    def test_bad_goal_exit_code(self):
+        import agv.explore as ex
+        self.assertEqual(ex.main(["--mode", "goto", "--map", SIM_MAP, "--to", "P_pink", "--enable-motors"]), 2)

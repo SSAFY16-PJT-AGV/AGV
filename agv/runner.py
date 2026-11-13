@@ -38,6 +38,14 @@ X자 교차 처리
     resume()을 부르면 다시 따라간다. 정책의 choose_split이 None이면 갈림길에 들어가기 전에 대기하고,
     재개할 때 다시 묻는다(V자도 같음).
 
+스퍼 끝에 주차 (이동 정책)
+    pop_stop()이 {type: enter_spur, via, pos, side}를 주면 스퍼로 들어간다. via가 tee(옆으로 뻗은 스퍼를
+    지나는 중)면 차체 가운데가 갈림 지점 J(pos)에 올 때까지 가서 스퍼 쪽으로 제자리 회전해 스퍼를 탄다.
+    via가 split이면 이미 스퍼 쪽 가지를 고른 것이다. 선 끝이 보이면 정책의 spur_arrived()를 불러, 도착이면
+    되돌아 나오는 대신 차체 가운데가 선 끝에서 recover.park_back_mm 앞에 올 때까지 곧게 더 가서 선다
+    (state "park" -> 대기 또는 끝). 대기 중 resume()하면 후진으로 J까지 돌아와 반대쪽으로 회전해 본선을
+    다시 타고, 정책의 spur_exited()를 부른다.
+
 이벤트 위치
     odo_mm은 판정한 바닥 지점 위치다(차체 위치 + geom.*_ahead_mm). 확정이 몇 프레임 늦게 나도
     처음 감지한 프레임의 위치를 쓴다.
@@ -70,6 +78,8 @@ RECOVER_DEFAULT = {
     "pivot_center": 0.15,    # 선이 화면 가운데에서 이 비율 안이면 회전 끝
     "pivot_timeout_s": 8.0,
     "suppress_mm": 40,       # 다시 따라가기 시작한 뒤 이 거리 동안 갈림길 판정 쉼
+    "park_back_mm": 20,      # 스퍼 끝 주차: 차체 가운데를 선 끝에서 이만큼 앞에 세움
+    "park_speed": 0.18,      # 선 끝을 본 뒤 주차 자리까지 곧게 갈 때 모터 명령
 }
 
 
@@ -110,13 +120,18 @@ class ExploreRunner(object):
         self.crossing = None        # 지금 지나는 X자 교차
         self.decision = None        # 마지막으로 고른 갈림길 {pos, side, kind, seq}
         self.split_as_tee = None    # 이번 갈림길이 이미 아는 막다른 길이면 그쪽(스퍼) 방향
-        self.state = "follow"       # follow | reverse | pivot | hold
+        self.state = "follow"       # follow | reverse | pivot | hold | park
+        self._park = None           # 주차하러 가는 중 {target, j, side, res}
+        self._parked = None         # 스퍼 끝에 서 있음 {j, side} (재개하면 후진해 나옴)
+        self.hold_reason = None
         self._stop_req = None       # 이동 정책이 요청한 정지 {pos, reason, hold, node}
         self._resume_split = None   # 갈림길 앞에서 대기 중이면 그 갈림길 시작 (t, odo)
         self._resume_vee = None     # V자 앞에서 대기 중이면 그 판정
         self.rc = dict(RECOVER_DEFAULT)
         self.rc.update(cfg.get("recover", {}))
         self._end_n = 0
+        self._end_odo = None
+        self._end_lost = False
         self._rev = None
         self.suppress_until = -1e9  # 되돌아 나온 직후 같은 갈림길을 다시 잡지 않게
         self.lost_s = 0.0
@@ -175,7 +190,7 @@ class ExploreRunner(object):
         elif ev["type"] == "cross":
             self.ex.on_cross(p)
         elif ev["type"] == "tee":
-            self.ex.on_tee(p)
+            self.ex.on_tee(p, side=ev["fields"].get("side"))
         elif ev["type"] == "dead_end":
             if ev["fields"]["ref_kind"] == "split":
                 self.ex.on_dead_end(ev["fields"]["side"], p)
@@ -189,27 +204,97 @@ class ExploreRunner(object):
         req = pop()
         if req is None:
             return
+        if req.get("type") == "enter_spur":
+            self._enter_spur(req)
+            return
         if req.get("pos") is None or req["pos"] <= self.odo:
             self._do_stop(req)
         else:
             self._stop_req = req
             self.log.log("note", self._odo(), msg="stop_planned", at=round(req["pos"], 1),
-                         reason=req["reason"], node=req.get("node"))
+                         reason=req.get("reason") or req.get("type"), node=req.get("node"))
 
     def _do_stop(self, req):
         self._stop_req = None
         if req.get("hold"):
             self.state = "hold"
+            self.hold_reason = req["reason"]
             self.cal.reset()
             self.last_cmd = (0.0, 0.0)
             self.log.log("note", self._odo(), msg="hold", reason=req["reason"], node=req.get("node"))
         else:
             self._finish(req["reason"])
 
+    def _enter_spur(self, req):
+        self._stop_req = None           # 스퍼를 못 찾을 때를 대비한 정지는 취소
+        side, j = req["side"], req["pos"]
+        self.log.log("note", self._odo(), msg="spur_enter", via=req.get("via"), side=side,
+                     j=round(j, 1), late_mm=round(max(0.0, self.odo - j), 1))
+        if req.get("via") == "tee":
+            self.v_plan = {"stop": j, "side": side, "kind": "spur_in"}
+            self.decision = {"pos": j, "side": side, "kind": "spur", "seq": None}
+            self.vee_mute_until = j + 120.0     # 회전 전까지 갈림길 판정 쉼
+
+    def _start_park(self, d, res):
+        first = self._end_odo if self._end_odo is not None else self.odo
+        end_pos = first + self.ctrl_ahead
+        if self._end_lost and self.odo - first < 5.0:
+            # 선 끝이 조향 줄을 지나는 모습 없이 선을 통째로 놓침(비스듬히 들어가 옆으로 빠짐 등):
+            # 선 끝은 이미 화면 아래보다 가깝다. 그 자리에 선다
+            end_pos = self.odo + self.rc["park_back_mm"]
+        self.state = "park"
+        self._park = {"target": end_pos - self.rc["park_back_mm"], "j": d["pos"], "side": d["side"],
+                      "res": res, "t": 0.0}
+        self.decision = None
+        self._end_n = 0
+        self.log.log("note", self._odo(), msg="spur_end_seen", side=d["side"],
+                     spur_mm=round(end_pos - d["pos"], 1), map_spur_mm=res.get("spur_mm"),
+                     park_at=round(self._park["target"], 1))
+
+    def _step_park(self, an, dt):
+        """선 끝을 본 뒤 곧게 조금 더 가서 선다(스퍼 끝 주차)."""
+        k = self._park
+        k["t"] += dt
+        self.t += dt
+        if self.odo >= k["target"] or k["t"] > 3.0:
+            res = k["res"]
+            self._parked = {"j": k["j"], "side": k["side"]}
+            self._park = None
+            self.log.log("note", self._odo(), msg="spur_parked", node=res.get("node"))
+            self._do_stop({"reason": res["reason"], "hold": res["hold"], "node": res.get("node")})
+            return 0.0, 0.0
+        v = self.rc["park_speed"]
+        # 아직 보이는 스퍼 선(아래쪽 줄)으로 방향을 맞추고, 선이 다 지나가면 곧게 간다
+        x = self.follow.target(an, None, self.junc.lw)
+        turn = 0.0
+        if x is not None:
+            l, r = self.follow.command(x, an.w, dt)
+            turn = max(-v, min(v, (l - r) / 2.0))
+        left, right = v + turn, v - turn
+        self._integrate(left, right, dt)
+        return left, right
+
+    def _exit_spur(self):
+        """스퍼 끝에서 후진해 갈림 지점으로 돌아와, 들어올 때 반대쪽으로 돌아 본선을 탄다."""
+        pk, self._parked = self._parked, None
+        self.state = "reverse"
+        self._rev = {"target": pk["j"] - self.rc["back_extra_mm"], "side": pk["side"], "t": 0.0,
+                     "kind": "spur_out",
+                     "limit_s": 3.0 + 2.5 * (self.odo - pk["j"] + 200) / max(self.speed_mm_s, 1.0)}
+        self.follow.prev_err = 0.0
+        self.log.log("note", self._odo(), msg="spur_out_reverse", target=round(self._rev["target"], 1))
+
     def resume(self):
         """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
         if self.state != "hold" or self.finished:
             return False
+        if self._parked is not None:
+            hook = getattr(self.ex, "resumed", None)
+            if hook is not None:
+                hook()
+            self.log.log("note", self._odo(), msg="resume")
+            self._exit_spur()
+            return True
         self.state = "follow"
         self.follow.prev_err = 0.0
         self.lost_s = 0.0
@@ -233,6 +318,10 @@ class ExploreRunner(object):
             early = getattr(self.ex, "on_patch_early", None)
             if ev["type"] == "patch" and early is not None and self.mode != "passive":
                 early(ev["fields"]["color"], ev["pos"])
+                self._poll_policy()
+            early = getattr(self.ex, "on_tee_early", None)
+            if ev["type"] == "tee" and early is not None and self.mode != "passive":
+                early(ev["pos"], ev["fields"].get("side"))
                 self._poll_policy()
         else:
             self._dispatch(ev)
@@ -294,6 +383,8 @@ class ExploreRunner(object):
             if res is not None:
                 self.speed_mm_s = self.cal.k
                 self.log.log("note", self._odo(), msg="speed_cal", color=self.patch.active, **res)
+        if self.state == "park":
+            return self._step_park(an, dt)
         if self.state == "reverse":
             return self._step_reverse(an, dt)
         if self.state == "pivot":
@@ -407,13 +498,24 @@ class ExploreRunner(object):
             self._start_recover()
             return 0.0, 0.0
         if self._stop_req is not None and self.odo >= self._stop_req["pos"]:
-            self._do_stop(self._stop_req)
+            req, self._stop_req = self._stop_req, None
+            if req.get("type") == "spur_deadline":
+                hook = getattr(self.ex, "spur_missed", None)    # 스퍼를 못 봄: 정책이 다시 돌지 설지 정함
+                self.log.log("note", self._odo(), msg="spur_deadline", node=req.get("node"))
+                if hook is not None:
+                    hook()
+                self._poll_policy()
+            else:
+                self._do_stop(req)
             if self.finished or self.state == "hold":
                 return 0.0, 0.0
+        if self.state == "park":
+            return 0.0, 0.0
         if self.v_plan is not None and self.odo >= self.v_plan["stop"]:
             self.state = "pivot"
-            self._piv = {"t": 0.0, "away": False, "n": 0, "side": self.v_plan["side"], "kind": "vee"}
-            self.log.log("note", self._odo(), msg="vee_pivot", dir=self.v_plan["side"])
+            kind = self.v_plan.get("kind", "vee")
+            self._piv = {"t": 0.0, "away": False, "n": 0, "side": self.v_plan["side"], "kind": kind}
+            self.log.log("note", self._odo(), msg=kind + "_pivot", dir=self.v_plan["side"])
             self.v_plan = None
             return 0.0, 0.0
         return self._drive(an, dt)
@@ -441,6 +543,7 @@ class ExploreRunner(object):
         if not dead:
             self.decision = {"pos": onset[1] + self.ctrl_ahead, "side": self.choice,
                              "kind": "split", "seq": None}
+        self._poll_policy()
 
     def _on_vee(self, v):
         """급한 가지를 찾음: 탐색 정책이 고르게 하고, 그 가지면 J에서 회전할 계획을 세운다."""
@@ -544,11 +647,18 @@ class ExploreRunner(object):
         far_empty = all(len(rows[i]) == 0 for i in range(an.ctrl_idx + 1))
         near = [r for i in range(an.ctrl_idx + 1, len(rows)) for r in rows[i]]
         ended = far_empty and len(near) > 0
-        lost = all(len(r) == 0 for r in rows) and self.lost_s + dt >= 0.3
+        empty = all(len(r) == 0 for r in rows)
+        # 선 끝이 아래쪽 줄을 다 지나 화면에서 사라져도, 끝이 지나가는 중이었으면 이어서 센다
+        ended = ended or (empty and self._end_n > 0 and not self._end_lost)
+        lost = empty and self.lost_s + dt >= 0.3
         if ended or lost:
+            if self._end_n == 0:
+                self._end_odo = self.odo       # 선 끝이 조향 줄을 처음 지난 순간(확정은 몇 프레임 뒤)
+                self._end_lost = lost and not ended   # 끝이 지나가는 모습 없이 통째로 놓침
             self._end_n += 1
         else:
             self._end_n = 0
+            self._end_lost = False
         return self._end_n >= self.rc["end_frames"] or lost
 
     def _start_recover(self):
@@ -562,6 +672,11 @@ class ExploreRunner(object):
         self.crossing = None
         self.split_onset = None
         self._flush_pending()
+        arrived = getattr(self.ex, "spur_arrived", None)
+        res = arrived(d["side"]) if arrived is not None and self.mode != "passive" else None
+        if res:
+            self._start_park(d, res)       # 스퍼 끝이 목표: 되돌아 나오지 않고 주차
+            return
         end_pos = self.odo + self.ctrl_ahead
         ev = self._ev("dead_end", (self.t, self.odo), self.ctrl_ahead, side=d["side"],
                       ref_seq=d.get("seq"), ref_kind=d["kind"],
@@ -601,9 +716,9 @@ class ExploreRunner(object):
         self._integrate(left, right, dt)
         if self.odo <= r["target"]:
             self.state = "pivot"
-            self._piv = {"t": 0.0, "away": False, "n": 0, "side": OPP[r["side"]]}
-            self._piv["kind"] = "recover"
-            self.log.log("note", self._odo(), msg="recover_pivot", dir=self._piv["side"])
+            kind = r.get("kind", "recover")
+            self._piv = {"t": 0.0, "away": False, "n": 0, "side": OPP[r["side"]], "kind": kind}
+            self.log.log("note", self._odo(), msg=kind + "_pivot", dir=self._piv["side"])
             return 0.0, 0.0
         if r["t"] > r["limit_s"]:
             self._finish("recover_failed_reverse")
@@ -654,7 +769,13 @@ class ExploreRunner(object):
             self.patch.active = best
         self.suppress_until = self.odo + self.rc["suppress_mm"]
         self.lost_s = 0.0
-        self.log.log("note", self._odo(), msg=self._piv.get("kind", "recover") + "_done")
+        kind = self._piv.get("kind", "recover")
+        self.log.log("note", self._odo(), msg=kind + "_done")
+        if kind == "spur_out":
+            hook = getattr(self.ex, "spur_exited", None)
+            if hook is not None:
+                hook()
+            self._poll_policy()
 
     def _is_crossing(self, pend, ons):
         """보류 중인 merge 뒤 1->2가 X자 교차인지 판단한다.

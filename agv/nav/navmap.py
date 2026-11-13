@@ -8,7 +8,8 @@
 이동에 쓰는 것은 노드 종류(kind)·색, 엣지 연결·길이·갈림길 방향(branch, branches)과
 패치 위 교차(crossing, through), 스퍼(spur)뿐이다. 좌표는 길이를 모를 때만 쓴다.
 
-길은 한쪽으로만 돈다(라인 엣지). 스퍼 엣지(type destination)는 경로 계산에서 뺀다.
+길은 한쪽으로만 돈다(라인 엣지). 스퍼 엣지(type destination)는 경로 계산에서 뺀다. 스퍼 끝 노드(D_*)로
+가는 길은 "부모 노드(패치·스퍼 갈림)까지 가서 옆으로 들어감"으로 다룬다(spur_parent).
 
 표준 라이브러리만 쓴다. Python 3.6 호환.
 """
@@ -128,6 +129,21 @@ class NavMap(object):
     def main_edges(self):
         return [k for k, e in self.edges.items() if not e["spur"]]
 
+    def spur_parent(self, node_id):
+        """스퍼 끝 노드의 부모(스퍼가 갈라지는 패치·스퍼 갈림 노드). 스퍼 끝이 아니면 None."""
+        if node_id not in self.nodes or self.nodes[node_id]["kind"] != "spur_end":
+            return None
+        for e in self.edges.values():
+            if e["spur"] and e["to"] == node_id:
+                return e["from"]
+        return None
+
+    def spur_length(self, node_id):
+        for e in self.edges.values():
+            if e["spur"] and e["to"] == node_id:
+                return e["len"]
+        return None
+
     def spur_side_at(self, node_id):
         """이 노드에서 옆으로 빠지는 스퍼 방향(패치 스퍼, 스퍼 갈림 노드)."""
         n = self.nodes[node_id]
@@ -172,6 +188,8 @@ class NavMap(object):
         """노드 목록(서버 주문의 nodes)을 잇는 엣지 집합. 이어지지 않는 쌍이 있으면 ValueError."""
         allowed = set()
         for a, b in zip(nodes[:-1], nodes[1:]):
+            if self.spur_parent(b) == a or self.spur_parent(a) == b:
+                continue            # 스퍼로 들어가기·나오기(경로 계산과 따로 다룸)
             es = [e for e in self.out.get(a, []) if self.edges[e]["to"] == b]
             if not es:
                 raise ValueError(u"경로가 이어지지 않아요: %s -> %s" % (a, b))

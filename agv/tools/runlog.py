@@ -65,7 +65,9 @@ def main(argv=None):
     show_notes = ("speed_cal", "vee_seen", "vee_pivot", "vee_done", "recover_reverse", "recover_pivot", "recover_done",
                   "nav_target", "nav_choice", "nav_reached", "nav_reached_early", "nav_relocalized", "nav_unmatched",
                   "nav_off_route", "nav_gave_up", "nav_hold_before_split", "nav_unreachable", "stop_planned",
-                  "hold", "resume")
+                  "hold", "resume", "nav_spur_armed", "nav_spur_enter", "nav_spur_retry", "nav_spur_missed",
+                  "nav_spur_exited", "spur_enter", "spur_in_pivot", "spur_in_done", "spur_end_seen", "spur_parked",
+                  "spur_deadline", "spur_out_reverse", "spur_out_pivot", "spur_out_done")
     count = {}
     for e in evs:
         count[e["type"]] = count.get(e["type"], 0) + 1
@@ -122,6 +124,19 @@ def main(argv=None):
         print(u"  다시 위치 잡음 %d, 맵과 안 맞은 이벤트 %d, 경로 벗어남 %d" % (
             notes.count("nav_relocalized"), notes.count("nav_unmatched"), notes.count("nav_off_route")))
         print(u"  대기 %d / 재개 %d" % (notes.count("hold"), notes.count("resume")))
+        for e in evs:
+            m = e.get("msg")
+            if m == "spur_enter":
+                print(u"  스퍼 진입 %s쪽 (%s로 봄)%s" % (e.get("side"), {"tee": u"옆 스퍼", "split": u"갈림길"}.get(
+                    e.get("via"), e.get("via")), u", 갈림 지점보다 %smm 늦음" % e["late_mm"] if e.get("late_mm") else u""))
+            elif m == "spur_end_seen":
+                print(u"  스퍼 끝 봄: 잰 스퍼 길이 %smm (맵 %s)" % (
+                    e.get("spur_mm"), u"%.0fmm" % e["map_spur_mm"] if e.get("map_spur_mm") else u"-"))
+            elif m == "nav_spur_retry":
+                print(u"  스퍼를 못 봐서 한 바퀴 돌아 다시 (%s번째)" % e.get("tries"))
+        print(u"  스퍼: 주차 %d, 빠져나옴 %d / 후진 시작 %d, 못 봄 %d" % (
+            notes.count("spur_parked"), notes.count("spur_out_done"), notes.count("spur_out_reverse"),
+            notes.count("nav_spur_missed")))
     end = [e for e in evs if e["type"] == "end"]
     print(u"\n종료 이유: %s" % (end[-1].get("reason") if end else u"(end 없음 - 비정상 종료)"))
     return 0

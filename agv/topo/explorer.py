@@ -140,7 +140,7 @@ class Explorer(object):
         if not self._near_patch(odo):
             self._add("X", odo)
 
-    def on_tee(self, odo):
+    def on_tee(self, odo, side=None):
         if not self._near_patch(odo):
             self._add("T", odo)
 
