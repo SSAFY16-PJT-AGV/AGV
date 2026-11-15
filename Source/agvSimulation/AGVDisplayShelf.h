@@ -22,21 +22,9 @@ protected:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
     USceneComponent* ShelfRoot;
 
-    // 진열대 외형
+    // 완성형 선반 Static Mesh
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
-    UStaticMeshComponent* BottomBoard;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
-    UStaticMeshComponent* MiddleBoard;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
-    UStaticMeshComponent* LeftPost;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
-    UStaticMeshComponent* RightPost;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
-    UStaticMeshComponent* BackPanel;
+    TObjectPtr<UStaticMeshComponent> ShelfMesh;
 
     // 상품을 배치할 6개 슬롯
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Shelf")
@@ -63,6 +51,17 @@ protected:
 
 
 public:
+    // 선반 고유 ID
+    UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "Shelf|Identity")
+    FString ShelfId = TEXT("");
+
+    // 선반 ID 반환
+    UFUNCTION(BlueprintPure, Category = "Shelf|Identity")
+    FString GetShelfId() const
+    {
+        return ShelfId;
+    }
+
     UFUNCTION(BlueprintPure, Category = "Shelf")
     EProductType GetShelfProductType() const
     {
@@ -93,4 +92,8 @@ public:
         AAGVGrabbableObject* Product,
         int32 SlotIndex
     );
+
+    // 지정된 상품 종류에 맞는 첫 번째 빈 슬롯 검색
+    UFUNCTION(BlueprintPure, Category = "Shelf|Slots")
+    int32 FindFirstEmptySlot(EProductType ProductType) const;
 };

@@ -1,9 +1,7 @@
 
 #include "AGVDisplayShelf.h"
-
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
-#include "UObject/ConstructorHelpers.h"
 #include "AGVGrabbableObject.h"
 #include "Engine/World.h"
 
@@ -11,101 +9,26 @@ AAGVDisplayShelf::AAGVDisplayShelf()
 {
     PrimaryActorTick.bCanEverTick = false;
 
-    // 1. 루트 생성
+    // 1. 루트 컴포넌트 생성
     ShelfRoot = CreateDefaultSubobject<USceneComponent>(
         TEXT("ShelfRoot")
     );
 
     RootComponent = ShelfRoot;
 
-    // 2. 기본 큐브 메시 가져오기
-    static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMesh(
-        TEXT("/Engine/BasicShapes/Cube.Cube")
+    // 2. 완성형 선반 메시 컴포넌트 생성
+    ShelfMesh = CreateDefaultSubobject<UStaticMeshComponent>(
+        TEXT("ShelfMesh")
     );
 
-    // 3. 선반 생성
-    BottomBoard = CreateDefaultSubobject<UStaticMeshComponent>(
-        TEXT("BottomBoard")
+    ShelfMesh->SetupAttachment(ShelfRoot);
+
+    // Static Mesh 에셋은 블루프린트에서 지정
+    ShelfMesh->SetCollisionEnabled(
+        ECollisionEnabled::QueryAndPhysics
     );
 
-    MiddleBoard = CreateDefaultSubobject<UStaticMeshComponent>(
-        TEXT("MiddleBoard")
-    );
-
-    LeftPost = CreateDefaultSubobject<UStaticMeshComponent>(
-        TEXT("LeftPost")
-    );
-
-    RightPost = CreateDefaultSubobject<UStaticMeshComponent>(
-        TEXT("RightPost")
-    );
-
-    BackPanel = CreateDefaultSubobject<UStaticMeshComponent>(
-        TEXT("BackPanel")
-    );
-
-    TArray<UStaticMeshComponent*> ShelfMeshes = {
-        BottomBoard,
-        MiddleBoard,
-        LeftPost,
-        RightPost,
-        BackPanel
-    };
-
-    for (UStaticMeshComponent* Mesh : ShelfMeshes)
-    {
-        Mesh->SetupAttachment(ShelfRoot);
-
-        if (CubeMesh.Succeeded())
-        {
-            Mesh->SetStaticMesh(CubeMesh.Object);
-        }
-
-        Mesh->SetCollisionEnabled(
-            ECollisionEnabled::QueryAndPhysics
-        );
-    }
-
-    // 4. 선반 위치 및 크기 설정
-    // 기본 큐브 크기 = 100cm
-
-    BottomBoard->SetRelativeLocation(
-        FVector(0.0f, 0.0f, 10.0f)
-    );
-    BottomBoard->SetRelativeScale3D(
-        FVector(1.0f, 2.4f, 0.2f)
-    );
-
-    MiddleBoard->SetRelativeLocation(
-        FVector(0.0f, 0.0f, 75.0f)
-    );
-    MiddleBoard->SetRelativeScale3D(
-        FVector(1.0f, 2.4f, 0.15f)
-    );
-
-    LeftPost->SetRelativeLocation(
-        FVector(0.0f, -120.0f, 75.0f)
-    );
-    LeftPost->SetRelativeScale3D(
-        FVector(1.0f, 0.15f, 1.5f)
-    );
-
-    RightPost->SetRelativeLocation(
-        FVector(0.0f, 120.0f, 75.0f)
-    );
-    RightPost->SetRelativeScale3D(
-        FVector(1.0f, 0.1f, 1.5f)
-    );
-
-    // 뒤쪽 벽
-    BackPanel->SetRelativeLocation(
-        FVector(45, 0, 75)
-    );
-    BackPanel->SetRelativeScale3D(
-        FVector(0.1f, 2.4f, 1.5f)
-    );
-
-    // 5. 슬롯 6개 생성
+    // 3. 상품 적재 슬롯 6개 생성
     for (int32 i = 0; i < 6; i++)
     {
         const FName SlotName(
@@ -124,13 +47,15 @@ AAGVDisplayShelf::AAGVDisplayShelf()
         const float Y = -75.0f + Column * 75.0f;
         const float Z = (Row == 0) ? 45.0f : 107.5f;
 
-        Slot->SetRelativeLocation(FVector(-5.0f, Y, Z));
+        Slot->SetRelativeLocation(
+            FVector(-5.0f, Y, Z)
+        );
 
         Slots.Add(Slot);
     }
 
-    // 6개 슬롯의 초기 점유 상태
-    OccupiedSlots.Init(nullptr, 6);
+    // 4. 슬롯 점유 상태 초기화
+    OccupiedSlots.Init(nullptr, Slots.Num());
 }
 
 FVector AAGVDisplayShelf::GetSlotWorldLocation(
@@ -336,4 +261,32 @@ bool AAGVDisplayShelf::PlaceProductAtSlot(
         *GetName(), SlotIndex);
 
     return true;
+}
+
+int32 AAGVDisplayShelf::FindFirstEmptySlot(
+    EProductType ProductType
+) const
+{
+    // 선반이 취급하는 상품 종류 확인
+    if (ShelfProductType != ProductType)
+    {
+        return INDEX_NONE;
+    }
+
+    for (int32 i = 0; i < Slots.Num(); i++)
+    {
+        if (!IsValid(Slots[i]))
+        {
+            continue;
+        }
+
+        // 비어 있는 슬롯 반환
+        if (!IsSlotOccupied(i))
+        {
+            return i;
+        }
+    }
+
+    // 빈 슬롯이 없는 경우
+    return INDEX_NONE;
 }

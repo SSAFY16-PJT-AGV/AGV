@@ -4,6 +4,8 @@
 #include "IWebSocket.h"
 #include "AGVWebSocketClient.generated.h"
 
+class AAGVRobot;
+
 UCLASS()
 class AGVSIMULATION_API AAGVWebSocketClient : public AActor
 {
@@ -63,4 +65,7 @@ private:
 
     // PIE 종료 중인지 여부
     bool bShuttingDown = false;
+
+    // AGV ID로 해당 로봇 액터 검색
+    AAGVRobot* FindRobotById(const FString& InAGVId) const;
 };

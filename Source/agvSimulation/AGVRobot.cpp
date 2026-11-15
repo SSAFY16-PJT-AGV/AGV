@@ -385,6 +385,106 @@ void AAGVRobot::GrabObject()
     }
 }
 
+bool AAGVRobot::ApplyExternalGrabSuccess(EProductType ProductType)
+{
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        return false;
+    }
+
+    if (!GetWorld() || !IsValid(GrabPoint))
+    {
+        return false;
+    }
+
+    // 이미 물체를 들고 있으면 중복 집기 방지
+    if (IsValid(HeldActor))
+    {
+        return false;
+    }
+
+    AAGVGrabbableObject* NearestObject = nullptr;
+    float NearestDistance = TNumericLimits<float>::Max();
+
+    // 레벨에 존재하는 물체 검색
+    for (TActorIterator<AAGVGrabbableObject> It(GetWorld()); It; ++It)
+    {
+        AAGVGrabbableObject* Candidate = *It;
+
+        if (!IsValid(Candidate))
+        {
+            continue;
+        }
+
+        // 이미 집힌 물체 제외
+        if (Candidate->bIsGrabbed)
+        {
+            continue;
+        }
+
+        // 실제 AGV가 인식한 색상과 비교
+        if (Candidate->GetProductType() != ProductType)
+        {
+            continue;
+        }
+
+        const float Distance = FVector::Dist2D(
+            GetActorLocation(),
+            Candidate->GetActorLocation()
+        );
+
+        // 집기 가능 범위 내에서 가장 가까운 물체 선택
+        if (Distance <= GrabDistance &&
+            Distance < NearestDistance)
+        {
+            NearestDistance = Distance;
+            NearestObject = Candidate;
+        }
+    }
+
+    if (!IsValid(NearestObject))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] GRAB FAILED: Type=%d, AGVPos=%s, GrabDistance=%.1f"),
+            *GetAGVId(),
+            static_cast<int32>(ProductType),
+            *GetActorLocation().ToString(),
+            GrabDistance
+        );
+
+        return false;
+    }
+
+    // 실제 집기 성공 결과 반영
+    NearestObject->Grab(GrabPoint);
+
+    if (!NearestObject->bIsGrabbed)
+    {
+        return false;
+    }
+
+    HeldActor = NearestObject;
+
+    // 진열대 슬롯 상태 갱신
+    for (TActorIterator<AAGVDisplayShelf> It(GetWorld()); It; ++It)
+    {
+        AAGVDisplayShelf* Shelf = *It;
+
+        if (IsValid(Shelf) &&
+            Shelf->RemoveProductFromSlot(HeldActor))
+        {
+            break;
+        }
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[%s] External grab success: Type=%d"),
+        *GetAGVId(),
+        static_cast<int32>(ProductType));
+
+    return true;
+}
+
 void AAGVRobot::ReleaseObject()
 {
     if (!IsValid(HeldActor))
@@ -438,7 +538,142 @@ void AAGVRobot::ReleaseObject()
         TEXT("Object released with gravity"));
 }
 
+bool AAGVRobot::ApplyExternalReleaseSuccess()
+{
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        return false;
+    }
 
+    if (!IsValid(HeldActor))
+    {
+        return false;
+    }
+
+    HeldActor->Release();
+
+    if (HeldActor->bIsGrabbed)
+    {
+        return false;
+    }
+
+    HeldActor = nullptr;
+
+    if (IsValid(PlacementPreview))
+    {
+        PlacementPreview->HidePreview();
+    }
+
+    AimedShelf = nullptr;
+    AimedSlotIndex = INDEX_NONE;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[%s] External release success"),
+        *GetAGVId());
+
+    return true;
+}
+
+bool AAGVRobot::ApplyExternalPlaceSuccess(
+    AAGVDisplayShelf* TargetShelf,
+    int32 SlotIndex
+)
+{
+    UE_LOG(LogTemp, Warning,
+        TEXT("[%s] PLACE EVENT RECEIVED: Shelf=%s, Slot=%d"),
+        *GetAGVId(),
+        IsValid(TargetShelf)
+        ? *TargetShelf->GetShelfId()
+        : TEXT("NONE"),
+        SlotIndex);
+
+    // 외부 데이터 연동 모드 확인
+    if (MovementMode != EAGVMovementMode::External)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: Not External Mode"),
+            *GetAGVId());
+
+        return false;
+    }
+
+    // 상품을 들고 있는지 확인
+    if (!IsValid(HeldActor))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: HeldActor is NULL"),
+            *GetAGVId());
+
+        return false;
+    }
+
+    // 대상 선반 확인
+    if (!IsValid(TargetShelf))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: TargetShelf is NULL"),
+            *GetAGVId());
+
+        return false;
+    }
+
+    // 상품 종류 확인
+    if (HeldActor->GetProductType() !=
+        TargetShelf->GetShelfProductType())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: Product Type Mismatch"),
+            *GetAGVId());
+
+        return false;
+    }
+
+    // 슬롯 점유 확인
+    if (TargetShelf->IsSlotOccupied(SlotIndex))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: Slot %d Occupied"),
+            *GetAGVId(),
+            SlotIndex);
+
+        return false;
+    }
+
+    // 선반에 상품 적재
+    const bool bPlaced =
+        TargetShelf->PlaceProductAtSlot(
+            HeldActor,
+            SlotIndex
+        );
+
+    if (!bPlaced)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[%s] PLACE FAILED: PlaceProductAtSlot returned false"),
+            *GetAGVId());
+
+        return false;
+    }
+
+    // 적재 성공
+    HeldActor = nullptr;
+
+    if (IsValid(PlacementPreview))
+    {
+        PlacementPreview->HidePreview();
+    }
+
+    AimedShelf = nullptr;
+    AimedSlotIndex = INDEX_NONE;
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("[%s] PLACE SUCCESS: Shelf=%s, Slot=%d"),
+        *GetAGVId(),
+        *TargetShelf->GetShelfId(),
+        SlotIndex);
+
+    return true;
+}
 
 bool AAGVRobot::CanGrabObject() const
 {
@@ -887,7 +1122,6 @@ void AAGVRobot::UpdateExternalPose(
         return;
     }
 
-    // 실제 서버 좌표 수신 시에만 타이머 초기화
     ExternalDataElapsed = 0.0f;
     bExternalDataReceived = true;
 
@@ -902,90 +1136,43 @@ void AAGVRobot::UpdateExternalPose(
         );
     }
 
-    // 현재 위치를 새로운 보간 시작점으로 설정
-    ExternalStartPosition = GetActorLocation();
-
-    // 서버 좌표를 Unreal 좌표로 변환
-    ExternalTargetPosition = FVector(
+    const FVector NewTargetPosition(
         X * ExternalPositionScale,
         Y * ExternalPositionScale,
         GetActorLocation().Z
     );
 
-    ExternalStartRotation = GetActorRotation();
-    ExternalTargetRotation = FRotator(0.0f, Yaw, 0.0f);
+    const FRotator NewTargetRotation(
+        0.0f,
+        Yaw,
+        0.0f
+    );
 
-    // 첫 위치 즉시 설정
+    // 첫 좌표 수신 시 즉시 초기 위치 설정
     if (!bExternalPoseInitialized)
     {
-        SetActorLocation(ExternalTargetPosition, false);
-        SetActorRotation(ExternalTargetRotation);
+        SetActorLocation(NewTargetPosition, false);
+        SetActorRotation(NewTargetRotation);
+
+        ExternalTargetPosition = NewTargetPosition;
+        ExternalTargetRotation = NewTargetRotation;
 
         bExternalPoseInitialized = true;
-        bExternalInterpolating = false;
-        return;
-    }
-
-    // 현재 위치와 새 목표 위치의 차이
-    const float PositionDifference = FVector::Dist2D(
-        GetActorLocation(),
-        ExternalTargetPosition
-    );
-
-    // 현재 방향과 새 목표 방향의 차이
-    const float RotationDifference = FMath::Abs(
-        FMath::FindDeltaAngleDegrees(
-            GetActorRotation().Yaw,
-            ExternalTargetRotation.Yaw
-        )
-    );
-
-    // 위치와 방향 모두 동일하면 새로운 보간을 시작하지 않음
-    if (PositionDifference <= ExternalPositionTolerance &&
-        RotationDifference <= ExternalRotationTolerance)
-    {
-        // 이미 진행 중인 보간이 있으면 중단하고 목표에 정렬
-        SetActorLocation(ExternalTargetPosition);
-        SetActorRotation(ExternalTargetRotation);
-
         bExternalRotating = false;
         bExternalInterpolating = false;
 
         return;
     }
 
-    // 새로운 목표를 받으면 회전 단계부터 시작
-    ExternalRotationElapsed = 0.0f;
-    ExternalInterpolationElapsed = 0.0f;
+    // 새로운 JSON 좌표를 목표 위치로 갱신
+    ExternalTargetPosition = NewTargetPosition;
+    ExternalTargetRotation = NewTargetRotation;
 
-    // 현재 위치에서 목표 위치까지 거리 (cm)
-    const float MoveDistance = FVector::Dist2D(
-        ExternalStartPosition,
-        ExternalTargetPosition
-    );
+    // 기존 회전 후 이동 방식 비활성화
+    bExternalRotating = false;
 
-    // 거리에 비례해 이동 시간 계산
-    ExternalCurrentMoveDuration = FMath::Max(
-        MoveDistance / FMath::Max(ExternalMoveSpeed, 1.0f),
-        ExternalMinInterpolationDuration
-    );
-
-    // 현재 방향과 목표 방향이 다르면 먼저 제자리 회전
-    const float YawDifference = FMath::Abs(
-        FMath::FindDeltaAngleDegrees(
-            ExternalStartRotation.Yaw,
-            ExternalTargetRotation.Yaw
-        )
-    );
-
-    bExternalRotating = YawDifference > 1.0f;
-
-    // 회전이 필요 없으면 바로 이동
-    bExternalInterpolating = !bExternalRotating;
-
-    UE_LOG(LogTemp, Warning,
-        TEXT("External target received: X=%.2f, Y=%.2f, Yaw=%.2f"),
-        X, Y, Yaw);
+    // 이동 및 회전을 Tick에서 함께 처리
+    bExternalInterpolating = true;
 }
 
 void AAGVRobot::UpdateExternalInterpolation(float DeltaTime)
@@ -995,71 +1182,69 @@ void AAGVRobot::UpdateExternalInterpolation(float DeltaTime)
         return;
     }
 
-    // 1단계: 제자리 회전
-    if (bExternalRotating)
+    if (!bExternalPoseInitialized || !bExternalDataReceived)
     {
-        ExternalRotationElapsed += DeltaTime;
-
-        const float RotationDuration =
-            FMath::Max(ExternalRotationDuration, 0.01f);
-
-        const float RotationAlpha = FMath::Clamp(
-            ExternalRotationElapsed / RotationDuration,
-            0.0f,
-            1.0f
-        );
-
-        // 최단 회전 방향으로 회전
-        const FQuat NewRotation = FQuat::Slerp(
-            ExternalStartRotation.Quaternion(),
-            ExternalTargetRotation.Quaternion(),
-            RotationAlpha
-        );
-
-        SetActorRotation(NewRotation);
-
-        if (RotationAlpha >= 1.0f)
-        {
-            bExternalRotating = false;
-            bExternalInterpolating = true;
-            ExternalInterpolationElapsed = 0.0f;
-
-            UE_LOG(LogTemp, Warning,
-                TEXT("External rotation completed"));
-        }
-
         return;
     }
 
-    // 2단계: 직진 이동
-    if (bExternalInterpolating)
+    // 통신이 끊겼으면 마지막 위치 유지
+    if (bExternalDataStale)
     {
-        ExternalInterpolationElapsed += DeltaTime;
+        return;
+    }
 
-        const float Duration =
-            FMath::Max(ExternalCurrentMoveDuration, 0.01f);
+    const FVector CurrentPosition = GetActorLocation();
+    const FRotator CurrentRotation = GetActorRotation();
 
-        const float Alpha = FMath::Clamp(
-            ExternalInterpolationElapsed / Duration,
-            0.0f,
-            1.0f
-        );
+    // 위치 추종 속도
+    constexpr float PositionInterpSpeed = 15.0f;
 
-        const FVector NewPosition = FMath::Lerp(
-            ExternalStartPosition,
-            ExternalTargetPosition,
-            Alpha
-        );
+    // 회전 추종 속도
+    constexpr float RotationInterpSpeed = 15.0f;
 
-        SetActorLocation(NewPosition, false);
+    // 목표 위치로 부드럽게 이동
+    const FVector NewPosition = FMath::VInterpTo(
+        CurrentPosition,
+        ExternalTargetPosition,
+        DeltaTime,
+        PositionInterpSpeed
+    );
 
-        if (Alpha >= 1.0f)
-        {
-            bExternalInterpolating = false;
+    // 목표 방향으로 부드럽게 회전
+    const FRotator NewRotation = FMath::RInterpTo(
+        CurrentRotation,
+        ExternalTargetRotation,
+        DeltaTime,
+        RotationInterpSpeed
+    );
 
-            UE_LOG(LogTemp, Warning,
-                TEXT("External target reached"));
-        }
+    SetActorLocation(NewPosition, false);
+    SetActorRotation(NewRotation);
+
+    const float PositionDifference = FVector::Dist2D(
+        NewPosition,
+        ExternalTargetPosition
+    );
+
+    const float RotationDifference = FMath::Abs(
+        FMath::FindDeltaAngleDegrees(
+            NewRotation.Yaw,
+            ExternalTargetRotation.Yaw
+        )
+    );
+
+    // 충분히 가까워지면 정확한 목표 좌표로 정렬
+    if (PositionDifference <= 0.5f &&
+        RotationDifference <= 0.5f)
+    {
+        SetActorLocation(ExternalTargetPosition, false);
+        SetActorRotation(ExternalTargetRotation);
+
+        bExternalInterpolating = false;
+    }
+    else
+    {
+        bExternalInterpolating = true;
     }
 }
 

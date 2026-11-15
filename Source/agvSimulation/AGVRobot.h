@@ -18,6 +18,7 @@ class AAGVDisplayShelf;
 class AWarehouseMapLoader;
 class USplineComponent;
 struct FWarehouseRouteStep;
+enum class EProductType : uint8;
 
 // AGV 위치 제어 방식. 현재는 Manual만 실제 이동을 처리한다.
 UENUM(BlueprintType)
@@ -36,6 +37,12 @@ class AGVSIMULATION_API AAGVRobot : public APawn
 #pragma region Public
 public:
     AAGVRobot();
+
+    UFUNCTION(BlueprintPure, Category = "AGV|Identity")
+    FString GetAGVId() const
+    {
+        return AGVId;
+    }
 
     virtual void Tick(float DeltaTime) override;
 
@@ -75,6 +82,18 @@ public:
     );
 
     void ResetExternalPoseInitialization();
+
+    UFUNCTION(BlueprintCallable, Category = "AGV|External")
+    bool ApplyExternalGrabSuccess(EProductType ProductType);
+
+    UFUNCTION(BlueprintCallable, Category = "AGV|External")
+    bool ApplyExternalReleaseSuccess();
+
+    UFUNCTION(BlueprintCallable, Category = "AGV|External")
+    bool ApplyExternalPlaceSuccess(
+        AAGVDisplayShelf* TargetShelf,
+        int32 SlotIndex
+    );
 #pragma endregion
 
 #pragma region Protected
@@ -97,6 +116,10 @@ protected:
     // 카메라
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
     UCameraComponent* Camera;
+
+    // 중앙 서버에서 사용하는 AGV 고유 식별자
+    UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "AGV|Identity")
+    FString AGVId = TEXT("AGV_01");
 
     // 현재 AGV 이동 모드 (기본값: 기존 수동 조작)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement")
