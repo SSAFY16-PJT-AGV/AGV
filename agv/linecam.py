@@ -32,9 +32,13 @@ import numpy as np
 DEFAULT_CONFIG = {
     "frame": {"width": 320, "height": 240, "flip": 0},
     "line": {
-        "v_max": 80,            # 이보다 어두우면 라인 후보
+        "v_auto": True,         # 프레임마다 테이프·매트 밝기를 재서 그 사이에 문턱을 둔다. 조명이 바뀌어도 따라간다
+                                # (실물: 어두운 방 매트 108·테이프 20, 밝은 곳 매트 210·테이프 90). false면 v_max·v_dark 고정값
+        "v_split": 0.25,        # 문턱 = 테이프 밝기 + 이 비율 x (매트 - 테이프)
+        "v_dark_split": 0.13,   # 채도와 상관없이 라인으로 볼 밝기도 같은 식
+        "v_max": 80,            # (v_rel이 null일 때) 이보다 어두우면 라인 후보
         "s_max": 90,            # 이보다 채도가 높으면 색 패치로 보고 제외
-        "v_dark": 55,           # 이보다 어두우면 채도와 상관없이 라인(어두운 픽셀은 S가 노이즈로 튐)
+        "v_dark": 55,           # (v_rel이 null일 때) 이보다 어두우면 채도와 상관없이 라인(어두운 픽셀은 S가 노이즈로 튐)
         "blur": 5,              # 가우시안 블러 커널(0이면 끔)
         "roi_top": 0.30,        # 스캔 영역(화면 높이 비율)
         "roi_bottom": 0.96,
@@ -162,6 +166,25 @@ class Analysis(object):
         self.line_mask = None
         self.sat_rows = []      # 속도 보정용: 정해진 가로줄마다 채도 높은(패치) 픽셀 비율
         self.dropped_sides = set()  # 매트 밖 바닥으로 보고 뺀 화면 쪽(left/right)
+        self.mat_v = None           # 이 프레임의 매트 밝기 추정
+        self.v_max = None           # 이 프레임에 쓴 라인 밝기 문턱
+        self.v_dark = None
+        self.line_v = None
+
+
+def line_thresholds(v, lc):
+    """(v_max, v_dark, mat_v, line_v). v_auto면 이 프레임의 스캔 영역 밝기에서 매트(70% 지점)와 테이프(3% 지점,
+    테이프는 화면 폭의 1할쯤이라 가장 어두운 쪽)를 재서 그 사이에 둔다. 테이프가 안 보여 둘 차이가 작으면
+    매트 밝기의 35%로 둔다(매트·패치를 라인으로 잡지 않게). 아니면 설정 고정값."""
+    if not lc.get("v_auto"):
+        return lc["v_max"], lc["v_dark"], None, None
+    h = v.shape[0]
+    sub = v[int(lc["roi_top"] * h):int(lc["roi_bottom"] * h):2, ::2]
+    line_v, mat_v = [float(x) for x in np.percentile(sub, [3, 70])]
+    if mat_v - line_v < 0.4 * mat_v:
+        return 0.35 * mat_v, 0.2 * mat_v, mat_v, None
+    k, kd = lc.get("v_split", 0.25), lc.get("v_dark_split", 0.13)
+    return line_v + k * (mat_v - line_v), line_v + kd * (mat_v - line_v), mat_v, line_v
 
 
 def _offmat_sides(per_row, w, frac):
@@ -191,11 +214,13 @@ def analyze(bgr, cfg):
     src = cv2.GaussianBlur(bgr, (lc["blur"], lc["blur"]), 0) if lc.get("blur") else bgr
     hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
-    mask = ((v < lc["v_max"]) & ((s < lc["s_max"]) | (v < lc["v_dark"]))).astype(np.uint8)
+    v_max, v_dark, mat_v, line_v = line_thresholds(v, lc)
+    mask = ((v < v_max) & ((s < lc["s_max"]) | (v < v_dark))).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     an = Analysis()
     an.w, an.h = w, h
+    an.mat_v, an.v_max, an.v_dark, an.line_v = mat_v, v_max, v_dark, line_v
     an.line_mask = mask
     ys = np.linspace(lc["roi_top"] * h, lc["roi_bottom"] * h, lc["rows"]).astype(int)
     min_w, max_w = lc["min_w_frac"] * w, lc["max_w_frac"] * w

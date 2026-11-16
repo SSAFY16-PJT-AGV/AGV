@@ -287,6 +287,12 @@ def solve(col, cfg, expect=None, margin=4):
         safe[("line", "v_dark")] = (lv + 5, min(line["v_max"], min_v - 15))
         safe[("patch", "s_min")] = (st["mat_s"] + 10, min_s - 20)
         safe[("patch", "v_min")] = (lv + 10, min_v - 15)
+    if cfg["line"].get("v_auto"):
+        # 라인 문턱을 프레임마다 자동으로 잡는 설정이면(기본) 고정 문턱은 쓰지 않으니 넣지 않는다
+        for k in ("v_max", "v_dark"):
+            line.pop(k, None)
+            safe.pop(("line", k), None)
+        info["warnings"].append(u"라인 밝기 문턱은 주행 중 프레임마다 자동으로 잡아요(line.v_auto). 여기서는 안 바꿔요.")
     info["kept"] = []
     for (sec, k), (lo, hi) in safe.items():
         cur = cfg[sec].get(k)

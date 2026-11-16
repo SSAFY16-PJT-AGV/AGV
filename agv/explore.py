@@ -127,6 +127,16 @@ def _lost_text(runner):
     return u"%.1f초째" % runner.lost_s
 
 
+def _thr_text(an):
+    if an is None or getattr(an, "v_max", None) is None:
+        return u"-"
+    if an.mat_v is None:
+        return u"%.0f보다 어두우면 (고정값)" % an.v_max
+    if an.line_v is None:
+        return u"%.0f (테이프가 안 보임, 매트 %.0f)" % (an.v_max, an.mat_v)
+    return u"%.0f보다 어두우면 (테이프 %.0f, 매트 %.0f)" % (an.v_max, an.line_v, an.mat_v)
+
+
 def _status_rows(a, runner, elapsed, left, right, fps):
     choice = runner.choice or u"-"
     return [
@@ -138,6 +148,7 @@ def _status_rows(a, runner, elapsed, left, right, fps):
         (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)
          + (u" (늘 %s)" % {"left": u"왼쪽", "right": u"오른쪽"}[runner.lap_side] if a.mode == "lap" else u"")),
         (u"패치", runner.patch.active or u"-"),
+        (u"라인 문턱", _thr_text(runner.last_an)),
         (u"매트 밖 바닥", _offmat_text(runner.last_an)),
         (u"라인 놓침", _lost_text(runner)),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)

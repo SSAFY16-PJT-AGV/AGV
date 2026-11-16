@@ -34,7 +34,7 @@ import cv2
 import numpy as np
 
 from ..camcalib import find_corners, guess_board
-from ..explore import HERE, ROOT, _offmat_text, load_config
+from ..explore import HERE, ROOT, _offmat_text, _thr_text, load_config
 from ..hw import make_motors, open_camera
 from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
 
@@ -314,6 +314,7 @@ def _arm_interactive(a, cfg, A):
                                 (u"카메라 자세", A.fmt(pose)),
                                 (u"고른 서보", u"%s번 %s, %g도씩" % (sel, A.NAMES.get(sel, u""), step)),
                                 (u"선 하나로 보이는 줄", u"%d / %d" % (one, rows)),
+                                (u"라인 문턱", _thr_text(an)),
                                 (u"매트 밖 바닥", _offmat_text(an)),
                                 (u"조향 줄 선 위치", u"-" if off is None else u"가운데에서 %+.0fpx" % off),
                                 (u"상태", (u"힘 뺌(손으로 움직이는 중)" if free else u"고정") + (u", 저장 안 함" if dirty else u""))])
