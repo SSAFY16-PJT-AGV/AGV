@@ -175,6 +175,7 @@ class ExploreRunner(object):
         self.suppress_until = -1e9  # 되돌아 나온 직후 같은 갈림길을 다시 잡지 않게
         self.lost_s = 0.0
         self.lost_logged = False
+        self.search_side = None     # 라인을 찾아 제자리 회전 중인 방향
         self.finished = False
         self.finish_reason = None
         self.last_an = None
@@ -273,8 +274,10 @@ class ExploreRunner(object):
         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
         if self.finished:
             return 0.0, 0.0
-        pivot = self.state == "pivot"
+        was_pivot = self.state == "pivot"
         left, right = self._step(frame, dt)
+        # 이번 명령이 제자리 회전인지(막다른 길 복귀 회전, 라인 찾기 회전): 회전 궤도폭을 따로 추정함
+        pivot = was_pivot or (self.search_side is not None and self.lost_s > 0)
         if self.mode != "passive":
             dy = self.speed_mm_s * (left - right) / self.cfg["follow"]["base_speed"] * dt
             self.yaw_mm += dy
@@ -458,10 +461,18 @@ class ExploreRunner(object):
 
     def _drive(self, an, dt):
         self.t += dt
-        x = self.follow.target(an, self.choice, self.junc.lw)
+        x = self.follow.target(an, self.choice, self.junc.lw, near_only=bool(self.search_side))
+        fc = self.cfg["follow"]
         if x is None:
+            if self.lost_s == 0.0 and self.mode != "passive":
+                # 급커브로 라인이 화면 옆으로 나갔으면 그쪽으로 제자리 회전하며 찾는다
+                self.search_side = self.follow.edge_side(an.w)
+                if self.search_side:
+                    self.log.log("note", self._odo(), msg="line_search", dir=self.search_side,
+                                 last_x=round(self.follow.last_x, 1))
             self.lost_s += dt
-            if self.lost_s >= self.cfg["follow"]["lost_timeout_s"] and not self.lost_logged:
+            limit = fc.get("search_timeout_s", 4.0) if self.search_side else fc["lost_timeout_s"]
+            if self.lost_s >= limit and not self.lost_logged:
                 self.lost_logged = True
                 self._flush_pending()
                 self.log.log("gap", self._odo(), reason="line_lost")
@@ -470,6 +481,11 @@ class ExploreRunner(object):
                     self._finish("line_lost")
                     return 0.0, 0.0
         else:
+            if self.search_side:
+                self.log.log("note", self._odo(), msg="line_search_done", dir=self.search_side,
+                             s=round(self.lost_s, 2))
+                self._reset_tracking()
+                self.search_side = None
             self.lost_s = 0.0
             self.lost_logged = False
 
@@ -478,7 +494,10 @@ class ExploreRunner(object):
             # 명목 속도만큼 늘린다.
             self.odo += self.speed_mm_s * dt
             return 0.0, 0.0
-        if x is None and self.lost_s > 0:
+        if x is None and self.search_side:
+            w = self.rc["pivot_speed"]
+            left, right = (-w, w) if self.search_side == "left" else (w, -w)
+        elif x is None and self.lost_s > 0:
             left, right = self.last_cmd[0] * 0.8, self.last_cmd[1] * 0.8  # 잠깐 놓치면 관성 유지
         else:
             left, right = self.follow.command(x, an.w, dt)
@@ -520,8 +539,10 @@ class ExploreRunner(object):
         rows = an.raw
         far_empty = all(len(rows[i]) == 0 for i in range(an.ctrl_idx + 1))
         near = [r for i in range(an.ctrl_idx + 1, len(rows)) for r in rows[i]]
-        ended = far_empty and len(near) > 0
-        lost = all(len(r) == 0 for r in rows) and self.lost_s + dt >= 0.3
+        # 선이 화면 옆으로 나가며 사라지면(급커브) 선 끝이 아니다: 라인 찾기 회전이 맡는다
+        sideways = self.follow.edge_side(an.w) is not None
+        ended = far_empty and len(near) > 0 and not sideways
+        lost = all(len(r) == 0 for r in rows) and self.lost_s + dt >= 0.3 and not sideways
         if ended or lost:
             self._end_n += 1
         else:
@@ -614,6 +635,18 @@ class ExploreRunner(object):
             return w, -w
         return -w, w
 
+    def _reset_tracking(self):
+        """제자리 회전 뒤 라인을 다시 잡았을 때: 회전 중 본 모양으로 갈림길·스퍼를 잘못 내지 않게 판정 상태를 비운다."""
+        self.follow.prev_err = None
+        self.junc.state = "one"
+        self.junc.in_split = False
+        self.junc._pend = 0
+        self.junc._gaps = []
+        self.junc._pair_slopes = []
+        self.tee.armed = False
+        self.tee._off = 0
+        self.suppress_until = self.odo + self.rc["suppress_mm"]
+
     def _rejoin(self, an, x):
         self.state = "follow"
         self.follow.last_x = float(x)
@@ -631,6 +664,7 @@ class ExploreRunner(object):
             self.patch.active = best
         self.suppress_until = self.odo + self.rc["suppress_mm"]
         self.lost_s = 0.0
+        self.search_side = None
         self.log.log("note", self._odo(), msg=self._piv.get("kind", "recover") + "_done")
 
     def _is_crossing(self, pend, ons):

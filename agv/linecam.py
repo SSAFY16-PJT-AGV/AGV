@@ -111,6 +111,12 @@ DEFAULT_CONFIG = {
         "slow_k": 0.5,          # 오차가 크면 감속
         "max_cmd": 0.6,
         "lost_timeout_s": 1.0,  # 라인을 이만큼 못 보면 정지
+        "jump_frac": 0.3,       # 화면 옆 끝에 붙은 조각이 마지막 라인 위치에서 화면 폭의 이 비율보다 멀면
+                                # 라인이 아니라 매트 밖 바닥·그림자로 보고 무시
+        "max_jump_frac": 0.5,   # 옆 끝에 안 붙은 조각도 이 비율보다 멀면 무시(먼 줄에 보이는 매트 밖 바닥)
+        "edge_frac": 0.3,       # 라인을 놓치기 직전 위치가 화면 왼/오른쪽 이 비율 안이면 급커브로 화면 밖에
+                                # 나간 것: 그쪽으로 제자리 회전하며 찾는다
+        "search_timeout_s": 4.0,  # 그렇게 찾는 최대 시간(그 뒤 정지)
     },
 }
 
@@ -517,10 +523,31 @@ class Follower(object):
         self.c = cfg["follow"]
         self.last_x = None
         self.prev_err = 0.0
+        self.rejected = 0       # 이번 프레임에 버린 먼 화면-끝 조각 수(디버그용)
 
-    def target(self, an, choice=None, lw=None):
+    def _ok(self, run, x, w):
+        """마지막 라인 위치에서 갑자기 멀리 있는 조각은 받지 않는다(화면 옆 끝에 붙은 조각은 더 엄하게).
+        급커브에서 라인이 화면 밖으로 나간 순간, 반대편 끝이나 먼 줄에 보이는 매트 밖 바닥(어두움)을
+        라인으로 잡아 계속 그쪽으로 도는 것을 막는다."""
+        a, b = run
+        lim = self.c.get("jump_frac", 0.3) if (a <= 1 or b >= w - 2) else self.c.get("max_jump_frac", 0.5)
+        return abs(x - self.last_x) <= lim * w
+
+    def edge_side(self, w):
+        """마지막으로 본 라인이 화면 옆 끝 근처였으면 그 쪽(left/right), 아니면 None."""
+        if self.last_x is None:
+            return None
+        f = self.c.get("edge_frac", 0.3)
+        if self.last_x < f * w:
+            return "left"
+        if self.last_x > (1.0 - f) * w:
+            return "right"
+        return None
+
+    def target(self, an, choice=None, lw=None, near_only=False):
         """조향 목표 x(px). choice가 left/right면 갈림길에서 그쪽 가지를 택한다.
-        lw(라인폭 px)를 주면 스퍼·교차로 넓어진 조각에서 내 선 쪽 가장자리를 쓴다."""
+        lw(라인폭 px)를 주면 스퍼·교차로 넓어진 조각에서 내 선 쪽 가장자리를 쓴다.
+        near_only: 조향 줄과 그보다 가까운 줄에서만 찾는다(라인을 찾아 회전하는 중. 먼 줄에는 매트 밖이 보일 수 있음)."""
         if self.last_x is None:
             self.last_x = an.w / 2.0
         ctrl_segs = an.rows[an.ctrl_idx][1]
@@ -529,10 +556,21 @@ class Follower(object):
             x = ctrl_segs[0] if choice == "left" else ctrl_segs[-1]
         if x is None:
             # 조향 줄 -> 그보다 가까운 줄 -> 먼 줄 순서로 찾는다
-            order = [an.ctrl_idx] + list(range(an.ctrl_idx + 1, len(an.rows))) \
-                + list(range(an.ctrl_idx - 1, -1, -1))
+            order = [an.ctrl_idx] + list(range(an.ctrl_idx + 1, len(an.rows)))
+            if not near_only:
+                order += list(range(an.ctrl_idx - 1, -1, -1))
+            self.rejected = 0
             for i in order:
-                cand = [_line_x(r, self.last_x, lw) for r in an.raw[i]] if an.raw else an.rows[i][1]
+                if an.raw:
+                    cand = []
+                    for r in an.raw[i]:
+                        cx = _line_x(r, self.last_x, lw)
+                        if self._ok(r, cx, an.w):
+                            cand.append(cx)
+                        else:
+                            self.rejected += 1
+                else:
+                    cand = an.rows[i][1]
                 if cand:
                     x = min(cand, key=lambda s: abs(s - self.last_x))
                     break
@@ -544,6 +582,8 @@ class Follower(object):
         if x is None:
             return 0.0, 0.0
         err = (x - w / 2.0) / (w / 2.0)
+        if self.prev_err is None:       # 라인을 다시 잡은 첫 프레임: 미분항이 튀지 않게
+            self.prev_err = err
         d = (err - self.prev_err) / max(dt, 1e-3)
         self.prev_err = err
         turn = self.c["kp"] * err + self.c["kd"] * d

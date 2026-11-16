@@ -114,6 +114,89 @@ class TestOffMatFloor(unittest.TestCase):
         self.assertTrue(all(len(xs) == 1 for _, xs in an.rows))
 
 
+class TestLostLineAtCorner(unittest.TestCase):
+    """급커브에서 라인이 화면 옆으로 나가면, 먼 줄·반대편 끝에 보이는 매트 밖 바닥을 라인으로 잡지 않고
+    라인이 나간 쪽으로 제자리 회전해 다시 찾는다(실물 주행에서 바깥 코너마다 바닥 쪽으로 돌던 문제)."""
+
+    @staticmethod
+    def _frame(line_x=None, floor=True):
+        import cv2
+        import numpy as np
+        im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+        if floor:   # 매트 끝 너머 바닥이 화면 위쪽(먼 줄)에 오른쪽 끝까지 보임
+            cv2.fillPoly(im, [np.array([[110, 0], [320, 0], [320, 105], [150, 105]])], (60, 58, 62))
+        if line_x is not None:
+            cv2.line(im, (int(line_x), 240), (int(line_x) - 40, 110), (30, 30, 30), 22)
+        return im
+
+    def _cfg(self):
+        from agv.linecam import merge_config
+        return merge_config(DEFAULT_CONFIG, {})
+
+    def test_follower_ignores_floor_after_line_leaves(self):
+        from agv.linecam import Follower
+        cfg = self._cfg()
+        f = Follower(cfg)
+        for x in (160, 120, 80, 50, 30):
+            self.assertIsNotNone(f.target(analyze(self._frame(x, floor=False), cfg)))
+        an = analyze(self._frame(None), cfg)
+        self.assertTrue(any(an.raw[i] for i in range(an.ctrl_idx)))     # 먼 줄에 바닥 조각이 보이지만
+        self.assertIsNone(f.target(an))                                  # 라인으로 치지 않음
+        self.assertEqual(f.edge_side(an.w), "left")
+        self.assertIsNotNone(f.target(analyze(self._frame(25), cfg), near_only=True))   # 왼쪽에서 다시 들어오면 잡음
+
+    def _runner(self, tmp):
+        from agv.runner import ExploreRunner
+        from agv.topo import EventLogger, Explorer
+        ev = os.path.join(tmp, "events.jsonl")
+        return ExploreRunner(self._cfg(), EventLogger(ev, echo=False), mode="drive", explorer=Explorer()), ev
+
+    def test_runner_pivots_toward_last_side_then_rejoins(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for x in (160, 140, 110, 80, 50, 30):
+                r.step(self._frame(x, floor=False), 0.05)
+            w = r.rc["pivot_speed"]
+            cmds = [r.step(self._frame(None), 0.05) for _ in range(30)]          # 1.5초 못 봄(보통은 1초면 정지)
+            self.assertFalse(r.finished)
+            self.assertTrue(all(c == (-w, w) for c in cmds), cmds[:3])            # 왼쪽으로 제자리 회전
+            left, right = r.step(self._frame(40), 0.05)
+            self.assertGreater(left + right, 0.1)                                  # 다시 앞으로 따라감
+            r._finish("test")
+            msgs = [json.loads(l).get("msg") for l in open(ev)]
+            self.assertIn("line_search", msgs)
+            self.assertIn("line_search_done", msgs)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_runner_search_gives_up(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for x in (160, 120, 80, 50, 30):
+                r.step(self._frame(x, floor=False), 0.05)
+            for _ in range(int(r.cfg["follow"]["search_timeout_s"] / 0.05) + 2):
+                r.step(self._frame(None), 0.05)
+            self.assertTrue(r.finished)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_lost_in_middle_keeps_old_behavior(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for _ in range(5):
+                r.step(self._frame(185, floor=False), 0.05)
+            c = r.step(self._frame(None, floor=False), 0.05)
+            self.assertGreater(c[0] + c[1], 0)                                     # 관성으로 조금 더 감
+            for _ in range(21):
+                r.step(self._frame(None, floor=False), 0.05)
+            self.assertTrue(r.finished)                                            # 1초 뒤 정지
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestSimExploration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
