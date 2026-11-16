@@ -20,6 +20,7 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 | `--mat 파일` | 매트 선택. 기본은 `mats/ssafy_mat.json`(첫 매트 한 장) |
 | `--start x,y,각도` | 시작 자세(mm, 도). 특정 구간만 시험할 때 |
 | `--right-first` | 갈림길에서 오른쪽부터 탐색 |
+| `--floor 55` | 매트 밖 바닥 밝기(기본 90). 실물처럼 테이프만큼 어두운 바닥을 흉내 |
 | `--mode lap` | 색 보정 전 첫 바퀴(갈림길은 늘 왼쪽, 한 바퀴 알아보면 멈춤) |
 
 `mats/ssafy_mat.json`은 `docs/images/track-mat.jpg` 사진을 눈대중으로 본뜬 매트다. 큰 루프 하나에 분기 두 곳(노랑 패치 위 갈라짐, 보라 패치 위 합쳐짐)이 있다. 실측 치수가 나오면 이 파일을 고친다. 경로는 점을 지나는 부드러운 곡선(Catmull-Rom)으로 그린다.

@@ -78,6 +78,8 @@ class Mat(object):
                           cv2.LINE_AA, shift=4)
         return img
 
+    floor_bgr = (90, 90, 90)      # 매트 밖 바닥 색. 실물 바닥은 테이프만큼 어두울 수 있음(run_sim --floor)
+
     def camera_view(self, pose, cam, out_w=320, out_h=240):
         """로봇 자세(x, y, th[rad])에서 앞 바닥을 비스듬히 본 영상(원근 포함)."""
         x, y, th = pose
@@ -93,4 +95,4 @@ class Mat(object):
         M = cv2.getPerspectiveTransform(dst, src)
         return cv2.warpPerspective(self.image, M, (out_w, out_h),
                                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                                   borderMode=cv2.BORDER_CONSTANT, borderValue=(90, 90, 90))
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(int(c) for c in self.floor_bgr))
