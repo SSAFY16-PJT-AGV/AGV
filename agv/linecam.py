@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
         "min_w_frac": 0.02,     # 라인 조각 최소/최대 폭(화면 폭 비율)
         "max_w_frac": 0.60,
         "gap_close_px": 4,      # 이보다 좁은 끊김은 이어 붙임
+        "border_drop_frac": 0.6,  # 화면 왼/오른쪽 끝에 붙은 어두운 조각이 스캔 줄의 이 비율 이상에 있고 그 줄들에
+                                  # 다른 라인 조각도 보이면 매트 밖 바닥으로 보고 뺀다(0이면 끔)
     },
     "junction": {
         "confirm_frames": 3,    # 조각 수 변화가 이만큼 이어져야 인정
@@ -150,6 +152,28 @@ class Analysis(object):
         self.patch_fracs = {}
         self.line_mask = None
         self.sat_rows = []      # 속도 보정용: 정해진 가로줄마다 채도 높은(패치) 픽셀 비율
+        self.dropped_sides = set()  # 매트 밖 바닥으로 보고 뺀 화면 쪽(left/right)
+
+
+def _offmat_sides(per_row, w, frac):
+    """매트 가장자리 밖 바닥이 화면 옆에 보이는지. 그 쪽 끝에 붙은 어두운 조각이 스캔 줄의 frac 이상에 있고,
+    그 줄들의 절반 이상에 끝에 안 붙은 조각(진짜 라인)도 같이 보이면 그 쪽을 뺀다.
+    라인이 급히 휘어 화면 옆으로 나갈 때는 다른 조각이 없으므로 빼지 않는다. 반환: {"left", "right"} 부분집합."""
+    out = set()
+    if not frac or not per_row:
+        return out
+    for side in ("left", "right"):
+        touch = 0
+        with_other = 0
+        for runs in per_row:
+            at = [r for r in runs if (r[0] <= 1 if side == "left" else r[1] >= w - 2)]
+            if at:
+                touch += 1
+                if len(runs) > len(at):
+                    with_other += 1
+        if touch >= frac * len(per_row) and with_other >= 0.5 * touch:
+            out.add(side)
+    return out
 
 
 def analyze(bgr, cfg):
@@ -166,10 +190,17 @@ def analyze(bgr, cfg):
     an.line_mask = mask
     ys = np.linspace(lc["roi_top"] * h, lc["roi_bottom"] * h, lc["rows"]).astype(int)
     min_w, max_w = lc["min_w_frac"] * w, lc["max_w_frac"] * w
+    per_row = []
     for y in ys:
         y0, y1 = max(0, y - 1), min(h, y + 2)
         band = mask[y0:y1].mean(axis=0) > 0.5
-        allruns = [(a, b) for a, b in _runs(band, lc["gap_close_px"]) if (b - a + 1) >= min_w]
+        per_row.append([(a, b) for a, b in _runs(band, lc["gap_close_px"]) if (b - a + 1) >= min_w])
+    drop = _offmat_sides(per_row, w, lc.get("border_drop_frac", 0.0))
+    an.dropped_sides = drop
+    for y, allruns in zip(ys, per_row):
+        if drop:
+            allruns = [(a, b) for a, b in allruns
+                       if not (("left" in drop and a <= 1) or ("right" in drop and b >= w - 2))]
         runs = [(a, b) for a, b in allruns if (b - a + 1) <= max_w]
         an.rows.append((int(y), [(a + b) / 2.0 for a, b in runs]))
         an.widths.append([float(b - a + 1) for a, b in runs])

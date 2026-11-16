@@ -87,6 +87,33 @@ class TestPerception(unittest.TestCase):
 
 
 @unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestOffMatFloor(unittest.TestCase):
+    """매트 가장자리 밖 어두운 바닥이 화면 옆에 보이면 라인으로 치지 않는다(실물 화면에서 생긴 문제)."""
+
+    @staticmethod
+    def _frame(floor=True, curve=False):
+        import cv2
+        import numpy as np
+        im = np.full((240, 320, 3), (150, 150, 160), np.uint8)            # 매트(실물처럼 좀 어두움)
+        if floor:
+            cv2.fillPoly(im, [np.array([[0, 0], [25, 0], [45, 240], [0, 240]])], (60, 58, 62))   # 바닥
+        if curve:
+            cv2.ellipse(im, (330, 240), (150, 180), 0, 180, 270, (30, 30, 30), 20)  # 오른쪽으로 나가는 곡선
+        else:
+            cv2.line(im, (175, 0), (175, 240), (30, 30, 30), 22)              # 검은 테이프
+        return im
+
+    def test_floor_at_left_edge_is_ignored(self):
+        an = analyze(self._frame(), DEFAULT_CONFIG)
+        self.assertEqual(an.dropped_sides, {"left"})
+        self.assertTrue(all(len(xs) == 1 and abs(xs[0] - 175) < 3 for _, xs in an.rows))
+
+    def test_line_leaving_frame_is_kept(self):
+        an = analyze(self._frame(floor=False, curve=True), DEFAULT_CONFIG)
+        self.assertEqual(an.dropped_sides, set())
+        self.assertTrue(all(len(xs) == 1 for _, xs in an.rows))
+
+
 class TestSimExploration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

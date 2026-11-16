@@ -111,6 +111,13 @@ def _speedcal(a, cfg):
     return None
 
 
+def _offmat_text(an):
+    sides = sorted(getattr(an, "dropped_sides", None) or [])
+    if not sides:
+        return u"-"
+    return u"화면 %s 끝의 어두운 바닥을 라인에서 뺌" % u"·".join({"left": u"왼쪽", "right": u"오른쪽"}[x] for x in sides)
+
+
 def _status_rows(a, runner, elapsed, left, right, fps):
     choice = runner.choice or u"-"
     return [
@@ -122,6 +129,7 @@ def _status_rows(a, runner, elapsed, left, right, fps):
         (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)
          + (u" (늘 %s)" % {"left": u"왼쪽", "right": u"오른쪽"}[runner.lap_side] if a.mode == "lap" else u"")),
         (u"패치", runner.patch.active or u"-"),
+        (u"매트 밖 바닥", _offmat_text(runner.last_an)),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
         (u"속도 보정", (u"%.0f mm/s (패치 %d번 보정)" % (runner.speed_mm_s, runner.cal.n)) if runner.cal.enabled
          else u"꺼짐 (%.0f mm/s 고정)" % runner.speed_mm_s),
