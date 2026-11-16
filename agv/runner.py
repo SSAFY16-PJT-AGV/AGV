@@ -8,6 +8,11 @@
     ask      자율 주행하되 갈림길에서 멈추고 사람에게 방향을 묻는다(분기 선택이 불안할 때).
     passive  모터를 쓰지 않는다. 손으로 밀거나 다른 프로그램으로 조종하면서 검출·기록만 한다.
              이동거리를 모르므로 odo_mm은 null(빌더가 시간 x 속도로 대신 계산).
+    lap      색 보정 전 첫 바퀴용. 갈림길은 늘 lap_side(기본 왼쪽)로, 급한 가지(V자)는 들어가지 않는다.
+             매트를 시계 방향으로 돌면 바깥 큰 고리가 왼쪽이라 패치를 다 지난다. 막다른 길에 들어가면
+             되돌아 나온다. 패치 색을 아직 모르므로 패치로 끝을 판단하지 않고, 갈라짐·합류·교차가
+             나온 순서와 간격이 앞에서와 똑같이 되풀이되면(= 한 바퀴를 돌아옴) 멈춘다(LapWatch).
+             색을 잡은 뒤의 확인 바퀴에도 쓴다(speedcal=True로 속도 보정을 켬).
 
 X자 교차 처리
     merge가 나면 바로 기록하지 않고 잠시 보류한다(pending). 보류 중 나온 패치·스퍼 이벤트도
@@ -51,7 +56,55 @@ from .linecam import Follower, JunctionTracker, PatchTracker, TeeTracker, analyz
 from .speedcal import SpeedCal
 from .topo import Explorer
 
-MODES = ("drive", "ask", "passive")
+MODES = ("drive", "ask", "passive", "lap")
+
+
+class LapWatch(object):
+    """색 없이 한 바퀴를 알아보기. 갈라짐(J)·합류(M)·교차(X) 이벤트의 종류와 간격이 앞에서 나온
+    어떤 구간과 k개 연속으로 똑같이 다시 나오고, 그 사이가 min_lap_mm 이상이면 한 바퀴를 돈 것으로 본다.
+    - 옆으로 짧게 나간 스퍼(tee)는 지날 때마다 보이기도 안 보이기도 해서 세지 않는다.
+    - 들어갔다 되돌아 나온 막다른 길의 갈라짐은 지운다(다음 바퀴엔 tee로 나옴).
+    - 앞부분에서 한두 개를 놓쳐도 되도록 처음 k개가 아니라 앞의 모든 구간과 비교한다.
+    반환: 한 바퀴 길이(mm) 또는 None."""
+
+    TOKENS = {"split": "J", "merge": "M", "cross": "X"}
+
+    def __init__(self, k=5, min_lap_mm=1500.0, tol_rel=0.15, tol_mm=80.0):
+        self.k, self.min_lap, self.tol_rel, self.tol_mm = k, min_lap_mm, tol_rel, tol_mm
+        self.seq = []
+
+    def add(self, type_, pos, fields=None):
+        if type_ == "dead_end":
+            if self.seq and self.seq[-1][0] == "J":
+                self.seq.pop()
+            return None
+        tok = self.TOKENS.get(type_)
+        if tok is None or pos is None:
+            return None
+        self.seq.append((tok, float(pos)))
+        k = self.k
+        n = len(self.seq)
+        if n < 2 * k:
+            return None
+        last = self.seq[-k:]
+        toks = [t for t, _ in last]
+        for i in range(0, n - 2 * k + 1):
+            win = self.seq[i:i + k]
+            lap = last[0][1] - win[0][1]
+            if lap < self.min_lap or [t for t, _ in win] != toks:
+                continue
+            ok = True
+            for j in range(k - 1):
+                g0 = win[j + 1][1] - win[j][1]
+                g1 = last[j + 1][1] - last[j][1]
+                if abs(g1 - g0) > max(self.tol_mm, self.tol_rel * abs(g0)):
+                    ok = False
+                    break
+            if ok:
+                return lap
+        return None
+
+
 OPP = {"left": "right", "right": "left"}
 RECOVER_DEFAULT = {
     "window_mm": 600,        # 갈림길에서 고른 뒤 이 거리 안에서 선이 끝나면 막다른 길
@@ -69,8 +122,13 @@ RECOVER_DEFAULT = {
 
 class ExploreRunner(object):
     def __init__(self, cfg, logger, mode="drive", explorer=None, ask_fn=None,
-                 speed_mm_s=150.0, robot_id="agv1", map_hint=None, trace_path=None):
+                 speed_mm_s=150.0, robot_id="agv1", map_hint=None, trace_path=None, lap_side="left",
+                 speedcal=None):
         assert mode in MODES
+        assert lap_side in ("left", "right")
+        self.lap_side = lap_side
+        self.lap = LapWatch() if mode == "lap" else None
+        self.lap_mm = None
         self.cfg = cfg
         self.log = logger
         self.mode = mode
@@ -80,6 +138,11 @@ class ExploreRunner(object):
         self.cal = SpeedCal(cfg, speed_mm_s)
         if mode == "passive":
             self.cal.enabled = False          # 손으로 밀 때는 모터 명령이 없음
+        if mode == "lap" and speedcal is None:
+            self.cal.enabled = False          # 첫 바퀴는 패치 색이 안 맞아 패치 가장자리를 믿을 수 없음
+        if speedcal is not None and mode != "passive":
+            self.cal.enabled = bool(speedcal)
+        self.speed0 = float(speed_mm_s)       # 한 바퀴 알아보기(LapWatch)는 속도 보정과 상관없는 거리로
         self.u = 0.0                          # 적분한 모터 명령(기본 속도로 달린 초)
         self.yaw_mm = 0.0                     # 좌우 명령 차이 적분(mm). 회전각 = yaw_mm / 실효 궤도 폭
         self.pivot_yaw_mm = 0.0               # 그중 제자리 회전 몫
@@ -152,9 +215,20 @@ class ExploreRunner(object):
         if ev.get("decision") is not None:
             ev["decision"]["seq"] = logged["seq"]
         p = ev["pos"]
+        if self.lap is not None:
+            # 모터 명령 적분(u) 기준 거리: 속도 보정으로 speed_mm_s가 바뀌어도 첫 바퀴와 간격이 같게
+            p_u = (self.u - (self.odo - p) / max(self.speed_mm_s, 1.0)) * self.speed0
+            lap = self.lap.add(ev["type"], p_u)
+            if lap is not None:
+                lap = lap * self.speed_mm_s / self.speed0     # 지금 속도 보정값으로 mm 환산
+                self.log.log("note", self._odo(), msg="lap_closed", lap_mm=round(lap, 1),
+                             tokens=u"".join(t for t, _ in self.lap.seq))
+                self.lap_mm = lap
+                self._finish("lap_closed")
+                return
         if ev["type"] == "patch":
             self.ex.on_patch(ev["fields"]["color"], p)
-            if self.ex.done and self.mode != "passive":
+            if self.ex.done and self.mode not in ("passive", "lap"):   # lap은 색을 아직 몰라 패치로 끝내지 않음
                 self._finish("explore_" + str(self.ex.done_reason))
         elif ev["type"] == "merge":
             self.ex.on_merge(p)
@@ -296,6 +370,8 @@ class ExploreRunner(object):
                         self.choice = suggestion
                     elif self.mode == "ask" and self.ask_fn is not None:
                         self.choice = self.ask_fn(suggestion) or suggestion
+                    elif self.mode == "lap":
+                        self.choice = self.lap_side
                     else:
                         self.choice = suggestion
                     self.choice_t = self.t
@@ -365,6 +441,8 @@ class ExploreRunner(object):
                     u"오른쪽" if side == "right" else u"왼쪽")) or suggestion
             except TypeError:
                 choice = self.ask_fn(suggestion) or suggestion
+        elif self.mode == "lap":
+            choice = "left" if side == "right" else "right"     # 급한 가지는 들어가지 않음
         else:
             choice = suggestion
         self.vee_mute_until = j_pos + 120.0

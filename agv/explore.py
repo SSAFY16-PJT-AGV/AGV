@@ -11,6 +11,10 @@
     # 3) 완전 자율 탐색(다 돌면 출발 패치에서 멈춤)
     python3 -m agv.explore --mode drive --enable-motors --record
 
+    # 색 보정 전 첫 바퀴: 갈림길은 늘 왼쪽(시계 방향이면 바깥 큰 고리), V자는 안 들어감,
+    # 한 바퀴 돌아온 것을 알아보면 스스로 멈춤. 녹화본으로 autocolor
+    python3 -m agv.explore --mode lap --enable-motors --record --view
+
     # 녹화 영상으로 검출만 다시 돌리기(노트북에서도 됨)
     python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4
 
@@ -95,6 +99,18 @@ def _note_camera_calib(cfg, logger, runner):
                date=d.get("date"), matches_camera=ok, matches_arm=w is None)
 
 
+def _speedcal(a, cfg):
+    if a.speedcal != "auto":
+        return a.speedcal == "on"
+    if a.mode == "lap":
+        on = bool(cfg["patch"].get("autocolor_at"))
+        msg = (u"켬(색 보정 %s)" % cfg["patch"]["autocolor_at"]) if on else \
+            u"끔(아직 색을 안 잡아서. 색 보정 뒤 확인 바퀴에서 켜짐)"
+        print(u"속도 보정: " + msg)
+        return on
+    return None
+
+
 def _status_rows(a, runner, elapsed, left, right, fps):
     choice = runner.choice or u"-"
     return [
@@ -103,7 +119,8 @@ def _status_rows(a, runner, elapsed, left, right, fps):
         (u"이동거리", u"%.0f mm" % runner.odo),
         (u"주행 상태", {"follow": u"라인 추종", "reverse": u"후진(막다른 길)",
                      "pivot": u"제자리 회전"}.get(runner.state, runner.state)),
-        (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)),
+        (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)
+         + (u" (늘 %s)" % {"left": u"왼쪽", "right": u"오른쪽"}[runner.lap_side] if a.mode == "lap" else u"")),
         (u"패치", runner.patch.active or u"-"),
         (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
         (u"속도 보정", (u"%.0f mm/s (패치 %d번 보정)" % (runner.speed_mm_s, runner.cal.n)) if runner.cal.enabled
@@ -114,7 +131,12 @@ def _status_rows(a, runner, elapsed, left, right, fps):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["passive", "ask", "drive"], default="passive")
+    ap.add_argument("--mode", choices=["passive", "ask", "drive", "lap"], default="passive",
+                    help="lap: 색 보정 전 첫 바퀴(갈림길은 늘 --lap-side 쪽, 한 바퀴 돌면 멈춤)")
+    ap.add_argument("--speedcal", choices=["auto", "on", "off"], default="auto",
+                    help="패치 속도 보정. auto: lap 모드는 색을 잡은 뒤(autocolor --write)에만 켬, 나머지 모드는 켬")
+    ap.add_argument("--lap-side", choices=["left", "right"], default="left",
+                    help="lap 모드에서 갈림길마다 고를 쪽. 매트를 시계 방향으로 돌면 left가 바깥 고리")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
@@ -122,7 +144,8 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="결과 폴더(기본 data/runs/<시각>)")
     ap.add_argument("--record", action="store_true", help="카메라 영상을 camera.mp4로 저장")
     ap.add_argument("--debug-every", type=int, default=20, help="N프레임마다 검출 그림 저장(0이면 끔)")
-    ap.add_argument("--max-time", type=float, default=600.0, help="최대 주행 시간(초)")
+    ap.add_argument("--max-time", type=float, default=None,
+                    help="최대 주행 시간(초). 기본 600, lap 모드는 240(한 바퀴를 못 알아봐도 멈추게)")
     ap.add_argument("--max-laps", type=int, default=6, help="출발 패치를 이만큼 지나면 강제 종료")
     ap.add_argument("--no-arm", action="store_true",
                     help="저장한 카메라 자세(arm.servo_angles)로 팔을 맞추지 않음(기본은 맞춤)")
@@ -136,6 +159,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
+    if a.max_time is None:
+        a.max_time = 240.0 if a.mode == "lap" else 600.0
     video_mode = a.camera.startswith("video:")
     if video_mode and a.mode != "passive":
         print(u"영상 재생은 passive 모드로만 돌려요.")
@@ -192,7 +217,8 @@ def main(argv=None):
     runner = ExploreRunner(cfg, logger, mode=a.mode, explorer=Explorer(max_laps=a.max_laps),
                            ask_fn=make_ask_fn(motors, view), speed_mm_s=rob["speed_mm_s"],
                            robot_id=rob.get("id", "agv1"), map_hint=None,
-                           trace_path=os.path.join(out, "trace.jsonl"))
+                           trace_path=os.path.join(out, "trace.jsonl"), lap_side=a.lap_side,
+                           speedcal=_speedcal(a, cfg))
     _note_camera_calib(cfg, logger, runner)
     if arm_res is not None:
         logger.log("note", runner._odo(), msg="arm_pose", saved=arm_res["saved"], pose=arm_res["pose"],
@@ -279,7 +305,13 @@ def main(argv=None):
         if a.show:
             cv2.destroyAllWindows()
     print(u"\n종료: %s" % runner.finish_reason)
-    print(u"맵 만들기: python3 mapping/build_map.py %s -o maps/<이름>.json" % os.path.join(out, "events.jsonl"))
+    if a.mode == "lap":
+        if runner.lap_mm:
+            print(u"한 바퀴를 돌아왔어요(한 바퀴 %.1fm)." % (runner.lap_mm / 1000.0))
+        print(u"색 보정: python3 -m agv.tools.autocolor %s" % out)
+        print(u"이 주행은 색이 안 맞은 상태라 맵을 만들지 않아요.")
+    else:
+        print(u"맵 만들기: python3 mapping/build_map.py %s -o maps/<이름>.json" % os.path.join(out, "events.jsonl"))
     return 0
 
 

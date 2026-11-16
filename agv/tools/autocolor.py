@@ -437,6 +437,7 @@ def main(argv=None):
                     user[sec]["colors"] = cols
                 else:
                     user[sec][k] = v
+        user.setdefault("patch", {})["autocolor_at"] = time.strftime("%Y-%m-%d %H:%M")   # 색을 잡았다는 표시
         with io.open(a.config, "w", encoding="utf-8") as f:
             f.write(json.dumps(user, ensure_ascii=False, indent=2) + u"\n")
         print(u"%s에 썼어요(원래 파일: %s)" % (a.config, bak))

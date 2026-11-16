@@ -39,7 +39,8 @@ class SimClock(object):
 def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         mode="drive", speed_err=0.05, slip=0.03, vmax_mm_s=500.0, track_mm=140.0,
         cfg_override=None, quiet=True, max_laps=8, raw_video=False, start_pose=None,
-        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None):
+        branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None,
+        speedcal=None):
     """speed_scale: 실제 속도 / 설정 속도를 이 값으로 고정(기본: 1 ± speed_err 무작위).
     speed_drift: 1분마다 실제 속도가 이 비율만큼 줄어듦(배터리 소모 흉내).
     turn_slip: 궤도 미끄러짐으로 회전이 덜 되는 비율(0.3이면 좌우 속도 차이로 계산한 회전의 70%만 돎.
@@ -57,7 +58,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
     runner = ExploreRunner(cfg, logger, mode=mode,
                            explorer=Explorer(max_laps=max_laps, branch_order=branch_order),
                            speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"],
-                           trace_path=os.path.join(out_dir, "trace.jsonl"))
+                           trace_path=os.path.join(out_dir, "trace.jsonl"), speedcal=speedcal)
     # 실제 속도는 설정값과 조금 다르다(속도 실측 오차 재현)
     true_scale = 1.0 + speed_err * (2 * rnd.rand() - 1)
     if speed_scale is not None:
@@ -143,6 +144,7 @@ def main():
     ap.add_argument("--mat", default=os.path.join(os.path.dirname(__file__), "mats", "ssafy_mat.json"))
     ap.add_argument("--out", default=os.path.join(ROOT, "data", "sim_run"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mode", default="drive", choices=["drive", "lap"], help="lap: 색 보정 전 첫 바퀴(늘 왼쪽)")
     ap.add_argument("--max-time", type=float, default=420.0)
     ap.add_argument("--video", action="store_true", help="카메라 시점+궤적 디버그 영상(run.mp4)")
     ap.add_argument("--raw-video", action="store_true", help="원본 카메라 영상(camera.mp4) - explore.py 재생 시험용")
@@ -159,7 +161,7 @@ def main():
     start = [float(v) for v in a.start.split(",")] if a.start else None
     ev, gt = run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, video=a.video, quiet=not a.verbose,
                  raw_video=a.raw_video, start_pose=start, speed_scale=a.speed_scale, speed_drift=a.speed_drift,
-                 turn_slip=a.turn_slip,
+                 turn_slip=a.turn_slip, mode=a.mode,
                  cfg_override={"patch": {"length_mm": a.patch_length}} if a.patch_length else None,
                  branch_order=("right", "left") if a.right_first else ("left", "right"))
     print("events:", ev)

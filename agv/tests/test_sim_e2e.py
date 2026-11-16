@@ -232,7 +232,9 @@ class TestAutoColor(unittest.TestCase):
         Mat.camera_view = warm
         try:
             lap = os.path.join(self.tmp, "lap")
-            run_sim.run(MAT_V2, lap, seed=3, max_time_s=75, raw_video=True)
+            # 현장 순서 그대로: 색이 안 맞는 상태에서 lap 모드로 한 바퀴(늘 왼쪽, 스스로 멈춤)
+            _, gt_lap = run_sim.run(MAT_V2, lap, seed=3, max_time_s=240, raw_video=True, mode="lap")
+            self.assertEqual(gt_lap["finish_reason"], "lap_closed")
             cap = cv2.VideoCapture(os.path.join(lap, "camera.mp4"))
             frames = []
             while True:
@@ -255,6 +257,32 @@ class TestAutoColor(unittest.TestCase):
         m = build_map([read_events(ev)])
         self.assertEqual(len([n for n in m["nodes"] if n["type"] == "patch"]), 6)
         self.assertTrue(m["explore"]["complete"])
+
+    def test_lap_mode_passes_all_patches(self):
+        """lap 모드: 갈림길마다 왼쪽, V자는 안 들어감 -> 바깥 큰 고리로 패치 여섯 개를 다 지나고,
+        갈라짐·합류·교차 순서가 되풀이되는 것을 보고 한 바퀴 남짓에서 멈춘다."""
+        import numpy as np
+        out = os.path.join(self.tmp, "lap")
+        ev, gt = run_sim.run(MAT_V2, out, seed=1, max_time_s=240, mode="lap", turn_slip=0.3, speed_scale=0.9)
+        self.assertEqual(gt["finish_reason"], "lap_closed")
+        P = np.array(gt["trajectory"])
+        passed = [p["color"] for p in gt["patches"] if np.min(np.hypot(*(P - np.array(p["center"])).T)) < 60]
+        self.assertEqual(sorted(passed), sorted(p["color"] for p in gt["patches"]))
+        lap = [e for e in read_events(ev) if e.get("msg") == "lap_closed"][0]["lap_mm"]
+        odo_true = gt["odo_true"][-1][1]
+        self.assertLess(odo_true, 2.0 * lap * 0.9)          # 두 바퀴 전에 멈춤(속도 보정 없이 설정 속도가 10% 큼)
+        self.assertFalse(any(e["type"] == "split" and e.get("vee") and e.get("choice") == e["vee"].get("side")
+                             for e in read_events(ev)))        # V자로 들어가지 않음
+
+    def test_lap_mode_with_speedcal(self):
+        """색을 잡은 뒤 확인 바퀴: 속도 보정이 켜져 속도 추정이 중간에 20% 바뀌어도 한 바퀴를 알아본다."""
+        ev, gt = run_sim.run(MAT_V2, os.path.join(self.tmp, "lap2"), seed=2, max_time_s=240, mode="lap",
+                             speedcal=True, speed_scale=0.8, cfg_override={"patch": {"length_mm": 159.3}})
+        self.assertEqual(gt["finish_reason"], "lap_closed")
+        E = read_events(ev)
+        self.assertGreaterEqual(sum(e.get("msg") == "speed_cal" and e.get("ok", True) for e in E), 3)
+        lap = [e for e in E if e.get("msg") == "lap_closed"][0]["lap_mm"]
+        self.assertAlmostEqual(lap / 4250.0, 1.0, delta=0.08)   # ssafy_v2 바깥 고리 약 4.25m
 
     def test_names_follow_hue_order(self):
         from agv.tools.autocolor import _assign_names, _range_center

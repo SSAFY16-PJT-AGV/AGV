@@ -36,15 +36,15 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - 확인: `python3 -m agv.tools.camtool snap` → `data/snap/debug.png`. `full.png`(원본 해상도)도 같이 저장된다. 검출 그림과 HSV 측정은 주행 해상도인 `raw.png` 기준이다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
 2. **색 자동으로 잡기**: 맵을 한 바퀴 도는 영상에서 패치 색 범위를 자동으로 잡는다. 라인 추종은 검은 선만 보므로 색이 안 맞아도 로봇이 직접 돌 수 있다.
-   - `python3 -m agv.explore --mode ask --enable-motors --record --view`로 한 바퀴 돈다. 갈림길에서는 바깥쪽 큰 고리를 골라 모든 패치를 한 번씩 지나게 한다(고를 쪽은 `FIELD_TEST.md` 2단계). 이 주행의 패치 검출은 틀려도 상관없고 영상만 있으면 된다. 주황으로 돌아오면 Ctrl+C로 멈춘다.
-   - 모터가 준비되지 않았거나 선을 못 따라가면 대신 `--mode passive`로 로봇을 손으로 밀어 한 바퀴 녹화한다.
+   - `python3 -m agv.explore --mode lap --enable-motors --record --view`로 한 바퀴 돈다. 매트에 시계 방향으로 놓으면 갈림길마다 왼쪽(바깥 큰 고리)으로 가고 V자는 들어가지 않아 모든 패치를 한 번씩 지난다. 갈라짐·합류·교차의 순서와 간격이 되풀이되는 것을 보고 한 바퀴를 알아본 뒤 스스로 멈춘다(못 알아보면 240초). 반시계 방향이면 `--lap-side right`. 이 주행의 패치 검출은 틀려도 상관없고 영상만 있으면 된다.
+   - `lap`이 엉뚱한 쪽으로 가면 `--mode ask`로 갈림길을 직접 고른다(고를 쪽은 `FIELD_TEST.md` 2단계). 모터가 준비되지 않았거나 선을 못 따라가면 `--mode passive`로 로봇을 손으로 밀어 한 바퀴 녹화한다.
    - 처음 바퀴를 굴리기 전에 앞으로 가는지 확인한다. 바퀴 방향이 반대면 `robot.invert_left/right`를 고친다.
    - `python3 -m agv.tools.autocolor data/runs/<시각>` → 색마다 새 H 범위, 바꿀 문턱, **그 영상에서 잡히는 패치 순서(기존 설정 vs 새 설정)**가 나온다. `autocolor.png`에서 이름표와 실제 패치 사진이 맞는지 본다.
    - 괜찮으면 `--write`를 붙여 다시 실행한다. `config/explore.json`에 쓰고 원래 파일은 `.bak-<시각>`으로 남는다. 라인 문턱(`line.v_max` 등)은 지금 값이 안전한 범위면 그대로 둔다.
    - 조명이 바뀌면(낮/밤, 다른 강의실) 한 바퀴 다시 찍어 돌리면 된다. 녹화 없이 `--camera gst --seconds 60`으로 카메라에서 바로 찍을 수도 있다.
    - 이름은 무지개 순서(빨강→주황→노랑→초록→파랑→보라)로 붙인다. 매트에 일부 색만 있으면 `--colors red,blue,...`로 알려 준다. 바닥·신발 같은 다른 색이 잡히면 화면에 안 들어오게 다시 찍는다.
    - 손으로 재야 할 때: `snap` 후 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`.
-3. **검출 확인**: 보정한 색으로 한 바퀴 더 돈다(`--mode ask --enable-motors --record`, 모터 없이 보려면 `--mode passive`로 손으로 밀기).
+3. **검출 확인**: 보정한 색으로 한 바퀴 더 돈다(`--mode lap --enable-motors --record`, 모터 없이 보려면 `--mode passive`로 손으로 밀기). 색을 잡은 뒤(`autocolor --write`)에는 `lap` 모드도 패치 속도 보정을 켠다(`--speedcal on/off`로 바꿀 수 있음).
    - 터미널에 `patch`(맵의 색 전부), `split`, `merge` 이벤트가 찍혀야 한다.
    - 결과 폴더의 `debug/*.jpg`에서 검출 상태를, `camera.mp4`로는 노트북에서 다시 돌려 볼 수 있다: `python3 -m agv.explore --camera video:<폴더>/camera.mp4`
 4. **패치 길이 재기**: 색 패치의 진행 방향 길이를 자로 한 번 재서 `patch.length_mm`에 넣는다(패치는 모두 같은 크기). 그러면 주행 중 패치를 지날 때마다 실제 속도를 다시 재서 이동거리를 보정한다. 배터리가 닳아 느려지거나 바닥이 바뀌어도 따라간다. `robot.speed_mm_s`는 첫 패치를 지나기 전까지만 쓰는 짐작값이라 기본값(150)으로 둬도 된다. 바퀴 방향이 반대면 `robot.invert_left/right`를 고친다.
