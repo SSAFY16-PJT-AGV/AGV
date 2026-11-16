@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
         "edge_frac": 0.3,       # 라인을 놓치기 직전 위치가 화면 왼/오른쪽 이 비율 안이면 급커브로 화면 밖에
                                 # 나간 것: 그쪽으로 제자리 회전하며 찾는다
         "search_timeout_s": 4.0,  # 그렇게 찾는 최대 시간(그 뒤 정지)
+        "min_track": 0.0,       # 라인을 따라갈 때 안쪽 궤도 명령의 하한(0이면 끔). 0.2쯤 주면 양쪽이 같이 밀며 크게 돈다
         "track_jump_frac": 0.2,   # 바로 앞 프레임에 라인을 봤으면, 화면 폭의 이 비율보다 먼 조각으로는 안 넘어감
         "min_w_k": 0.3,           # 라인 폭(조향 줄)의 이 배보다 가는 조각은 라인이 아님(패치 가장자리의 가는 어두운 띠 등)
     },
@@ -628,8 +629,15 @@ class Follower(object):
         turn = self.c["kp"] * err + self.c["kd"] * d
         base = self.c["base_speed"] * max(0.4, 1.0 - self.c["slow_k"] * abs(err))
         m = self.c["max_cmd"]
-        left = max(-m, min(m, base + turn))
-        right = max(-m, min(m, base - turn))
+        left, right = base + turn, base - turn
+        lo = self.c.get("min_track", 0.0)
+        if lo and min(left, right) < lo:
+            # 안쪽 궤도를 거의 세우면 바깥 궤도 혼자 차체를 비틀어야 해서 실물에서 멈췄다.
+            # 좌우 차이(회전 정도)는 그대로 두고 둘 다 올려 양쪽이 같이 밀며 돌게 한다
+            up = lo - min(left, right)
+            left, right = left + up, right + up
+        left = max(-m, min(m, left))
+        right = max(-m, min(m, right))
         return left, right
 
 
