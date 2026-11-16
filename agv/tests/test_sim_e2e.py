@@ -22,6 +22,8 @@ except ImportError:  # Jetson에 sim/mat/이 없으면 건너뜀
 
 from agv.linecam import DEFAULT_CONFIG, JunctionTracker, PatchTracker, analyze  # noqa: E402
 from agv.topo import build_map, read_events  # noqa: E402
+from agv.runner import STALL_DEFAULT  # noqa: E402
+STALL_MAX_OUT = STALL_DEFAULT["max_out"]
 
 MAT = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_mat.json")
 MAT_V2 = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2_fix.json")
@@ -131,7 +133,7 @@ class TestLostLineAtCorner(unittest.TestCase):
 
     def _cfg(self):
         from agv.linecam import merge_config
-        return merge_config(DEFAULT_CONFIG, {})
+        return merge_config(DEFAULT_CONFIG, {"stall": {"enabled": False}})   # 그린 화면은 회전해도 안 바뀜
 
     def test_follower_ignores_floor_after_line_leaves(self):
         from agv.linecam import Follower
@@ -216,6 +218,44 @@ class TestLostLineAtCorner(unittest.TestCase):
             for _ in range(21):
                 r.step(self._frame(None, floor=False), 0.05)
             self.assertTrue(r.finished)                                            # 1초 뒤 정지
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestStallGuard(unittest.TestCase):
+    """도는 명령인데 화면이 그대로면(실물에서 회전 중 궤도가 멈춤) 출력을 올린다. 직진·움직이는 화면에서는 안 올림."""
+
+    def _frames(self, moving):
+        import numpy as np
+        rnd = np.random.RandomState(0)
+        base = rnd.randint(90, 160, (240, 320, 3)).astype(np.uint8)
+        for i in range(40):
+            yield np.roll(base, 6 * i, axis=1) if moving else base
+
+    def test_boost_only_when_turning_and_static(self):
+        from agv.runner import STALL_DEFAULT, StallGuard
+        for moving, cmd, expect in ((False, (0.45, -0.07), True), (True, (0.45, -0.07), False),
+                                    (False, (0.3, 0.3), False)):
+            g = StallGuard(dict(STALL_DEFAULT))
+            b = [g.update(f, cmd) for f in self._frames(moving)][-1]
+            self.assertEqual(b > 1.3, expect, (moving, cmd, b))
+
+    def test_runner_scales_output_but_not_odometry(self):
+        import numpy as np
+        from agv.runner import ExploreRunner
+        from agv.topo import EventLogger, Explorer
+        tmp = tempfile.mkdtemp()
+        try:
+            ev = os.path.join(tmp, "e.jsonl")
+            r = ExploreRunner(DEFAULT_CONFIG, EventLogger(ev, echo=False), mode="drive", explorer=Explorer())
+            im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+            import cv2
+            cv2.line(im, (300, 240), (300, 0), (25, 25, 25), 22)          # 선이 오른쪽 끝: 크게 오른쪽으로 꺾는 명령
+            outs = [r.step(im, 0.05) for _ in range(40)]
+            self.assertGreater(outs[-1][0], r.last_cmd[0] * 1.3)          # 실제로 낸 명령은 올라감
+            self.assertLessEqual(outs[-1][0], STALL_MAX_OUT)
+            r._finish("test")
+            self.assertIn("stall_boost", [json.loads(l).get("msg") for l in open(ev)])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

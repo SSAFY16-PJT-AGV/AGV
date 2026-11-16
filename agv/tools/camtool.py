@@ -415,6 +415,29 @@ def cmd_speed(a, cfg):
     return 0
 
 
+def cmd_turn(a, cfg):
+    """회전 힘 확인: 한쪽 궤도만(또는 제자리) 출력을 단계별로 올리며 1초씩 돈다. 언제부터 실제로 도는지 본다."""
+    if not a.enable_motors:
+        print(u"로봇이 제자리에서 돌아요. 주변을 비우고 --enable-motors를 붙여 다시 실행하세요.")
+        return 2
+    m = make_motors(cfg)
+    steps = [round(0.3 + 0.1 * i, 1) for i in range(6)]
+    print(u"%s: 출력 %s를 1초씩 차례로 냅니다. 실제로 돌기 시작한 값을 적어 두세요." % (
+        u"제자리 회전(좌 +, 우 -)" if a.pivot else u"오른쪽으로 꺾기(왼쪽 궤도만)", u", ".join("%.1f" % v for v in steps)))
+    time.sleep(2.0)
+    try:
+        for v in steps:
+            print(u"  출력 %.1f" % v)
+            m.set(v, -v if a.pivot else 0.0)
+            time.sleep(a.seconds)
+            m.stop()
+            time.sleep(1.0)
+    finally:
+        m.stop()
+    print(u"돌기 시작한 값이 0.6보다 크면 궤도가 바닥에 너무 비비는 것(배터리·궤도 장력·매트 표면 확인).")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
@@ -450,6 +473,10 @@ def main(argv=None):
     sp = sub.add_parser("speed")
     sp.add_argument("--seconds", type=float, default=4.0)
     sp.add_argument("--enable-motors", action="store_true")
+    tu = sub.add_parser("turn", help="회전에 필요한 모터 출력 확인")
+    tu.add_argument("--pivot", action="store_true", help="한쪽만 말고 제자리 회전(양쪽 반대로)")
+    tu.add_argument("--seconds", type=float, default=1.0)
+    tu.add_argument("--enable-motors", action="store_true")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.cmd == "snap":
@@ -464,6 +491,8 @@ def main(argv=None):
         return cmd_ground(a, cfg)
     if a.cmd == "speed":
         return cmd_speed(a, cfg)
+    if a.cmd == "turn":
+        return cmd_turn(a, cfg)
     ap.print_help()
     return 1
 

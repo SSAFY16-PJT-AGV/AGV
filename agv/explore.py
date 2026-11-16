@@ -140,7 +140,8 @@ def _status_rows(a, runner, elapsed, left, right, fps):
         (u"패치", runner.patch.active or u"-"),
         (u"매트 밖 바닥", _offmat_text(runner.last_an)),
         (u"라인 놓침", _lost_text(runner)),
-        (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
+        (u"모터 L / R", u"%.2f / %.2f" % (left, right)
+         + (u" (회전 중 멈춤 -> 출력 x%.2f)" % runner.stall.boost if runner.stall.boost > 1.01 else u"")),
         (u"속도 보정", (u"%.0f mm/s (패치 %d번 보정)" % (runner.speed_mm_s, runner.cal.n)) if runner.cal.enabled
          else u"꺼짐 (%.0f mm/s 고정)" % runner.speed_mm_s),
         (u"처리 속도", u"%.1f fps" % fps if fps else u"-"),

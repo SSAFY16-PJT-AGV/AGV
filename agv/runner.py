@@ -51,6 +51,8 @@ X자 교차 처리
 import collections
 import io
 import json
+import cv2
+import numpy as np
 
 from .linecam import Follower, JunctionTracker, PatchTracker, TeeTracker, analyze
 from .speedcal import SpeedCal
@@ -103,6 +105,64 @@ class LapWatch(object):
             if ok:
                 return lap
         return None
+
+
+class StallGuard(object):
+    """돌라고 명령하는데 화면이 그대로면(궤도가 미끄러지지 못하고 모터가 멈춤) 모터 출력을 조금씩 올린다.
+
+    실물 주행 세 번 모두, 바깥 궤도 0.4~0.6 / 안쪽 궤도 -0.2~0.1로 도는 명령에서 로봇이 멈춰 있었다
+    (화면 변화가 정지 상태 수준). 직진(0.3/0.3)은 잘 갔다. 궤도 차량은 제자리·급회전에서 바닥과 비벼야 해서
+    힘이 더 든다. 좌우 명령 차이가 클 때만 본다(곧은 선 위 직진은 화면이 거의 안 바뀌어도 정상)."""
+
+    def __init__(self, c):
+        self.c = c
+        self.prev = None
+        self.hist = []
+        self.boost = 1.0
+        self.stalled = False
+
+    def motion(self, frame):
+        g = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (80, 60), interpolation=cv2.INTER_AREA)
+        g = g.astype(np.float32)
+        d = None if self.prev is None else float(np.abs(g - self.prev).mean())
+        self.prev = g
+        return d
+
+    def update(self, frame, cmd):
+        """frame: 이번 프레임(직전 명령의 결과), cmd: 직전 명령. 반환: 이번 명령에 곱할 배율."""
+        c = self.c
+        d = self.motion(frame)
+        if not c.get("enabled", True) or d is None:
+            return self.boost
+        turning = abs(cmd[0] - cmd[1]) >= c["turn_diff"] and max(abs(cmd[0]), abs(cmd[1])) >= c["min_cmd"]
+        if not turning:
+            self.hist = []
+            self.stalled = False
+            self.boost = max(1.0, self.boost - c["down"])
+            return self.boost
+        self.hist = (self.hist + [d])[-c["frames"]:]
+        med = float(np.median(self.hist))
+        if len(self.hist) >= c["frames"] and med < c["motion_thr"]:
+            self.stalled = True
+            self.boost = min(c["max_boost"], self.boost + c["up"])
+        else:
+            self.stalled = False
+            if med >= 1.5 * c["motion_thr"]:
+                self.boost = max(1.0, self.boost - c["down"])
+        return self.boost
+
+
+STALL_DEFAULT = {
+    "enabled": True,
+    "turn_diff": 0.2,       # 좌우 명령 차이가 이 이상일 때만 멈춤을 본다
+    "min_cmd": 0.15,
+    "frames": 10,           # 이만큼(0.5초) 화면 변화 중앙값이
+    "motion_thr": 0.3,      # 이보다 작으면 멈춘 것(80x60 회색 평균 밝기 차. 멈춤 0.05~0.3, 움직임 0.5 이상)
+    "up": 0.05,             # 멈춰 있는 동안 프레임마다 배율을 이만큼 올림
+    "down": 0.01,           # 움직이면 프레임마다 이만큼 내림(필요한 힘 근처에 머물게 천천히)
+    "max_boost": 1.8,
+    "max_out": 0.95,        # 올린 뒤 모터 명령 최댓값
+}
 
 
 OPP = {"left": "right", "right": "left"}
@@ -176,6 +236,11 @@ class ExploreRunner(object):
         self.lost_s = 0.0
         self.lost_logged = False
         self.search_side = None     # 라인을 찾아 제자리 회전 중인 방향
+        sc = dict(STALL_DEFAULT)
+        sc.update(cfg.get("stall") or {})
+        self.stall = StallGuard(sc)
+        self._sent = (0.0, 0.0)     # 직전 프레임에 낸 명령(배율 적용 전)
+        self._stall_logged = False
         self.finished = False
         self.finish_reason = None
         self.last_an = None
@@ -275,6 +340,12 @@ class ExploreRunner(object):
         if self.finished:
             return 0.0, 0.0
         was_pivot = self.state == "pivot"
+        boost = self.stall.update(frame, self._sent) if self.mode != "passive" else 1.0
+        if self.stall.stalled and not self._stall_logged and boost >= 1.2:
+            self._stall_logged = True
+            self.log.log("note", self._odo(), msg="stall_boost", boost=round(boost, 2), cmd=[round(v, 2) for v in self._sent])
+        elif not self.stall.stalled:
+            self._stall_logged = False
         left, right = self._step(frame, dt)
         # 이번 명령이 제자리 회전인지(막다른 길 복귀 회전, 라인 찾기 회전): 회전 궤도폭을 따로 추정함
         pivot = was_pivot or (self.search_side is not None and self.lost_s > 0)
@@ -284,6 +355,10 @@ class ExploreRunner(object):
             if pivot:
                 self.pivot_yaw_mm += dy
         self._write_trace()
+        self._sent = (left, right)
+        if boost > 1.0 and (left or right):
+            m = self.stall.c["max_out"]
+            return max(-m, min(m, left * boost)), max(-m, min(m, right * boost))
         return left, right
 
     def _write_trace(self):
