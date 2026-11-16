@@ -8,6 +8,7 @@
 --video면 run.mp4(카메라 시점 + 위에서 본 궤적).
 """
 import argparse
+import io
 import json
 import math
 import os
@@ -81,6 +82,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         raw = cv2.VideoWriter(os.path.join(out_dir, "camera.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                               int(round(1 / dt)), (320, 240))
     t = 0.0
+    # 프레임마다 실제 자세(trace.jsonl 줄과 1:1). 도안으로 맵 좌표를 만들 때 씀(mapping/design_map.py)
+    truth = io.open(os.path.join(out_dir, "truth.jsonl"), "w", encoding="utf-8")
     while t < max_time_s and not runner.finished:
         frame = mat.camera_view((x, y, th), CAM)
         frame = np.clip(frame.astype(np.int16) + rnd.normal(0, 4, frame.shape), 0, 255).astype(np.uint8)
@@ -97,6 +100,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         th -= w * dt
         x += v * math.cos(th) * dt
         y += v * math.sin(th) * dt
+        truth.write(u'[%.1f,%.1f,%.5f]\n' % (x, y, th))    # trace.jsonl i번째 줄(이번 명령 뒤 odo)과 짝
         dist += abs(v) * dt
         t += dt
         clock.t += dt
@@ -120,6 +124,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
             vw.write(canvas)
     if not runner.finished:
         runner.stop("sim_timeout")
+    truth.close()
     logger.close()
     if vw is not None:
         vw.release()

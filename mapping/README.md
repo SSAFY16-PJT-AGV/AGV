@@ -1,6 +1,25 @@
 # mapping/ — 맵 생성(팀 공통 형식 agv-map-v1)과 디버그 뷰어
 
-## 맵 만들기
+## 실제 매트 맵: `maps/mat_ssafy_v2.json` (도안으로 만듦, 지금 쓰는 맵)
+
+2m × 1m 매트(2026-11-06 도안 그대로)의 맵이다. 목표 패치로 가기(goto), 서버 경로 계획, 디지털 트윈에서 실물 매트를 보여 줄 때 이 파일을 쓴다. 로봇이 탐색해 맵을 만드는 일(아래 "탐색 로그로 맵 만들기")은 실물 시험이 오래 걸려 뒤로 미뤘다.
+
+```
+python3 mapping/design_map.py sim/mat/mats/ssafy_v2.json -o maps/mat_ssafy_v2.json [--twin <트윈 프로젝트 폴더>]
+```
+
+- 노드 종류와 연결(갈라짐 좌우, 합류 입력, 교차, 스퍼)은 로봇이 그 매트에서 알아보는 것과 같아야 goto의 위치 추적이 맞는다. 그래서 도안을 시뮬레이터에서 탐색시켜(로봇과 같은 인식 코드) 위상을 만든다.
+- 좌표와 곡선은 추정하지 않고 도안 정답으로 채운다(`pos_source: "design"`).
+  - 패치: 도안의 패치 가운데. 스퍼 끝: 도안의 선 끝
+  - 갈라짐·합류·교차: 로봇이 그 노드를 알아본 자리(도안 분기점보다 몇 cm 뒤일 수 있음. 엣지 길이와 맞추려고 일부러 옮기지 않음)
+  - 엣지 곡선: 시뮬레이터 로봇이 실제로 지나간 길(선 위)
+  - 엣지 길이: 노드를 알아본 지점 사이 주행 거리(탐색 맵과 같은 기준). 스퍼는 패치 가운데에서 선 끝까지
+- 원점은 주황 패치 가운데, +x는 그 패치를 지나는 진행 방향(도안의 위 선 방향), +y는 진행 방향 오른쪽.
+- 경고 3개(합류 누락 보정 2, 보라 뒤 렌즈 분기가 `S2`·`T1` 두 노드로 나뉨)는 시뮬레이터 탐색에서 늘 같게 나오는 것이고, 로봇도 같은 곳을 같은 식으로 본다고 보고 그대로 둔다.
+- **실제 매트가 도안과 다르면**(줄자로 잰 값) `sim/mat/mats/gen_ssafy_v2.py`의 숫자를 고쳐 도안을 다시 만들고(`python3 sim/mat/mats/gen_ssafy_v2.py`) 이 명령을 다시 돌린다. 노트북용(opencv-python, numpy).
+- 1~2분 걸린다(난수 여섯 개로 탐색해 경고가 가장 적은 결과를 고름. `--seeds 1`이면 한 번만).
+
+## 탐색 로그로 맵 만들기
 
 ```
 python3 mapping/build_map.py data/runs/<시각>/events.jsonl [다른 주행 로그 ...] -o maps/<이름>.json --map-id <이름>
@@ -36,7 +55,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 - **표시**: 색 패치는 실제 색 사각형, 갈라짐은 ◆, 합쳐짐은 ●, 미탐색 가지는 점선으로 그린다. 검출 누락으로 보고 뺀 엣지는 붉은 점선이다. 스퍼 끝(destination) 노드는 따로 그리지 않고 패치 옆 짧은 선으로 그린다.
 - **패널**: 요약, 경고, 선택한 노드·엣지의 값, 엣지 표, 이벤트 로그(`debug.events`)를 보여 준다. 이벤트 행을 누르면 그 관측이 묶인 노드가 선택된다. 노드 식별이 이상할 때 여기서 원인을 찾는다.
 - **배경 사진**: 매트를 위에서 찍어 반듯하게 편 사진을 깔고, 폭과 위치를 mm로 맞춘 뒤 노드를 끌어 비교한다.
-- 로컬 서버로 열면 주소로 바로 불러올 수 있다: `python3 -m http.server` 후 `http://localhost:8000/mapping/viewer/?map=../../maps/sim_ssafy_v2.json`
+- 로컬 서버로 열면 주소로 바로 불러올 수 있다: `python3 -m http.server` 후 `http://localhost:8000/mapping/viewer/?map=../../maps/mat_ssafy_v2.json`
 
 ## 맵 JSON 형식 (agv-map-v1)
 
@@ -116,7 +135,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 
 패치 바로 앞 합쳐짐을 어느 바퀴에서 놓치면 그 선이 패치로 바로 들어오는 엣지가 생긴다. 합쳐짐에서 패치까지가 150mm 안이고 합쳐짐으로 들어오는 선이 하나뿐이면 그 엣지를 합쳐짐에 잇고 경고를 남긴다(반대로 달릴 때 그 자리 갈라짐의 가지를 알아야 해서).
 
-**맵 전체**: `pos_source`(`odometry` = 주행 궤적으로 계산, `estimated` = 길이로 추정한 배치, `measured` = 실측), `shape_fit`(모양 계산 요약. 아래 표), `one_way`(`--one-way`로 만든 맵이면 true), `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
+**맵 전체**: `pos_source`(`design` = 매트 도안 좌표, `odometry` = 주행 궤적으로 계산, `estimated` = 길이로 추정한 배치, `measured` = 실측), `design`(도안으로 만든 맵이면 도안 파일·고정한 노드), `shape_fit`(모양 계산 요약. 아래 표), `one_way`(`--one-way`로 만든 맵이면 true), `explore.unexplored`(한쪽 가지만 가 본 갈라짐), `warnings`, `debug.events`(관측 하나하나가 어느 노드로 묶였는지. `--no-debug`로 뺄 수 있음).
 
 아직 정하지 않은 것(트윈·서버 담당과 합의): 설계 문서의 단위(mm)를 m로 맞출지, 선반·벽·구역 필드(설계 문서 4장)를 어떻게 얹을지. 진행 중인 통일안은 `docs/mapping/map-schema.md`(PR #41).
 

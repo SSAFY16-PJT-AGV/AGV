@@ -412,7 +412,7 @@ def _simplify(pts, tol):
     return left[:-1] + _simplify(pts[bi:], tol)
 
 
-def _traversal_path(sol, v, w, pa_opt, pb_opt):
+def _traversal_path(sol, v, w, pa_opt, pb_opt, blend_mm=100.0):
     """방문 v(떠난 프레임) -> w(도착 프레임) 궤적을 최적화된 양 끝 자세에 맞게 옮기고 편다."""
     np = _np()
     traj = sol["trajs"][v["run"]]
@@ -428,14 +428,162 @@ def _traversal_path(sol, v, w, pa_opt, pb_opt):
     c, s = math.cos(dth), math.sin(dth)
     R = np.array([[c, -s], [s, c]])
     P = (pts[:, :2] - rv[:2]).dot(R.T) + pa_opt[:2]
-    # 끝점 오차를 거리 비율로 나눠 편다
+    # 끝점 오차: 도착 쪽은 쌓인 적분 오차라 거리 비율로 나눠 펴고, 출발 쪽은 짧게(blend_mm) 잇는다.
+    # 출발 쪽 차이는 대부분 실제 모양(스퍼에 들어갔다 후진해 나온 자리에서 다시 출발 등)이라 멀리 퍼뜨리지 않음
     seg = np.hypot(*np.diff(P, axis=0).T)
-    sfrac = np.concatenate([[0.0], np.cumsum(seg)])
-    sfrac = sfrac / sfrac[-1] if sfrac[-1] > 1e-9 else np.linspace(0, 1, len(P))
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    sfrac = s / s[-1] if s[-1] > 1e-9 else np.linspace(0, 1, len(P))
+    blend = max(1e-6, min(blend_mm, s[-1] / 2.0))
+    w0 = np.clip(1.0 - s / blend, 0.0, 1.0)
     start_err = pa_opt[:2] - P[0]
+    P = P + np.outer(w0, start_err)
     end_err = pb_opt[:2] - P[-1]
-    P = P + np.outer(1 - sfrac, start_err) + np.outer(sfrac, end_err)
+    P = P + np.outer(sfrac, end_err)
     return P
+
+
+def _assemble(m, runs, visits, X0, trajs, cp, same, origin, o, snap=None, fix_heading=None):
+    """방문 자세(X0)와 궤적(trajs)으로 노드 좌표·진행 방향·엣지 곡선·스퍼 끝을 만든다.
+    snap: {노드: (x, y)} 이 좌표로 노드를 고정(도안 좌표). fix_heading: {노드: (ux, uy)} 진행 방향 고정.
+    좌표계는 원점 노드 (0, 0), 진행 방향 +x로 맞춘다."""
+    np = _np()
+    sol = {"trajs": trajs}
+    # 패치 방문은 패치 가운데(이벤트 지점 + cp)를 지나는 순간으로 옮긴다. 노드 좌표·엣지 곡선이 가운데 기준
+    orig = visits
+    visits = [dict(v) for v in visits]
+    X = X0.copy()
+    for k, v in enumerate(visits):
+        if v["type"] != "patch":
+            continue
+        r = runs[v["run"]]
+        cands = r.crossings(v["d"] + cp)
+        end = orig[v["next"]]["fi"] if v["next"] is not None else float("inf")
+        fi = next((c for c in cands if c >= v["fi"]), None)
+        if fi is None or fi >= end:
+            continue
+        # 패치 위에서 스퍼로 잘못 들어갔다 나온 경우까지: 다음 방문 전 마지막으로 가운데를 지난 프레임
+        dep = [c for c in cands if fi <= c < end][-1]
+        traj = sol["trajs"][v["run"]]
+        X[k] = _compose(X0[k], _rel(_interp(traj, v["fi"]), _interp(traj, fi)))
+        v["fi"], v["dep"] = fi, dep
+
+    # 노드에서 막다른 길로 들어갔다 후진해 나왔으면, 엣지 곡선은 후진이 끝난 뒤(마지막 전진 시작)부터
+    for k, v in enumerate(visits):
+        r = runs[v["run"]]
+        end = visits[v["next"]]["fi"] if v["next"] is not None else len(r.o) - 1
+        a, b = int(math.ceil(v["dep"])), int(math.floor(end))
+        if b - a < 3:
+            continue
+        seg = r.o[a:b + 1]
+        back = np.nonzero(np.diff(seg) < -0.5)[0]          # 후진한 프레임
+        if len(back) and seg[:back[-1] + 1].max() - seg[back[-1] + 1] > 20.0:
+            v["dep"] = float(a + back[-1] + 1)
+
+    # 노드 좌표 = 방문 위치 평균(튀는 방문은 빼고)
+    pos, heading = {}, {}
+    for nid, ks in same.items():
+        P = X[ks, :2]
+        med = np.median(P, axis=0)
+        d = np.hypot(*(P - med).T)
+        keep = d <= max(3 * o["sigma_same_xy"], 3 * float(np.median(d)) + 1e-9)
+        pos[nid] = tuple(float(v) for v in P[keep].mean(axis=0))
+        if snap and nid in snap:
+            pos[nid] = (float(snap[nid][0]), float(snap[nid][1]))
+        ux = float(np.mean(np.cos(X[ks, 2])))
+        uy = float(np.mean(np.sin(X[ks, 2])))
+        L = math.hypot(ux, uy) or 1.0
+        heading[nid] = (ux / L, uy / L)
+
+    for nid, h in (fix_heading or {}).items():
+        if nid in heading:
+            L = math.hypot(h[0], h[1]) or 1.0
+            heading[nid] = (h[0] / L, h[1] / L)
+    # 설계 문서 좌표계: 원점 노드가 (0, 0), 원점을 지나는 진행 방향이 +x
+    if origin in pos:
+        ox, oy = pos[origin]
+        hx, hy = heading[origin]
+        ang = math.atan2(hy, hx)
+        c, s = math.cos(-ang), math.sin(-ang)
+        R = np.array([[c, -s], [s, c]])
+        X = X.copy()
+        X[:, :2] = (X[:, :2] - [ox, oy]).dot(R.T)
+        X[:, 2] -= ang
+        tf = lambda p: (c * (p[0] - ox) - s * (p[1] - oy), s * (p[0] - ox) + c * (p[1] - oy))  # noqa: E731
+        pos = dict((k, tf(p)) for k, p in pos.items())
+        heading = dict((k, (c * h[0] - s * h[1], s * h[0] + c * h[1])) for k, h in heading.items())
+    else:
+        tf = lambda p: (float(p[0]), float(p[1]))  # noqa: E731
+    # snap에 "D_<노드>"로 준 스퍼 끝(도안 좌표)은 같은 변환으로 옮겨 spur_end로
+    snap_spur = dict((k[2:], tf(v)) for k, v in (snap or {}).items() if k.startswith("D_"))
+
+    # 엣지 곡선
+    eid = dict(((e["from"], e["to"], e.get("branch")), e["id"]) for e in m["edges"])
+    paths = {}
+    for k, v in enumerate(visits):
+        if v["next"] is None:
+            continue
+        w = visits[v["next"]]
+        e = eid.get((v["node"], w["node"], v["branch"]))
+        if e is not None:
+            paths.setdefault(e, []).append(_traversal_path(sol, v, w, X[k], X[v["next"]]))
+            continue
+        # 빌더가 놓친 합류를 끼워 넣은 엣지(v -> M -> w): 지나간 길을 M에 가장 가까운 점에서 잘라 앞부분을 v -> M에
+        for (fa, fb, br), eid1 in eid.items():
+            if fa != v["node"] or br != v["branch"] or fb not in pos or (fb, w["node"], None) not in eid:
+                continue
+            P = _traversal_path(sol, v, w, X[k], X[v["next"]])
+            j = int(np.argmin(np.hypot(*(P - np.array(pos[fb])).T)))
+            if 0 < j < len(P) - 1:
+                paths.setdefault(eid1, []).append(P[:j + 1])
+            break
+    shapes = {}
+    for e in m["edges"]:
+        ps = paths.get(e["id"])
+        a, b2 = pos.get(e["from"]), pos.get(e["to"])
+        if not ps or a is None or b2 is None:
+            continue
+        L = max(float(np.hypot(*np.diff(p, axis=0).T).sum()) for p in ps)
+        n = max(2, int(L / o["resample_mm"]) + 1)
+        avg = np.mean([_resample(p, n) for p in ps], axis=0)
+        # 양 끝을 노드 좌표에 붙인다. 쌓인 오차는 _traversal_path에서 이미 폈으니 끝 근처만 짧게 잇는다
+        # (도안 좌표로 고정한 노드처럼 차이가 실제 모양인 경우 곡선 가운데를 끌고 가지 않게)
+        s_ = np.linspace(0, L, n)
+        blend = max(1e-6, min(100.0, L / 2.0))
+        w0 = np.clip(1.0 - s_ / blend, 0.0, 1.0)
+        w1 = np.clip(1.0 - (L - s_) / blend, 0.0, 1.0)
+        avg = avg + np.outer(w0, np.array(a) - avg[0]) + np.outer(w1, np.array(b2) - avg[-1])
+        pts = [tuple(float(round(c, 1)) for c in p) for p in avg]
+        shapes[e["id"]] = _simplify(pts, o["simplify_mm"])
+
+    # 들어가 본 스퍼(tee): 갈림길에서 가장 멀리 간 지점 방향
+    spur_end = {}
+    for k, v in enumerate(visits):
+        if v["type"] != "tee" or v["dep"] <= v["fi"] + 1:
+            continue
+        r = runs[v["run"]]
+        traj = sol["trajs"][v["run"]]
+        a, b2 = int(math.ceil(v["fi"])), int(math.floor(v["dep"]))
+        if b2 <= a:
+            continue
+        i_far = a + int(np.argmax(r.o[a:b2 + 1]))
+        rv = _interp(traj, v["fi"])
+        rel = _rel(rv, traj[i_far])
+        far = _compose(X[k], rel)
+        nd = next((n for n in m["nodes"] if n["id"] == v["node"]), {})
+        length = nd.get("length_mm")
+        p0 = pos[v["node"]]
+        dx, dy = far[0] - p0[0], far[1] - p0[1]
+        L = math.hypot(dx, dy)
+        if L < 20:
+            continue
+        if length:
+            dx, dy = dx / L * length, dy / L * length
+        spur_end.setdefault(v["node"], []).append((p0[0] + dx, p0[1] + dy))
+    spur_end = dict((n, (sum(p[0] for p in ps) / len(ps), sum(p[1] for p in ps) / len(ps)))
+                    for n, ps in spur_end.items())
+    spur_end.update(snap_spur)
+
+    return pos, heading, shapes, spur_end
 
 
 # ---------------------------------------------------------------- 본체
@@ -499,103 +647,7 @@ def estimate_shape(m, traces, opts=None):
     res = graph.loop_residuals(X0, cp)
     raw_res = graph.loop_residuals(np.array(sol["raw"]), cp)
 
-    # 패치 방문은 패치 가운데(이벤트 지점 + cp)를 지나는 순간으로 옮긴다. 노드 좌표·엣지 곡선이 가운데 기준
-    orig = visits
-    visits = [dict(v) for v in visits]
-    X = X0.copy()
-    for k, v in enumerate(visits):
-        if v["type"] != "patch":
-            continue
-        r = runs[v["run"]]
-        cands = r.crossings(v["d"] + cp)
-        end = orig[v["next"]]["fi"] if v["next"] is not None else float("inf")
-        fi = next((c for c in cands if c >= v["fi"]), None)
-        if fi is None or fi >= end:
-            continue
-        # 패치 위에서 스퍼로 잘못 들어갔다 나온 경우까지: 다음 방문 전 마지막으로 가운데를 지난 프레임
-        dep = [c for c in cands if fi <= c < end][-1]
-        traj = sol["trajs"][v["run"]]
-        X[k] = _compose(X0[k], _rel(_interp(traj, v["fi"]), _interp(traj, fi)))
-        v["fi"], v["dep"] = fi, dep
-
-    # 노드 좌표 = 방문 위치 평균(튀는 방문은 빼고)
-    pos, heading = {}, {}
-    for nid, ks in graph.same.items():
-        P = X[ks, :2]
-        med = np.median(P, axis=0)
-        d = np.hypot(*(P - med).T)
-        keep = d <= max(3 * o["sigma_same_xy"], 3 * float(np.median(d)) + 1e-9)
-        pos[nid] = tuple(float(v) for v in P[keep].mean(axis=0))
-        ux = float(np.mean(np.cos(X[ks, 2])))
-        uy = float(np.mean(np.sin(X[ks, 2])))
-        L = math.hypot(ux, uy) or 1.0
-        heading[nid] = (ux / L, uy / L)
-
-    # 설계 문서 좌표계: 원점 노드가 (0, 0), 원점을 지나는 진행 방향이 +x
-    if origin in pos:
-        ox, oy = pos[origin]
-        hx, hy = heading[origin]
-        ang = math.atan2(hy, hx)
-        c, s = math.cos(-ang), math.sin(-ang)
-        R = np.array([[c, -s], [s, c]])
-        X = X.copy()
-        X[:, :2] = (X[:, :2] - [ox, oy]).dot(R.T)
-        X[:, 2] -= ang
-        tf = lambda p: (c * (p[0] - ox) - s * (p[1] - oy), s * (p[0] - ox) + c * (p[1] - oy))  # noqa: E731
-        pos = dict((k, tf(p)) for k, p in pos.items())
-        heading = dict((k, (c * h[0] - s * h[1], s * h[0] + c * h[1])) for k, h in heading.items())
-
-    # 엣지 곡선
-    eid = dict(((e["from"], e["to"], e.get("branch")), e["id"]) for e in m["edges"])
-    paths = {}
-    for k, v in enumerate(visits):
-        if v["next"] is None:
-            continue
-        w = visits[v["next"]]
-        e = eid.get((v["node"], w["node"], v["branch"]))
-        if e is None:
-            continue
-        paths.setdefault(e, []).append(_traversal_path(sol, v, w, X[k], X[v["next"]]))
-    shapes = {}
-    for e in m["edges"]:
-        ps = paths.get(e["id"])
-        a, b2 = pos.get(e["from"]), pos.get(e["to"])
-        if not ps or a is None or b2 is None:
-            continue
-        L = max(float(np.hypot(*np.diff(p, axis=0).T).sum()) for p in ps)
-        n = max(2, int(L / o["resample_mm"]) + 1)
-        avg = np.mean([_resample(p, n) for p in ps], axis=0)
-        sfrac = np.linspace(0, 1, n)
-        avg = avg + np.outer(1 - sfrac, np.array(a) - avg[0]) + np.outer(sfrac, np.array(b2) - avg[-1])
-        pts = [tuple(float(round(c, 1)) for c in p) for p in avg]
-        shapes[e["id"]] = _simplify(pts, o["simplify_mm"])
-
-    # 들어가 본 스퍼(tee): 갈림길에서 가장 멀리 간 지점 방향
-    spur_end = {}
-    for k, v in enumerate(visits):
-        if v["type"] != "tee" or v["dep"] <= v["fi"] + 1:
-            continue
-        r = runs[v["run"]]
-        traj = sol["trajs"][v["run"]]
-        a, b2 = int(math.ceil(v["fi"])), int(math.floor(v["dep"]))
-        if b2 <= a:
-            continue
-        i_far = a + int(np.argmax(r.o[a:b2 + 1]))
-        rv = _interp(traj, v["fi"])
-        rel = _rel(rv, traj[i_far])
-        far = _compose(X[k], rel)
-        nd = next((n for n in m["nodes"] if n["id"] == v["node"]), {})
-        length = nd.get("length_mm")
-        p0 = pos[v["node"]]
-        dx, dy = far[0] - p0[0], far[1] - p0[1]
-        L = math.hypot(dx, dy)
-        if L < 20:
-            continue
-        if length:
-            dx, dy = dx / L * length, dy / L * length
-        spur_end.setdefault(v["node"], []).append((p0[0] + dx, p0[1] + dy))
-    spur_end = dict((n, (sum(p[0] for p in ps) / len(ps), sum(p[1] for p in ps) / len(ps)))
-                    for n, ps in spur_end.items())
+    pos, heading, shapes, spur_end = _assemble(m, runs, visits, X0, sol["trajs"], cp, graph.same, origin, o)
 
     # 폭이 잘 정해졌는지: 최적 폭에서 ±25% 바꾸면 고리 오차가 얼마나 커지는지
     c0 = sol["cost"]
@@ -622,6 +674,52 @@ def estimate_shape(m, traces, opts=None):
     fit["warnings"] = warns
     return {"pos": pos, "heading": heading, "shapes": shapes, "spur_end": spur_end, "fit": fit,
             "scan": [(round(x, 1), round(v, 1)) for x, v in scan]}, None
+
+
+def read_truth(path):
+    """시뮬레이터 truth.jsonl -> (N, 3) 배열(x, y, 각도). trace.jsonl 데이터 줄과 1:1."""
+    np = _np()
+    rows = []
+    with io.open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return np.array(rows, float)
+
+
+def shape_from_truth(m, traces, truths, snap=None, opts=None, fix_heading=None):
+    """시뮬레이터처럼 실제 궤적을 알 때: 추정 없이 그 궤적으로 노드 좌표·엣지 곡선을 만든다.
+    도안(가상 매트)을 탐색한 결과로 실제 매트 맵을 만들 때 쓴다(mapping/design_map.py).
+
+    traces: {주행: read_trace}, truths: {주행: read_truth}, snap: {노드: (x, y)} 도안 좌표로 고정할 노드.
+    반환 형식은 estimate_shape와 같다(fit에 source "truth")."""
+    np = _np()
+    o = dict(DEFAULT_OPTS)
+    o.update(opts or {})
+    runs = dict((k, _Run(tr)) for k, tr in traces.items() if k in truths)
+    visits, miss = _visits(m, runs)
+    if not visits:
+        return None, u"방문을 찾지 못함"
+    trajs = {}
+    for k, r in runs.items():
+        T = np.asarray(truths[k], float)
+        n = min(len(T), len(r.o))
+        if n < len(r.o):         # 길이가 다르면 짧은 쪽에 맞춤(끝부분)
+            T = np.vstack([T, np.repeat(T[-1:], len(r.o) - n, axis=0)])
+        trajs[k] = T[:len(r.o)]
+    X0 = np.array([_interp(trajs[v["run"]], v["fi"]) for v in visits], float)
+    same = {}
+    for k, v in enumerate(visits):
+        same.setdefault(v["node"], []).append(k)
+    lens = [tr.get("meta", {}).get("patch_length_mm") for tr in traces.values() if tr]
+    lens = [float(x) for x in lens if x]
+    cp = sum(lens) / len(lens) / 2.0 if lens else o["patch_offset_mm"][0]
+    pos, heading, shapes, spur_end = _assemble(m, runs, visits, X0, trajs, cp, same, m.get("origin_node"), o,
+                                               snap=snap, fix_heading=fix_heading)
+    fit = {"source": "truth", "visits": len(visits), "visits_unmatched": miss, "edges_with_shape": len(shapes),
+           "snapped": sorted(snap or {}), "warnings": []}
+    return {"pos": pos, "heading": heading, "shapes": shapes, "spur_end": spur_end, "fit": fit}, None
 
 
 def load_traces_for(event_paths, names):

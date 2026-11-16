@@ -5,6 +5,7 @@
 """
 import os
 import shutil
+import json
 import sys
 import tempfile
 import unittest
@@ -394,3 +395,32 @@ class TestShapeFromTrace(unittest.TestCase):
         self.assertLess(np.sqrt(np.mean(err ** 2)), 50.0, err)
         d = to_agv_map_v1(m, shape=res)
         self.assertEqual((d["pos_source"], twin_problems(d)), ("odometry", []))
+
+
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestDesignMap(unittest.TestCase):
+    """도안(가상 매트)으로 실제 매트 맵 만들기: 위상은 시뮬레이터 탐색, 좌표·곡선은 도안 정답."""
+
+    def test_design_map(self):
+        import math
+        sys.path.insert(0, os.path.join(ROOT, "mapping"))
+        import design_map
+        from agv.topo import twin_problems
+        doc, m = design_map.build(MAT_V2, "mat_test", seeds=[0], quiet=True)
+        self.assertEqual(doc["pos_source"], "design")
+        self.assertEqual(twin_problems(doc), [])
+        self.assertTrue(m["explore"]["complete"])
+        with open(MAT_V2) as f:
+            design = json.load(f)
+        P = dict((n["id"], (n["x"], n["y"])) for n in doc["nodes"])
+        c0 = [p["center"] for p in design["patches"] if p["color"] == "orange"][0]
+        for p in design["patches"]:                       # 패치는 도안 가운데 그대로(원점 주황, y는 오른쪽 +)
+            x, y = P["P_" + p["color"]]
+            self.assertAlmostEqual(x * 1000, p["center"][0] - c0[0], delta=1.0)
+            self.assertAlmostEqual(-y * 1000, p["center"][1] - c0[1], delta=1.0)
+        # S자 선이 아래 선 밑으로 내려가는 곳(도안 최저점 y=124mm)을 곡선이 따라감
+        dip = min(c0[1] - q["y"] * 1000 for e in doc["edges"] if e["type"] == "main" for q in e["points"])
+        self.assertLess(dip, 150.0)
+        self.assertTrue(all(len(e["points"]) > 0 for e in doc["edges"]
+                            if e["type"] == "main" and e["length_m"] > 0.25))
+        self.assertTrue(all(not math.isnan(n["x"]) for n in doc["nodes"]))

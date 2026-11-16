@@ -10,7 +10,7 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 
 | 옵션 | 결과 |
 | --- | --- |
-| (기본) | `events.jsonl`·`trace.jsonl`(실물과 같은 형식), `gt.json`(정답 노드 위치·경로 길이·궤적), `mat_topdown.png` |
+| (기본) | `events.jsonl`·`trace.jsonl`(실물과 같은 형식), `truth.jsonl`(프레임마다 실제 자세, `trace.jsonl` 줄과 짝. 도안으로 맵 만들 때 씀), `gt.json`(정답 노드 위치·경로 길이·궤적), `mat_topdown.png` |
 | `--video` | `run.mp4`: 왼쪽은 검출 결과를 그린 카메라 시점, 오른쪽은 위에서 본 궤적 |
 | `--raw-video` | `camera.mp4`: 원본 카메라 영상. `python3 -m agv.explore --camera video:...`로 재생 시험할 때 쓴다 |
 | `--seed N` | 노이즈·미끄러짐 난수 |
@@ -20,6 +20,7 @@ python3 mapping/build_map.py data/sim_run/events.jsonl -o data/sim_run/map.json
 | `--mat 파일` | 매트 선택. 기본은 `mats/ssafy_mat.json`(첫 매트 한 장) |
 | `--start x,y,각도` | 시작 자세(mm, 도). 특정 구간만 시험할 때 |
 | `--right-first` | 갈림길에서 오른쪽부터 탐색 |
+| `--mode lap` | 색 보정 전 첫 바퀴(갈림길은 늘 왼쪽, 한 바퀴 알아보면 멈춤) |
 
 `mats/ssafy_mat.json`은 `docs/images/track-mat.jpg` 사진을 눈대중으로 본뜬 매트다. 큰 루프 하나에 분기 두 곳(노랑 패치 위 갈라짐, 보라 패치 위 합쳐짐)이 있다. 실측 치수가 나오면 이 파일을 고친다. 경로는 점을 지나는 부드러운 곡선(Catmull-Rom)으로 그린다.
 

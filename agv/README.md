@@ -2,6 +2,8 @@
 
 로봇이 바닥 라인을 따라 돌면서 색 패치와 갈림길(갈라짐·합쳐짐)을 검출해 이벤트 로그로 남기고, 안 가 본 가지를 골라 매트 전체를 탐색한다. 맵은 그 로그로 `mapping/build_map.py`가 만든다.
 
+지금 실제 매트(2m × 1m)에 쓰는 맵은 탐색 대신 매트 도안으로 만든 `maps/mat_ssafy_v2.json`이다(`mapping/design_map.py`, [mapping/README.md](../mapping/README.md)). 탐색으로 맵 만들기는 뒤로 미뤘고, 아래 현장 순서의 1~3번(카메라 자세, 색, 속도 보정)은 맵을 보고 주행할 때도 그대로 필요하다.
+
 Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추가 설치는 필요 없다.
 
 ## 구성
