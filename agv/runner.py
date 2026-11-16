@@ -309,6 +309,22 @@ class ExploreRunner(object):
         self.follow.prev_err = 0.0
         self.log.log("note", self._odo(), msg="spur_out_reverse", target=round(self._rev["target"], 1))
 
+    def policy_changed(self):
+        """바깥에서 이동 정책의 목표를 바꿨을 때 부른다(주행 중 서버 주문으로 해제 노드가 늘어남 등).
+        정책이 낸 정지 요청을 이벤트를 기다리지 않고 바로 받는다."""
+        if not self.finished and self.state != "hold":
+            self._poll_policy()
+
+    def hold(self, reason):
+        """바깥 사정(통신 끊김 등)으로 그 자리에 선다. 라인 추종 중일 때만 바로 서고(True),
+        회전·후진·주차 중이면 False(그 동작이 끝난 뒤 다시 부르면 됨). 풀 때는 resume()."""
+        if self.finished or self.state == "hold":
+            return self.state == "hold"
+        if self.state != "follow":
+            return False
+        self._do_stop({"reason": reason, "hold": True})
+        return True
+
     def resume(self):
         """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
         if self.state != "hold" or self.finished:

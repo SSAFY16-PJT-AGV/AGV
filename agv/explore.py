@@ -28,6 +28,10 @@
     #    모터 없이 위치 추적만 확인(손으로 밀기·녹화 영상): passive에 --map
     python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4 --map maps/field_v2.json
 
+    # 5) 서버 주문으로 움직이기(MQTT): 시작 노드 조금 앞에 놓고 첫 주문을 기다림. agv/link/
+    MQTT_HOST=192.168.0.10 python3 -m agv.explore --mode serve --map maps/mat_ssafy_v2.json --start P_orange --enable-motors
+    python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4 --map maps/field_v2.json
+
 카메라로 찍을 때는 시작하면서 저장해 둔 카메라 자세(arm.servo_angles, camtool arm으로 정함)로 팔을 맞춘다.
 --no-arm이면 팔을 건드리지 않는다. 녹화 영상 재생은 팔을 건드리지 않는다.
 
@@ -136,9 +140,41 @@ def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
     ]
 
 
+def _start_link(a, cfg, nav, nmap, runner, logger):
+    """serve: MQTT 연결과 주문 처리기. 실패하면 (None, None)."""
+    from .link import LinkController, LinkUnavailable, MqttLink, settings_from
+    from .link.battery import make_battery
+    lc = cfg.get("link") or {}
+    st = settings_from(lc)
+    if a.mqtt_host:
+        st["host"] = a.mqtt_host
+    if a.mqtt_port:
+        st["port"] = a.mqtt_port
+    rid = a.robot_id or lc.get("robot_id") or cfg["robot"].get("id", "agv1")
+
+    def note(msg, **kw):
+        logger.log("note", runner._odo(), msg=msg, **kw)
+    try:
+        link = MqttLink(rid, st["host"], st["port"], st["username"], st["password"], st["tls_ca"],
+                        st["keepalive"]).start()
+    except (LinkUnavailable, ValueError) as e:
+        print(u"MQTT 연결을 못 만들었어요: %s" % e)
+        return None, None
+    ctl = LinkController(link, nav, nmap.raw, start_node=a.start, waiting=lc.get("waiting", "zones"),
+                         state_hz=lc.get("state_hz", 5.0), link_loss_s=lc.get("link_loss_s", 1.0),
+                         resume_after_reconnect=bool(lc.get("resume_after_reconnect", False)),
+                         battery=make_battery(lc), log=note)
+    ctl.attach(runner)
+    ok = link.wait_connected(5.0)
+    print(u"MQTT %s:%d %s, 로봇 %s, 맵 %s - 첫 주문을 기다려요(첫 노드 %s)" % (
+        st["host"], st["port"], u"연결됨" if ok else u"아직 연결 안 됨(계속 다시 시도)", rid,
+        ctl.book.map_ref, a.start))
+    return ctl, link
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["passive", "ask", "drive", "goto"], default="passive")
+    ap.add_argument("--mode", choices=["passive", "ask", "drive", "goto", "serve"], default="passive")
     ap.add_argument("--map", default=None, help="goto: 이동에 쓸 맵 JSON(build_map 결과). passive에 주면 위치 추적만")
     ap.add_argument("--to", default=None,
                     help="goto: 목표 노드. 패치 P_<색>이면 패치 가운데, 스퍼 끝 D_<노드>면 스퍼에 들어가 끝에 주차")
@@ -151,6 +187,9 @@ def main(argv=None):
                     help="goto: 탐색한 방향과 반대로 놓았음(--start/--route 첫 노드로 반대 방향에서 다가감)")
     ap.add_argument("--stop-offset", type=float, default=None,
                     help="goto: 목표 패치 앞 가장자리를 본 뒤 더 갈 거리(mm). 기본 patch.length_mm/2, 없으면 80")
+    ap.add_argument("--robot-id", default=None, help="serve: MQTT 토픽의 로봇 ID(기본 config robot.id)")
+    ap.add_argument("--mqtt-host", default=None, help="serve: 브로커 주소(기본 MQTT_HOST, config link.host)")
+    ap.add_argument("--mqtt-port", type=int, default=None, help="serve: 브로커 포트(기본 1883)")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
@@ -158,7 +197,7 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="결과 폴더(기본 data/runs/<시각>)")
     ap.add_argument("--record", action="store_true", help="카메라 영상을 camera.mp4로 저장")
     ap.add_argument("--debug-every", type=int, default=20, help="N프레임마다 검출 그림 저장(0이면 끔)")
-    ap.add_argument("--max-time", type=float, default=600.0, help="최대 주행 시간(초)")
+    ap.add_argument("--max-time", type=float, default=None, help="최대 주행 시간(초). 기본 600, serve는 제한 없음")
     ap.add_argument("--max-laps", type=int, default=6, help="출발 패치를 이만큼 지나면 강제 종료")
     ap.add_argument("--no-arm", action="store_true",
                     help="저장한 카메라 자세(arm.servo_angles)로 팔을 맞추지 않음(기본은 맞춤)")
@@ -172,13 +211,18 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
+    if a.max_time is None:
+        a.max_time = float("inf") if a.mode == "serve" else 600.0
     video_mode = a.camera.startswith("video:")
     if video_mode and a.mode != "passive":
         print(u"영상 재생은 passive 모드로만 돌려요.")
         a.mode = "passive"
     nav = None
     then = []
-    if a.mode == "goto" or (a.mode == "passive" and a.map):
+    if a.mode == "serve" and not (a.map and a.start):
+        print(u"serve 모드는 --map(맵 JSON)과 --start(놓은 자리 바로 앞 노드)가 필요해요.")
+        return 2
+    if a.mode in ("goto", "serve") or (a.mode == "passive" and a.map):
         if not a.map:
             print(u"goto 모드는 --map(맵 JSON)이 필요해요.")
             return 2
@@ -195,7 +239,7 @@ def main(argv=None):
         try:
             # 경로를 주면 그 첫 노드 조금 앞에 놓았다고 본다
             nav = Navigator(nmap, start=a.start or (route[0] if route else None), stop_offset_mm=off,
-                            hold_at_end=bool(then), start_dir="r" if a.reverse else "f")
+                            hold_at_end=bool(then) or a.mode == "serve", start_dir="r" if a.reverse else "f")
             for n in then:
                 nav.check_node(n)
             if route:
@@ -228,7 +272,7 @@ def main(argv=None):
     cam = open_camera(a.camera, cfg["camera"])
     rob = cfg["robot"]
     motors = NullMotors()
-    run_mode = "drive" if a.mode == "goto" else a.mode
+    run_mode = "drive" if a.mode in ("goto", "serve") else a.mode
     if a.mode != "passive":
         motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False),
                               rob.get("trim", 0.0))
@@ -265,6 +309,11 @@ def main(argv=None):
                            map_hint=(nav.m.map_id if nav is not None else None),
                            trace_path=os.path.join(out, "trace.jsonl"))
     _note_camera_calib(cfg, logger, runner)
+    ctl = link = None
+    if a.mode == "serve":
+        ctl, link = _start_link(a, cfg, nav, nmap, runner, logger)
+        if ctl is None:
+            runner.stop("link_unavailable")
     if arm_res is not None:
         logger.log("note", runner._odo(), msg="arm_pose", saved=arm_res["saved"], pose=arm_res["pose"],
                    diff_deg=arm_res["diff"], ok=arm_res["ok"])
@@ -296,6 +345,8 @@ def main(argv=None):
             last = now
             left, right = runner.step(frame, dt)
             motors.set(left, right)
+            if ctl is not None:
+                ctl.step()
 
             if a.record:
                 if writer is None:
@@ -355,6 +406,9 @@ def main(argv=None):
             writer.release()
         if not runner.finished:
             runner.stop("error")
+        if ctl is not None:
+            ctl.step()          # 마지막 상태(ERROR, 종료 이유)
+            link.stop()
         logger.close()
         if view is not None:
             view.set_status(_status_rows(a, runner, time.time() - t_start, 0.0, 0.0, fps_meas, nav),

@@ -2,7 +2,7 @@
 
 로봇이 바닥 라인을 따라 돌면서 색 패치와 갈림길(갈라짐·합쳐짐)을 검출해 이벤트 로그로 남기고, 안 가 본 가지를 골라 매트 전체를 탐색한다. 맵은 그 로그로 `mapping/build_map.py`가 만든다. 완성된 맵이 있으면 목표 패치까지 찾아가 멈추거나, 스퍼 끝에 들어가 주차한다([goto](#완성된-맵에서-목표로-가기-goto)).
 
-Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추가 설치는 필요 없다.
+Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추가 설치는 필요 없다. 서버 주문으로 움직이는 `serve` 모드만 MQTT 라이브러리가 필요하다(`pip3 install --user "paho-mqtt<2"`, [아래](#서버-주문으로-움직이기-serve)).
 
 ## 구성
 
@@ -13,6 +13,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더, 주행 기록으로 맵 모양 계산(`shape.py`) |
 | `nav/` | 완성된 맵 위 이동: 맵 읽기(`navmap.py`), 이벤트로 위치 추적·갈림길 선택·정지(`navigator.py`) |
+| `link/` | 서버 연동(MQTT): 주문 검사(`orders.py`), 주행과 잇기(`controller.py`), 맵 위 자세(`geometry.py`), rear_clear 자원(`segments.py`), 연결(`mqtt.py`) |
 | `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot) |
 | `arm.py` | 카메라 자세(팔 서보 1·2·3·5번 각도) 읽기·맞추기·저장. 저장한 자세는 시작할 때 자동으로 맞춤 |
 | `tools/camtool.py` | 현장 보정: 카메라 자세 맞추기·저장(`arm`), 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
@@ -108,6 +109,64 @@ python3 -m agv.tools.runlog data/runs/<시각>      # "이동(goto)" 칸에 갈�
 - 맵은 지금 탐색기 출력(agv-map-v1, m 단위)과 통일 제안 형식(`docs/mapping/map-schema.md`: mm, `pos`/`shape`, `bidirectional`, 중간 노드 `V_*`)을 둘 다 읽는다.
 - 패치 위 교차 + 스퍼(도안의 노랑)를 S자 선 쪽에서 지나면, 교차 처리 때문에 스퍼에 한 번 들어갔다 되돌아 나온다(탐색 때와 같은 동작). 시간만 조금 더 든다.
 
+## 서버 주문으로 움직이기 (serve)
+
+서버(브랜치 `feature/server-communication`)가 MQTT로 보내는 주문을 받아 `goto`와 같은 코드로 움직이고, 상태·정지 이벤트를 보낸다. 토픽과 주문 형식은 설계 문서 3장, 정지 이벤트는 서버 브랜치의 제안(`server/docs/segment_recovery_proposal.md`)을 따른다.
+
+```bash
+pip3 install --user "paho-mqtt<2"     # 젯슨(Python 3.6)은 2.x가 안 깔림. 노트북은 아무 버전
+MQTT_HOST=<브로커 PC IP> python3 -m agv.explore --mode serve --map maps/mat_ssafy_v2.json --start P_orange --enable-motors --view
+```
+
+- 로봇을 `--start` 노드 조금 앞(라인 위)에 놓으면 서서 첫 주문을 기다린다(상태 `IDLE`, `last_node`가 그 노드). 첫 주문의 첫 노드는 `--start`여야 하고, 다음 새 작업은 이전 작업의 마지막 노드에서 시작해야 한다. 스퍼 끝에서 시작하는 주문(`D_P_red, P_red, ...`)은 그 스퍼에 주차해 있을 때만 된다(처음부터 스퍼 끝에 놓고 시작하는 건 아직 안 됨).
+- 로봇 ID는 `--robot-id` 또는 config `robot.id`. 브로커 주소·인증은 서버와 같은 환경변수(`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA`)나 config `link` 항목(`host`, `port`, `waiting`, `state_hz`, `link_loss_s`, `resume_after_reconnect`, `battery`)으로 준다.
+- 시간 제한이 없다(`--max-time`으로 줄 수 있음). Ctrl+C로 끝내면 `conn`에 `offline`을 남긴다. 프로그램이 죽거나 와이파이가 끊기면 브로커가 15초쯤 뒤 LWT로 `offline`을 대신 보낸다.
+
+| 토픽 | 방향 | 내용 |
+| --- | --- | --- |
+| `agv/<id>/order` | 받음, QoS 1 | 주문 `{order_id, seq, map_id, nodes, released_until, action_at_end}` |
+| `agv/<id>/state` | 보냄, QoS 0, retained, 5Hz(바뀌면 바로) | 아래 |
+| `agv/<id>/event` | 보냄, QoS 1 | 해제 노드에 서면 `rear_clear` 한 번 |
+| `agv/<id>/conn` | 보냄, QoS 1, retained | `online` / `offline`(LWT) |
+
+주문 처리(`link/orders.py`):
+
+- 맵이 다르면(`map_id`가 `<맵 map_id>@v<version>`과 다름) 거절. 같은 `(order_id, seq)`가 같은 내용으로 다시 오면 무시(QoS 1 중복), 내용이 다르면 거절.
+- 새 작업은 `seq` 1, 같은 작업의 다음 주문은 `seq`+1이고 `nodes`·`action_at_end`는 그대로, `released_until`만 더 앞으로. 서 있을 때 받으면 바로 출발하고, 가는 중에 받으면 멈추지 않고 이어 간다.
+- 거절은 이벤트로 보내지 않고 상태의 `rejected`에 싣는다(서버가 이벤트 토픽에서 `rear_clear` 아닌 것을 받으면 오류로 보기 때문).
+- 해제 노드가 중간 노드(`V_*`)면, 그 앞 노드를 지난 뒤 엣지 길이만큼 가서 선다(중간 노드는 눈에 안 보이므로 이동거리로).
+
+상태 메시지:
+
+```json
+{"ts": 1794816609.4, "map_id": "mat_ssafy_v2@v0", "robot_session": "9a9b77ec8f674d34",
+ "last_node": "S2", "edge": ["S2", "V_E15"], "next_node": "V_E15", "progress": 0.42, "dir": "fwd",
+ "pose": {"x": 855.7, "y": 17.3, "th": -173.6, "src": "interp"},
+ "status": "MOVING", "carrying": null, "battery": null,
+ "order_id": "T1", "seq": 2, "released_until": "V_E15", "error": null, "rejected": null}
+```
+
+- `status`: `IDLE`(주문 없음·작업 끝) / `MOVING` / `WAITING`(해제 노드에서 다음 해제를 기다림) / `ERROR`(`error`에 이유: `link_lost`, `nav_off_route`, `nav_spur_missed`, 종료 이유 등).
+- `pose`: 맵 좌표 mm, `th`는 맵 x축에서 잰 도(맵 `coordinate_frame` 그대로). 노드를 지날 때 맞추고 그 사이는 이동거리로 엣지 모양 위에 놓는다(`src: interp`). 노드에 서 있으면 `node`, 처음 놓인 자리는 `start`, 스퍼를 드나드는 중이면 `spur`(부모 노드 위치). 가상 매트에서 실제 위치와의 차이는 중간값 2cm, 90%가 5cm 안이었다.
+- runner는 합류 뒤 30cm 동안 교차인지 보느라 이벤트를 보류한다. 그동안 Navigator 위치가 늦어서, 자세는 경로를 따라 이동거리로 이어 붙인다(해제 노드를 넘지 않음).
+- `battery`: config `link.battery`에 INA219 주소를 넣었을 때만 값이 있다(`link/battery.py`, 보드에 센서가 있는지 현장 확인 필요). 없으면 `null`.
+
+정지와 끊김:
+
+- 해제 노드에 서면 `rear_clear`를 보낸다: `{type, event_id, robot_session, order_id, seq, map_id, stopped_at, cleared_resources}`. `cleared_resources`는 서버 `plan_segment` 규칙을 그대로 흉내 내 계산한다(구간 노드·엣지·공유 구역 - 다음 구간과 겹치는 것). 대기 노드를 정하는 법은 config `link.waiting`: `zones`(맵 waiting 구역, 기본) 또는 `all`(서버 주문 시연이 쓰는 "모든 노드가 대기 지점" 가정). 서버 쪽과 같아야 서버가 받는다.
+- 브로커 연결이 1초(`link_loss_s`) 넘게 끊기면 그 자리에 선다(라인 추종 중이면 바로, 회전·후진·주차 중이면 끝나는 대로). 다시 붙어도 저절로 가지 않고 `ERROR`/`link_lost`로 남는다. 재동기화 규약이 정해지기 전까지의 안전한 기본값이며, `link.resume_after_reconnect: true`면 남은 해제 구간을 이어 간다.
+
+집에서 시험(가상 매트 + 실제 브로커): `sim/link_demo.py`. mosquitto를 띄우고 `python3 sim/link_demo.py --dispatch ...`이면 작은 배차기가 구간별로 해제를 보내며 끝까지 돌린다. 서버의 트윈 브리지에 이어 언리얼에서 보려면 로봇 ID를 `sim-r1`(기본값)로 둔다.
+
+서버·트윈과 정해야 할 것(현재 코드가 가정한 것):
+
+1. **상태 형식**: 설계 문서 형식(`pose` mm·`th`, `last_node`, battery 0~1)으로 보낸다. 트윈 요청서는 최상위 `x`, `y`(m)·`yaw`·`current_node`·battery %였는데, 서버 브리지가 이미 변환한다. 서버 브리지는 `battery`가 없으면 상태를 통째로 버리고, 자세는 시험용 맵 ID(`twin-validation-v1`)일 때만 넘긴다 - 실제 맵 ID를 받게 바꿔야 한다.
+2. **rear_clear 자원 계산**: 로봇이 서버 내부 자원 이름과 다음 구간까지 알아야 해서 서로 엇갈리기 쉽다. 로봇은 `stopped_at`만 보내고 서버가 계산하자고 제안.
+3. **로봇 방향**: 서버 경로 계산이 로봇이 어느 쪽을 보는지 모른다. 패치 가운데·스퍼 끝에 서 있으면 로봇이 알아서 유턴하지만, 그 밖의 노드(갈림길 앞 등)에서 뒤로 가는 경로를 받으면 출발한 뒤 경로를 벗어났다고 보고 선다(`nav_off_route`). 상태의 `dir`·`edge`를 경로 계산에 쓰거나, 작업 끝 지점을 패치·스퍼 끝으로 두면 된다.
+4. **도착·작업 이벤트**: 상차·하차 완료, 실패 이벤트 형식이 없다. 지금은 `rear_clear`와 상태(`status`, `error`, `rejected`)뿐.
+5. **로봇 ID·대기 지점**: 서버 시뮬레이션은 `sim-` ID만 받는다. 매트 맵의 대기 지점은 스퍼 끝뿐이라 구간이 길다(서버 시연은 모든 노드를 대기 지점으로 봄).
+6. **끊김 뒤 재개**와 **재시작 동기화**(로봇이 재부팅하면 위치를 모름).
+
 ## 검출 방식과 조정 값
 
 카메라는 앞 바닥을 비스듬히 본다(화면 아래 = 가까움). 스캔 영역에 가로줄 14개를 긋고 줄마다 라인 조각을 찾는다.
@@ -171,3 +230,5 @@ python3 -m unittest discover -s agv/tests -v
 ```
 
 실제 모터·카메라는 쓰지 않는다. `test_sim_e2e.py`는 가상 매트(`sim/mat/`)에서 탐색부터 맵 생성까지 돌린다. `test_nav.py`는 맵 읽기·위치 추적·갈림길 선택 단위 테스트와, 가상 매트에서 탐색으로 만든 맵(`maps/sim_ssafy_v2.json`)으로 목표까지 가는 시험(짧은 가지, V자, 대기 후 재개, 시작 위치 모름 + 속도 15% 오차, 스퍼 끝 주차 후 빠져나오기 3곳, `explore.py --then` 실행 루프)이다.
+
+`test_link.py`는 서버 연동이다: 주문 검사 규칙, 맵 위 자세, rear_clear 자원, 통일 맵(중간 노드), 중간 노드에서 서기, 가상 매트에서 실물 맵(`maps/mat_ssafy_v2.json`)으로 주문 받아 움직이기(구간 셋 + 중간 노드 + 유턴해 거꾸로 + 스퍼 주차, 틀린 주문 거절, 통신 끊김에 서기). 서버 브랜치를 받아 둔 폴더를 `AGV_SERVER_REPO=<폴더>`로 주면 서버 코드(`server/routing.py`, `server/segments.py`)로도 맵과 자원 계산을 맞춰 본다. 실제 브로커 왕복은 `sim/link_demo.py`.
