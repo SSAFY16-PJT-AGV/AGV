@@ -114,8 +114,14 @@ async def digital_twin(websocket: WebSocket):
     if service is None:
         await websocket.close(code=1011)
         return
+    actions = getattr(websocket.app.state, 'demo_actions', None)
+    claimed = False
     try:
         await websocket.accept()
+        if actions is not None:
+            trusted = (websocket.headers.getlist('origin') == ['http://127.0.0.1']
+                       and _allowed_origin(websocket.headers))
+            claimed = actions.attach(websocket, trusted)
         revisions = {robot_id: service.twin_observation(robot_id)['revision']
                      for robot_id in mapping}
         while True:
@@ -123,6 +129,12 @@ async def digital_twin(websocket: WebSocket):
                 event = await asyncio.wait_for(websocket.receive(), timeout=POLL_SECONDS)
                 if event['type'] == 'websocket.disconnect':
                     return
+                text = event.get('text')
+                if claimed and isinstance(text, str) and len(text) <= 4096:
+                    try:
+                        actions.receive(websocket, json.loads(text))
+                    except (ValueError, TypeError, RecursionError):
+                        pass
             except asyncio.TimeoutError:
                 pass
             for robot_id, twin_id in mapping.items():
@@ -139,5 +151,12 @@ async def digital_twin(websocket: WebSocket):
                 if payload is not None:
                     payload['data']['agv_id'] = twin_id
                     await websocket.send_json(payload)
+            if claimed:
+                action = actions.poll(websocket, time.monotonic())
+                if action is not None:
+                    await websocket.send_json(action)
     except WebSocketDisconnect:
         return
+    finally:
+        if claimed:
+            actions.detach(websocket)

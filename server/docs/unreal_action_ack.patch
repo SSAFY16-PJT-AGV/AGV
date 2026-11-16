@@ -1,0 +1,43 @@
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -6,6 +6,7 @@
+ #include "AGVDisplayShelf.h"
+ #include "Dom/JsonObject.h"
+ #include "Serialization/JsonSerializer.h"
++#include "Serialization/JsonWriter.h"
+ #include "Serialization/JsonReader.h"
+ #include "EngineUtils.h"
+ #include "TimerManager.h"
+@@ -502,6 +503,32 @@
+             *AGVId,
+             *Action);
+ 
++        // Optional local-demo correlation: existing action messages with no
++        // metadata retain their original behaviour and generate no response.
++        FString OrderId;
++        FString ActionId;
++        if ((*DataObject)->TryGetStringField(TEXT("order_id"), OrderId) &&
++            (*DataObject)->TryGetStringField(TEXT("action_id"), ActionId) &&
++            !OrderId.IsEmpty() && !ActionId.IsEmpty() &&
++            Socket.IsValid() && Socket->IsConnected())
++        {
++            TSharedRef<FJsonObject> AckData = MakeShared<FJsonObject>();
++            AckData->SetStringField(TEXT("order_id"), OrderId);
++            AckData->SetStringField(TEXT("action_id"), ActionId);
++            AckData->SetStringField(TEXT("agv_id"), AGVId);
++            AckData->SetStringField(TEXT("action"), Action);
++            AckData->SetBoolField(TEXT("applied"), bApplied);
++            TSharedRef<FJsonObject> Ack = MakeShared<FJsonObject>();
++            Ack->SetStringField(TEXT("type"), TEXT("robot.action.result"));
++            Ack->SetObjectField(TEXT("data"), AckData);
++            FString AckJson;
++            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&AckJson);
++            if (FJsonSerializer::Serialize(Ack, Writer))
++            {
++                Socket->Send(AckJson);
++            }
++        }
++
+         return;
+     }
+ 

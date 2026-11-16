@@ -1,0 +1,88 @@
+--- a/Source/agvSimulation/AGVRobot.h
++++ b/Source/agvSimulation/AGVRobot.h
+@@ -44,6 +44,9 @@
+         return AGVId;
+     }
+ 
++    // Uses the same per-instance scale as UpdateExternalPose.
++    float GetExternalPositionScale() const { return ExternalPositionScale; }
++
+     virtual void Tick(float DeltaTime) override;
+ 
+     virtual void SetupPlayerInputComponent(
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -382,9 +382,58 @@
+             return;
+         }
+ 
++        // Correlated local-demo actions must prove the rendered robot is
++        // actually close to the requested map position before mutating items.
++        // Legacy actions with no correlation metadata keep their old behaviour.
++        FString OrderId;
++        FString ActionId;
++        const bool bHasOrderId = (*DataObject)->HasField(TEXT("order_id"));
++        const bool bHasActionId = (*DataObject)->HasField(TEXT("action_id"));
++        const bool bCorrelated =
++            (*DataObject)->TryGetStringField(TEXT("order_id"), OrderId) &&
++            (*DataObject)->TryGetStringField(TEXT("action_id"), ActionId) &&
++            !OrderId.IsEmpty() && !ActionId.IsEmpty();
++
++        if ((bHasOrderId || bHasActionId) && !bCorrelated)
++        {
++            UE_LOG(LogTemp, Warning, TEXT("[WebSocket] Invalid action correlation"));
++            return;
++        }
++
++        bool bPositionAllowed = true;
++        if (bCorrelated)
++        {
++            double ExpectedX = 0.0;
++            double ExpectedY = 0.0;
++            const float Scale = Robot->GetExternalPositionScale();
++            const FVector Actual = Robot->GetActorLocation();
++            bPositionAllowed =
++                (*DataObject)->TryGetNumberField(TEXT("expected_x"), ExpectedX) &&
++                (*DataObject)->TryGetNumberField(TEXT("expected_y"), ExpectedY) &&
++                FMath::IsFinite(ExpectedX) && FMath::IsFinite(ExpectedY) &&
++                FMath::Abs(ExpectedX) <= 1000.0 && FMath::Abs(ExpectedY) <= 1000.0 &&
++                FMath::IsFinite(Scale) && Scale > 0.0f &&
++                FMath::IsFinite(Actual.X) && FMath::IsFinite(Actual.Y);
++            if (bPositionAllowed)
++            {
++                const FVector Expected(ExpectedX * Scale, ExpectedY * Scale, Actual.Z);
++                bPositionAllowed = FVector::Dist2D(Actual, Expected) <= 25.0;
++            }
++            if (!bPositionAllowed)
++            {
++                UE_LOG(LogTemp, Warning,
++                    TEXT("[WebSocket] Correlated action blocked: AGV=%s, action=%s, position=%s"),
++                    *AGVId, *Action, *Actual.ToString());
++            }
++        }
++
+         bool bApplied = false;
+ 
+-        if (Action == TEXT("grab"))
++        if (!bPositionAllowed)
++        {
++            // Reply applied=false below without attempting the action.
++        }
++        else if (Action == TEXT("grab"))
+         {
+             FString ProductTypeString;
+ 
+@@ -505,12 +554,7 @@
+ 
+         // Optional local-demo correlation: existing action messages with no
+         // metadata retain their original behaviour and generate no response.
+-        FString OrderId;
+-        FString ActionId;
+-        if ((*DataObject)->TryGetStringField(TEXT("order_id"), OrderId) &&
+-            (*DataObject)->TryGetStringField(TEXT("action_id"), ActionId) &&
+-            !OrderId.IsEmpty() && !ActionId.IsEmpty() &&
+-            Socket.IsValid() && Socket->IsConnected())
++        if (bCorrelated && Socket.IsValid() && Socket->IsConnected())
+         {
+             TSharedRef<FJsonObject> AckData = MakeShared<FJsonObject>();
+             AckData->SetStringField(TEXT("order_id"), OrderId);
