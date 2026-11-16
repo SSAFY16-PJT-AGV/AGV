@@ -4,9 +4,11 @@ The WebSocket client below is a test double; this is not an Unreal or physical
 robot test.  It never publishes a robot order and does not use port 8000.
 """
 from contextlib import ExitStack
+import io
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -14,6 +16,7 @@ import sysconfig
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from urllib.request import ProxyHandler, Request, build_opener
 
 from websockets.sync.client import connect
@@ -47,7 +50,37 @@ def request(port, path, payload=None):
         data = json.dumps(payload).encode('utf-8')
     req = Request('http://127.0.0.1:{}{}'.format(port, path), headers=headers, data=data)
     with HTTP.open(req, timeout=3) as response:
-        return json.load(response)
+        result = json.load(response)
+        status_code = response.status
+    # A 202 acknowledges only admission, not publication. Never retry the POST:
+    # ask for the outcome of this exact execution using its request ID.
+    if payload is None or path != '/order-demo/api/product-orders' or status_code != 202:
+        return result
+    if (not isinstance(result, dict) or result.get('status') != 'pending'
+            or not isinstance(result.get('request_id'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', result['request_id'])):
+        raise AssertionError('invalid or unknown admission response: {!r}'.format(result))
+    request_id = result['request_id']
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        req = Request('http://127.0.0.1:{}/order-demo/api/submissions/{}'.format(port, request_id),
+                      headers={'Host': '127.0.0.1:8000'})
+        remaining = deadline - time.monotonic()
+        with HTTP.open(req, timeout=max(.01, min(3, remaining))) as response:
+            observed = json.load(response)
+        if not isinstance(observed, dict) or observed.get('request_id') != request_id:
+            raise AssertionError('invalid admission lookup: {!r}'.format(observed))
+        state = observed.get('status')
+        if state == 'completed':
+            if not isinstance(observed.get('result'), dict):
+                raise AssertionError('completed admission lacks an order result')
+            return observed['result']
+        if state in ('error', 'unknown'):
+            raise AssertionError('order admission did not complete: {!r}'.format(observed))
+        if state != 'pending':
+            raise AssertionError('unexpected admission state: {!r}'.format(observed))
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    raise AssertionError('order admission did not complete within 20 seconds')
 
 
 def receive_action(ws, timeout=15):
@@ -68,6 +101,41 @@ def action_reply(action, *, applied=True, action_id=None):
         data['action_id'] = action_id
     data['applied'] = applied
     return json.dumps({'type': 'robot.action.result', 'data': data})
+
+
+class SubmissionHelperTest(unittest.TestCase):
+    def test_pending_submission_polls_id_without_repeating_post(self):
+        request_id = 'a' * 32
+        calls = []
+        replies = iter([(202, {'status': 'pending', 'request_id': request_id}),
+                        (200, {'status': 'pending', 'request_id': request_id}),
+                        (200, {'status': 'completed', 'request_id': request_id,
+                               'result': {'assigned_robot': 'sim-r2'}})])
+        def fake_open(req, timeout):
+            calls.append((req.get_method(), req.full_url, timeout))
+            status, payload = next(replies)
+            stream = io.BytesIO(json.dumps(payload).encode())
+            stream.status = status
+            return stream
+        with patch.object(HTTP, 'open', side_effect=fake_open):
+            result = request(1234, '/order-demo/api/product-orders', {'product_id': 'blue'})
+        self.assertEqual(result['assigned_robot'], 'sim-r2')
+        self.assertEqual([call[0] for call in calls], ['POST', 'GET', 'GET'])
+        self.assertTrue(all(call[2] <= 3 for call in calls))
+        self.assertTrue(all('/submissions/' + request_id in call[1] for call in calls[1:]))
+
+    def test_unknown_submission_result_is_not_treated_as_order_success(self):
+        request_id = 'b' * 32
+        replies = iter([(202, {'status': 'pending', 'request_id': request_id}),
+                        (200, {'status': 'unknown', 'request_id': request_id})])
+        def fake_open(req, timeout):
+            status, payload = next(replies)
+            stream = io.BytesIO(json.dumps(payload).encode())
+            stream.status = status
+            return stream
+        with patch.object(HTTP, 'open', side_effect=fake_open):
+            with self.assertRaisesRegex(AssertionError, 'did not complete'):
+                request(1234, '/order-demo/api/product-orders', {'product_id': 'red'})
 
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')

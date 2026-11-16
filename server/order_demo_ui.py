@@ -105,6 +105,9 @@ HTML_PAGE = r'''<!doctype html>
   let polling = false;
   let jobActive = true;
   let fleetMode = false;
+  let pendingSubmission = null;
+  let submissionPolling = false;
+  let submissionUnknown = false;
 
   function message(element, text, success = false) {
     element.textContent = text;
@@ -115,8 +118,78 @@ HTML_PAGE = r'''<!doctype html>
     return await response.json();
   }
   function updateButton() {
-    submit.disabled = !nodesReady || submitting || jobActive;
-    productSubmit.disabled = !productsReady || submitting || jobActive;
+    const awaiting = pendingSubmission !== null || submissionUnknown;
+    submit.disabled = !nodesReady || submitting || jobActive || awaiting;
+    productSubmit.disabled = !productsReady || submitting || jobActive || awaiting;
+  }
+  function makeRequestKey() {
+    if (typeof crypto === 'undefined') throw new Error('secure randomness is unavailable');
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    if (typeof crypto.getRandomValues !== 'function') throw new Error('secure randomness is unavailable');
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  function submissionFailed(element) {
+    submissionUnknown = true;
+    message(element, '요청 결과를 확인할 수 없습니다. 재주문하지 말고 서버 상태를 확인해 주세요.');
+    updateButton();
+  }
+  async function refreshSubmission() {
+    if (!pendingSubmission || submissionPolling) return;
+    submissionPolling = true;
+    const entry = pendingSubmission;
+    try {
+      const result = await readJson(await fetch('/order-demo/api/submissions/' + encodeURIComponent(entry.id), {cache: 'no-store'}));
+      if (!result || result.request_id !== entry.id) throw new Error('invalid submission status');
+      if (result.status === 'pending') {
+        message(entry.feedback, '가상 주문 처리 결과를 확인 중입니다.');
+      } else if (result.status === 'completed' && result.result &&
+                 !['unknown', 'failed', 'error'].includes(result.result.status)) {
+        pendingSubmission = null;
+        message(entry.feedback, entry.success, true);
+        await refreshStatus();
+      } else if (['unknown', 'error'].includes(result.status) || result.status === 'completed') {
+        pendingSubmission = null;
+        submissionFailed(entry.feedback);
+      } else {
+        throw new Error('invalid submission status');
+      }
+    } catch (_) {
+      message(entry.feedback, '주문 상태를 확인하지 못했습니다. 재주문하지 마세요. 자동으로 다시 확인합니다.');
+    } finally {
+      submissionPolling = false;
+      updateButton();
+    }
+  }
+  async function submitRequest(url, body, element, success) {
+    let requestKey;
+    try { requestKey = makeRequestKey(); }
+    catch (_) { message(element, '주문 요청 식별자를 만들 수 없어 접수하지 않았습니다.'); return; }
+    try {
+      const response = await fetch(url, {
+        method: 'POST', headers: {'Content-Type': 'application/json', 'Idempotency-Key': requestKey},
+        body: JSON.stringify(body)
+      });
+      if (response.status === 503) {
+        message(element, '현재 주문이 접수되지 않았습니다. 잠시 후 다시 시도해 주세요.');
+        return;
+      }
+      const result = await readJson(response);
+      if (result && result.status === 'pending' && typeof result.request_id === 'string' &&
+          /^[A-Za-z0-9_-]{1,128}$/.test(result.request_id)) {
+        pendingSubmission = {id: result.request_id, feedback: element, success};
+        message(element, '가상 주문 처리 결과를 확인 중입니다.');
+        updateButton();
+        await refreshSubmission();
+      } else if (!result || ['pending', 'unknown', 'failed', 'error'].includes(result.status)) {
+        submissionFailed(element);
+      } else {
+        jobActive = true;
+        message(element, success, true);
+        await refreshStatus();
+      }
+    } catch (_) {
+      submissionFailed(element);
+    }
   }
   function showProductDetails() {
     const item = products.get(product.value);
@@ -197,6 +270,9 @@ HTML_PAGE = r'''<!doctype html>
     polling = true;
     try {
       const data = await readJson(await fetch('/order-demo/api/status', {cache: 'no-store'}));
+      if (data.stale !== undefined && typeof data.stale !== 'boolean') throw new Error('invalid freshness');
+      const stale = data.stale === true;
+      const disconnected = data.connected === false || data.unreal_connected === false;
       fleetMode = data.mode === 'fleet';
       document.getElementById('single-status').hidden = fleetMode;
       document.getElementById('fleet-status').hidden = !fleetMode;
@@ -221,9 +297,11 @@ HTML_PAGE = r'''<!doctype html>
           row.textContent = `${robot.robot_id} · ${status}\n단계: ${phase}\n현재 노드: ${textValue(robot.current_node)}\n경로: ${route}`;
           fleet.appendChild(row);
         }
-        jobActive = !data.accepting_orders;
+        jobActive = stale || disconnected || !data.accepting_orders;
         updateButton();
-        message(statusFeedback, jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : '');
+        message(statusFeedback, stale ? '표시된 내용은 최신 상태가 아닙니다. 새 주문은 잠시 기다려 주세요.'
+          : (disconnected ? '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.'
+            : (jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : '')));
         return;
       }
       const terminalIssue = ['unknown', 'failed'].includes(data.status) ? data.status : null;
@@ -238,18 +316,19 @@ HTML_PAGE = r'''<!doctype html>
       document.getElementById('current-node').textContent = textValue(data.current_node);
       document.getElementById('route').textContent = Array.isArray(data.route) && data.route.length
         ? data.route.map(textValue).join(' → ') : '—';
-      jobActive = exhausted || ['moving', 'running', 'waiting_grab', 'waiting_place', 'unknown', 'failed'].includes(effectiveStatus);
+      jobActive = stale || disconnected || exhausted || ['moving', 'running', 'waiting_grab', 'waiting_place', 'unknown', 'failed'].includes(effectiveStatus);
       updateButton();
-      message(statusFeedback, terminalIssue || exhausted
-        ? '시연 서버와 Unreal 에디터를 종료한 뒤 다시 시작해 주세요.' : '');
+      message(statusFeedback, stale ? '표시된 내용은 최신 상태가 아닙니다. 새 주문은 잠시 기다려 주세요.'
+        : (disconnected ? '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.'
+          : (terminalIssue || exhausted ? '시연 서버와 Unreal 에디터를 종료한 뒤 다시 시작해 주세요.' : '')));
     } catch (_) {
-      if (fleetMode) { jobActive = true; updateButton(); }
+      jobActive = true; updateButton();
       message(statusFeedback, '진행 현황을 불러오지 못했습니다. 서버 연결을 확인해 주세요.');
     } finally { polling = false; }
   }
   document.getElementById('product-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!productsReady || submitting || jobActive) return;
+    if (!productsReady || submitting || jobActive || pendingSubmission || submissionUnknown) return;
     if (!products.has(product.value)) {
       message(productFeedback, '상품을 선택해 주세요.');
       return;
@@ -257,21 +336,13 @@ HTML_PAGE = r'''<!doctype html>
     submitting = true;
     updateButton();
     message(productFeedback, '');
-    try {
-      await readJson(await fetch('/order-demo/api/product-orders', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({product_id: product.value})
-      }));
-      jobActive = true;
-      message(productFeedback, '가상 상품 주문을 접수했습니다.', true);
-      await refreshStatus();
-    } catch (_) {
-      message(productFeedback, '상품 주문에 실패했습니다. 진행 중인 작업과 서버 상태를 확인해 주세요.');
-    } finally { submitting = false; updateButton(); }
+    try { await submitRequest('/order-demo/api/product-orders', {product_id: product.value},
+                              productFeedback, '가상 상품 주문을 접수했습니다.'); }
+    finally { submitting = false; updateButton(); }
   });
   document.getElementById('order-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!nodesReady || submitting || jobActive) return;
+    if (!nodesReady || submitting || jobActive || pendingSubmission || submissionUnknown) return;
     if (!pickup.value || !destination.value) {
       message(feedback, '출발지와 도착지를 선택해 주세요.');
       return;
@@ -283,22 +354,14 @@ HTML_PAGE = r'''<!doctype html>
     submitting = true;
     updateButton();
     message(feedback, '');
-    try {
-      await readJson(await fetch('/order-demo/api/orders', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({pickup_node: pickup.value, destination_node: destination.value})
-      }));
-      jobActive = true;
-      message(feedback, '가상 운반 요청을 접수했습니다.', true);
-      await refreshStatus();
-    } catch (_) {
-      message(feedback, '운반 요청에 실패했습니다. 진행 중인 작업과 서버 상태를 확인해 주세요.');
-    } finally { submitting = false; updateButton(); }
+    try { await submitRequest('/order-demo/api/orders', {pickup_node: pickup.value, destination_node: destination.value},
+                              feedback, '가상 운반 요청을 접수했습니다.'); }
+    finally { submitting = false; updateButton(); }
   });
   loadNodes();
   loadProducts();
   refreshStatus();
-  setInterval(refreshStatus, 800);
+  setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmission()]); }, 800);
 })();
 </script>
 </body>

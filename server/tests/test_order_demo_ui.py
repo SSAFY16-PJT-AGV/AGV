@@ -57,6 +57,58 @@ class OrderDemoUiTest(unittest.TestCase):
         self.assertIn('확인 중', self.html)
 
     @unittest.skipUnless(shutil.which('node'), 'requires Node to exercise browser JavaScript')
+    def test_unknown_submission_never_looks_like_a_success(self):
+        script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+const html = fs.readFileSync(0, 'utf8');
+const source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const els = new Map();
+function element(id) {
+  if (!els.has(id)) els.set(id, {value:'', disabled:false, textContent:'', children:[], handlers:{},
+    classList:{toggle() {}}, addEventListener(t, f) {this.handlers[t]=f;},
+    replaceChildren() {this.children=[];}, appendChild(item) {this.children.push(item);}});
+  return els.get(id);
+}
+let posts = 0;
+let timer;
+let outcome = {status:'pending', request_id:'id-1'};
+const context = {
+  crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
+  document: {getElementById:element, createElement:() => ({})},
+  setInterval(f) {timer=f;},
+  fetch: async (url) => {
+    if (url.endsWith('/products')) return {ok:true, json:async () => ({products:[
+      {id:'red', label:'빨강', pickup_node:'D01', destination_node:'D04', shelf_id:'SHELF_RED', slot_index:0}]})};
+    if (url.endsWith('/nodes')) return {ok:true, json:async () => ({nodes:[{id:'D01'}]})};
+    if (url.endsWith('/status')) return {ok:true, json:async () => ({status:'idle', phase:null, route:[]})};
+    if (url.endsWith('/product-orders')) {posts++; return {ok:true, status:202, json:async () => ({status:'pending', request_id:'id-1'})};}
+    if (url.endsWith('/submissions/id-1')) return {ok:true, json:async () => outcome};
+    throw new Error(url);
+  }
+};
+vm.runInNewContext(source, context);
+const flush = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  await flush(); await flush();
+  element('product').value = 'red';
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts, 1);
+  assert.strictEqual(element('submit-product').disabled, true);
+  outcome = {status:'completed', request_id:'id-1', result:{status:'unknown'}};
+  await timer();
+  assert(element('product-feedback').textContent.includes('재주문하지'));
+  assert.strictEqual(element('submit-product').disabled, true);
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts, 1);
+})().catch(error => {console.error(error); process.exitCode=1;});
+'''
+        result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires Node to exercise browser JavaScript')
     def test_product_order_and_acknowledgement_in_javascript(self):
         script = r'''
 const fs = require('fs');
@@ -78,17 +130,34 @@ function element(id) {
 let current = {status:'idle', phase:null, current_node:'J01', route:[]};
 let posted;
 let timer;
+let postCount = 0;
+let pendingReply = false;
+let requestLost = false;
+let rejectBeforeAcceptance = false;
+let lookupLost = false;
+let submissionState = {status:'pending', request_id:'test-request-1'};
+let lastHeaders;
 const catalog = [{id:'red', label:'빨강', pickup_node:'D01', destination_node:'D04',
                   shelf_id:'SHELF_RED', slot_index:0}];
 const context = {
+  crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
   document: {getElementById:element, createElement:() => ({})},
   setInterval(fn) {timer = fn;},
   fetch: async (url, options = {}) => {
     if (url.endsWith('/products')) return {ok:true, json:async () => ({products:catalog})};
     if (url.endsWith('/nodes')) return {ok:true, json:async () => ({nodes:[{id:'D01'}, {id:'D04'}]})};
     if (url.endsWith('/status')) return {ok:true, json:async () => current};
+    if (url.endsWith('/submissions/test-request-1')) {
+      if (lookupLost) throw new Error('status lookup lost');
+      return {ok:true, json:async () => submissionState};
+    }
     if (url.endsWith('/product-orders')) {
+      postCount++;
+      lastHeaders = options.headers;
+      if (requestLost) throw new Error('connection lost');
+      if (rejectBeforeAcceptance) return {ok:false, status:503, json:async () => ({detail:'busy'})};
       posted = JSON.parse(options.body);
+      if (pendingReply) return {ok:true, status:202, json:async () => ({status:'pending', request_id:'test-request-1'})};
       if (current.mode === 'fleet') {
         current = {...current, accepting_orders:false};
       } else {
@@ -134,6 +203,30 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   assert.strictEqual(element('direct-orders').hidden, true);
   assert.strictEqual(element('submit-product').disabled, true);
   assert(element('status-feedback').textContent.includes('다시 시작'));
+  current = {status:'idle', phase:null, current_node:'J01', route:[], stale:true};
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert.strictEqual(element('submit-order').disabled, true);
+  assert(element('status-feedback').textContent.includes('최신 상태'));
+  current = {status:'idle', phase:null, current_node:'J01', route:[], stale:false};
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, false);
+  assert.strictEqual(element('submit-order').disabled, false);
+  assert.strictEqual(element('status-feedback').textContent, '');
+  current.connected = false;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert.strictEqual(element('submit-order').disabled, true);
+  assert(element('status-feedback').textContent.includes('연결'));
+  current.connected = true;
+  current.unreal_connected = false;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert.strictEqual(element('submit-order').disabled, true);
+  assert(element('status-feedback').textContent.includes('연결'));
+  current.unreal_connected = true;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, false);
   current = {mode:'fleet', accepting_orders:true, robots:[
     {robot_id:'sim-r1', status:'moving', phase:'to_pickup', current_node:'N1', route:['N1','D01']},
     {robot_id:'sim-r2', status:'idle', phase:null, current_node:'N5', route:[]}
@@ -147,6 +240,26 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   assert(rows[0].textContent.includes('이동 중') && rows[0].textContent.includes('N1 → D01'));
   assert(rows[1].textContent.includes('sim-r2') && rows[1].textContent.includes('N5'));
   assert(rows[1].textContent.includes('대기 중'));
+  current.stale = true;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('status-feedback').textContent.includes('최신 상태'));
+  current.stale = false;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, false);
+  assert.strictEqual(element('status-feedback').textContent, '');
+  current.connected = false;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('status-feedback').textContent.includes('연결'));
+  current.connected = true;
+  current.unreal_connected = false;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('status-feedback').textContent.includes('연결'));
+  current.unreal_connected = true;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, false);
   current.robots[0].status = 'waiting';
   current.robots[0].phase = 'reservation_wait';
   await timer();
@@ -162,6 +275,42 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   await timer();
   assert.strictEqual(element('submit-product').disabled, true);
   assert(element('status-feedback').textContent.includes('불러오지 못했습니다'));
+  current = {status:'idle', phase:null, current_node:'J01', route:[], stale:false};
+  await timer();
+  pendingReply = true;
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert(lastHeaders['Idempotency-Key']);
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('product-feedback').textContent.includes('확인 중'));
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  lookupLost = true;
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('product-feedback').textContent.includes('자동으로 다시 확인'));
+  lookupLost = false;
+  await timer();
+  assert(element('product-feedback').textContent.includes('확인 중'));
+  submissionState = {status:'completed', request_id:'test-request-1', result:{status:'moving', order_id:'web-pickup'}};
+  await timer();
+  assert(element('product-feedback').textContent.includes('접수'));
+  assert.strictEqual(element('submit-product').disabled, false);
+  pendingReply = false;
+  context.crypto = {getRandomValues(bytes) { bytes.fill(7); return bytes; }};
+  rejectBeforeAcceptance = true;
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(lastHeaders['Idempotency-Key'], '07'.repeat(16));
+  assert(element('product-feedback').textContent.includes('접수되지 않았습니다'));
+  assert.strictEqual(element('submit-product').disabled, false);
+  rejectBeforeAcceptance = false;
+  requestLost = true;
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert(element('product-feedback').textContent.includes('결과를 확인할 수 없습니다'));
+  assert(element('product-feedback').textContent.includes('재주문하지'));
+  assert.strictEqual(element('submit-product').disabled, true);
+  const countAfterLoss = postCount;
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(postCount, countAfterLoss);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''
         result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,

@@ -9,6 +9,7 @@ import secrets
 import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from server.order_demo_actions import DemoActionSession
 
 router = APIRouter()
 POLL_SECONDS = 0.1
@@ -19,6 +20,57 @@ _MAX_VALIDATION_COORDINATE_MM = 1000000
 _MAX_VALIDATION_YAW_DEGREES = 3600
 _SIM_ID = re.compile(r'sim-[A-Za-z0-9_-]{1,60}\Z', re.ASCII)
 _TWIN_ID = re.compile(r'[A-Za-z0-9_-]{1,64}\Z', re.ASCII)
+
+
+def _invalidate_action_owner(actions, client):
+    invalidate = getattr(actions, 'invalidate_owner', None)
+    if callable(invalidate):
+        invalidate(client)
+
+
+async def _action_call(fn, *args, on_cancel=None):
+    """Keep blocking action work off the ASGI loop without abandoning it.
+
+    A cancelled coroutine waits for its in-flight synchronous action to end;
+    the caller then performs the normal disconnect/unknown cleanup. In
+    particular a late poll must never mark an unsent action as sent after
+    ownership has been handed to a new connection.
+    """
+    future = asyncio.create_task(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel()
+        try:
+            await future
+        except Exception:
+            pass
+        raise
+
+
+async def _attach_action(actions, client, trusted):
+    # A cancellation can occur while attach is waiting for the shared lock.
+    # If it then succeeds, undo ownership before propagating cancellation.
+    future = asyncio.create_task(asyncio.to_thread(actions.attach, client, trusted))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        try:
+            if await future:
+                _invalidate_action_owner(actions, client)
+                await _action_call(actions.detach, client)
+        except Exception:
+            pass
+        raise
+
+
+def _poll_action(actions, client):
+    if isinstance(actions, DemoActionSession):
+        # DemoActionSession captures the clock after acquiring its lock.
+        return actions.poll(client)
+    # Retain compatibility with independent test/adapter implementations.
+    return actions.poll(client, time.monotonic())
 
 
 def _robot_mapping():
@@ -121,7 +173,7 @@ async def digital_twin(websocket: WebSocket):
         if actions is not None:
             trusted = (websocket.headers.getlist('origin') == ['http://127.0.0.1']
                        and _allowed_origin(websocket.headers))
-            claimed = actions.attach(websocket, trusted)
+            claimed = await _attach_action(actions, websocket, trusted)
         revisions = {robot_id: service.twin_observation(robot_id)['revision']
                      for robot_id in mapping}
         while True:
@@ -132,7 +184,8 @@ async def digital_twin(websocket: WebSocket):
                 text = event.get('text')
                 if claimed and isinstance(text, str) and len(text) <= 4096:
                     try:
-                        actions.receive(websocket, json.loads(text))
+                        await _action_call(actions.receive, websocket, json.loads(text),
+                                           on_cancel=lambda: _invalidate_action_owner(actions, websocket))
                     except (ValueError, TypeError, RecursionError):
                         pass
             except asyncio.TimeoutError:
@@ -152,11 +205,13 @@ async def digital_twin(websocket: WebSocket):
                     payload['data']['agv_id'] = twin_id
                     await websocket.send_json(payload)
             if claimed:
-                action = actions.poll(websocket, time.monotonic())
+                action = await _action_call(_poll_action, actions, websocket,
+                                            on_cancel=lambda: _invalidate_action_owner(actions, websocket))
                 if action is not None:
                     await websocket.send_json(action)
     except WebSocketDisconnect:
         return
     finally:
         if claimed:
-            actions.detach(websocket)
+            _invalidate_action_owner(actions, websocket)
+            await _action_call(actions.detach, websocket)

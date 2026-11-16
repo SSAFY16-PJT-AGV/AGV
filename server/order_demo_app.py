@@ -4,6 +4,7 @@ This process publishes simulated observations, never physical robot commands.
 Launch it via the isolated demo launcher, not the production server.
 """
 from contextlib import asynccontextmanager, ExitStack
+import copy
 import json
 import logging
 import os
@@ -13,12 +14,14 @@ import time
 import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictStr
 import paho.mqtt.client as mqtt
 
 from server.mqtt_client import start_mqtt, stop_mqtt
 from server.order_demo_actions import DemoActionSession
+from server.order_demo_admission import (AdmissionBusy, AdmissionConflict, AdmissionOutcomeUnknown,
+                                         AdmissionStopped, OrderAdmission)
 from server.twin_websocket import router as twin_router
 
 PRODUCTS = (
@@ -35,13 +38,27 @@ SIMULATION_STATUS = {'moving': 'MOVING', 'waiting': 'WAITING', 'failed': 'ERROR'
 
 
 class DemoRuntime:
-    def __init__(self, engine, port, nodes, observer=None):
+    def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic):
         self.engine = engine
         self.port = port
         self._nodes = nodes
         self.observer = observer
         self.lock = threading.RLock()
-        self.actions = DemoActionSession(engine, self.lock, can_dispatch=self._ready)
+        if not callable(clock) or not isinstance(snapshot_max_age, (int, float)) or snapshot_max_age <= 0:
+            raise ValueError('a positive snapshot maximum age and clock are required')
+        self.clock = clock
+        self.snapshot_max_age = snapshot_max_age
+        self._snapshot_lock = threading.Lock()
+        try:
+            self._cached_snapshot = copy.deepcopy(engine.snapshot())
+        except Exception:
+            self._cached_snapshot = {'status': 'unknown'}
+        self._snapshot_at = self.clock()
+        self._snapshot_valid = True
+        self._cached_ready = False
+        self.actions = DemoActionSession(engine, self.lock, can_dispatch=self._ready,
+                                         on_change=self._invalidate_snapshot)
+        self.admission = OrderAdmission()
         self.connected = threading.Event()
         self.stop_event = threading.Event()
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
@@ -68,6 +85,11 @@ class DemoRuntime:
 
     def stop(self):
         self.stop_event.set()
+        self._invalidate_snapshot()
+        self.admission.shutdown()
+        # Never tear down shared MQTT/DB resources while an accepted request
+        # is still using them; it remains unknown after shutdown.
+        self.admission.join()
         if self.thread is not None:
             self.thread.join(timeout=5)
         self.client.disconnect()
@@ -92,29 +114,89 @@ class DemoRuntime:
         except Exception:
             return False
 
+    def _invalidate_snapshot(self):
+        with self._snapshot_lock:
+            self._snapshot_valid = False
+
+    def _store_snapshot(self, state, ready):
+        snapshot = copy.deepcopy(state)
+        with self._snapshot_lock:
+            self._cached_snapshot = snapshot
+            self._snapshot_at = self.clock()
+            self._snapshot_valid = True
+            self._cached_ready = ready is True
+
     def snapshot(self):
-        with self.lock:
-            result = self.engine.snapshot()
-        result['connected'] = self._ready()
-        result['unreal_connected'] = self.actions.available()
+        # Observation must not wait for MQTT/DB operations held under the
+        # control lock. Cached state is never used for dispatch or safety.
+        acquired = self.lock.acquire(blocking=False)
+        try:
+            with self._snapshot_lock:
+                result = copy.deepcopy(self._cached_snapshot)
+                age = max(0.0, self.clock() - self._snapshot_at)
+                stale = not acquired or not self._snapshot_valid or age > self.snapshot_max_age
+                ready = self._cached_ready
+        finally:
+            if acquired:
+                self.lock.release()
+        result['stale'] = stale
+        result['connected'] = not stale and ready and self.connected.is_set() and not self.stop_event.is_set()
+        result['unreal_connected'] = not stale and self.actions.available_fast()
+        if stale or not result['connected'] or not result['unreal_connected']:
+            result['accepting_orders'] = False
         return result
 
     def create_order(self, pickup, destination):
-        with self.lock:
-            if not self._ready():
+        # The admission worker may wait for the control lock after its HTTP
+        # caller receives a pending ID. The operation remains exactly-once.
+        self.lock.acquire()
+        try:
+            if self.stop_event.is_set() or not self._ready():
                 raise ConnectionError('isolated broker unavailable')
-            return self.engine.create_order(pickup, destination)
+            self._invalidate_snapshot()
+            try:
+                result = self.engine.create_order(pickup, destination)
+                self._store_snapshot(self.engine.snapshot(), self._ready())
+                return result
+            except Exception as exc:
+                raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
+        finally:
+            self.lock.release()
 
     def create_product_order(self, product_id):
         product = next((item for item in PRODUCTS if item['id'] == product_id), None)
         if product is None:
             raise ValueError('unknown product')
-        with self.lock:
-            if not self._ready() or not self.actions.available():
+        self.lock.acquire()
+        try:
+            if self.stop_event.is_set() or not self._ready() or not self.actions.available():
                 raise ConnectionError('authenticated Unreal connection unavailable')
-            return self.engine.create_product_order(product['product_type'], product['pickup_node'],
-                                                    product['destination_node'], product['shelf_id'],
-                                                    product['slot_index'])
+            self._invalidate_snapshot()
+            try:
+                result = self.engine.create_product_order(product['product_type'], product['pickup_node'],
+                                                          product['destination_node'], product['shelf_id'],
+                                                          product['slot_index'])
+                self._store_snapshot(self.engine.snapshot(), self._ready())
+                return result
+            except Exception as exc:
+                raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
+        finally:
+            self.lock.release()
+
+    def _submit(self, operation, fingerprint, request_key=None):
+        # A request accepted by admission is never silently cancelled or
+        # retried. The operation itself rejects before mutation if busy.
+        return self.admission.submit(operation, fingerprint, request_key=request_key)
+
+    def submit_product_order(self, product_id, request_key=None):
+        if not any(item['id'] == product_id for item in PRODUCTS):
+            raise ValueError('unknown product')
+        return self._submit(lambda: self.create_product_order(product_id),
+                            'product:' + product_id, request_key)
+
+    def submit_order(self, pickup, destination, request_key=None):
+        return self._submit(lambda: self.create_order(pickup, destination),
+                            json.dumps(['nodes', pickup, destination], ensure_ascii=True), request_key)
 
     def _run(self):
         try:
@@ -124,6 +206,7 @@ class DemoRuntime:
                 if self._ready():
                     with self.lock:
                         state = self.engine.tick(min(now - previous, 0.5))
+                        self._store_snapshot(state, self._ready())
                     states = state.get('robots') if state.get('mode') == 'fleet' else [dict(state, robot_id='sim-r1')]
                     if (not isinstance(states, list) or not states or
                             any(item.get('robot_id') not in ('sim-r1', 'sim-r2') for item in states)):
@@ -143,11 +226,13 @@ class DemoRuntime:
                 else:
                     with self.lock:
                         self.engine.action_unknown()
+                        self._invalidate_snapshot()
                 previous = now
                 self.stop_event.wait(0.2)
         except Exception:
             logging.getLogger(__name__).error('isolated demo worker stopped')
             self.connected.clear()
+            self._invalidate_snapshot()
             with self.lock:
                 if hasattr(self.engine, 'action_unknown'):
                     self.engine.action_unknown()
@@ -297,11 +382,40 @@ def products(request: Request):
     return {'products': [dict(product) for product in PRODUCTS]}
 
 
+@app.get('/order-demo/api/submissions/{request_id}')
+def submission(request_id: str, request: Request):
+    demo = _demo(request)
+    try:
+        return demo.admission.get(request_id)
+    except (KeyError, ValueError):
+        raise HTTPException(404, '요청을 찾을 수 없습니다') from None
+
+
+def _request_key(request):
+    values = request.headers.getlist('idempotency-key')
+    if len(values) > 1:
+        raise HTTPException(422, '요청 키가 올바르지 않습니다')
+    return values[0] if values else None
+
+
+def _submission_response(result):
+    if isinstance(result, dict) and result.get('status') in ('pending', 'unknown') and result.get('request_id'):
+        return JSONResponse(result, status_code=202)
+    return result
+
+
 @app.post('/order-demo/api/product-orders')
 def product_order(body: ProductOrderRequest, request: Request):
     demo = _demo(request, mutate=True)
     try:
-        return demo.create_product_order(body.product_id)
+        submit = getattr(demo, 'submit_product_order', None)
+        result = (submit(body.product_id, _request_key(request)) if submit is not None
+                  else demo.create_product_order(body.product_id))
+        return _submission_response(result)
+    except AdmissionConflict:
+        raise HTTPException(409, '요청 키가 다른 주문에 사용됐습니다') from None
+    except (AdmissionBusy, AdmissionStopped):
+        raise HTTPException(503, '가상 주문을 접수할 수 없습니다') from None
     except ValueError:
         raise HTTPException(422, '알 수 없는 상품입니다') from None
     except RuntimeError:
@@ -314,7 +428,14 @@ def product_order(body: ProductOrderRequest, request: Request):
 def order(body: OrderRequest, request: Request):
     demo = _demo(request, mutate=True)
     try:
-        return demo.create_order(body.pickup_node, body.destination_node)
+        submit = getattr(demo, 'submit_order', None)
+        result = (submit(body.pickup_node, body.destination_node, _request_key(request)) if submit is not None
+                  else demo.create_order(body.pickup_node, body.destination_node))
+        return _submission_response(result)
+    except AdmissionConflict:
+        raise HTTPException(409, '요청 키가 다른 주문에 사용됐습니다') from None
+    except (AdmissionBusy, AdmissionStopped):
+        raise HTTPException(503, '가상 주문을 접수할 수 없습니다') from None
     except ValueError:
         raise HTTPException(422, '선택한 지점으로 경로를 만들 수 없습니다') from None
     except RuntimeError:
