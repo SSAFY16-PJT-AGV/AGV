@@ -117,6 +117,8 @@ DEFAULT_CONFIG = {
         "edge_frac": 0.3,       # 라인을 놓치기 직전 위치가 화면 왼/오른쪽 이 비율 안이면 급커브로 화면 밖에
                                 # 나간 것: 그쪽으로 제자리 회전하며 찾는다
         "search_timeout_s": 4.0,  # 그렇게 찾는 최대 시간(그 뒤 정지)
+        "track_jump_frac": 0.2,   # 바로 앞 프레임에 라인을 봤으면, 화면 폭의 이 비율보다 먼 조각으로는 안 넘어감
+        "min_w_k": 0.3,           # 라인 폭(조향 줄)의 이 배보다 가는 조각은 라인이 아님(패치 가장자리의 가는 어두운 띠 등)
     },
 }
 
@@ -154,6 +156,7 @@ class Analysis(object):
         self.rows = []          # [(y, [xc, ...]), ...] 위(먼 곳)부터
         self.widths = []        # rows와 같은 순서의 조각 폭 [[w, ...], ...]
         self.raw = []           # rows와 같은 순서, 폭 필터 전 조각 [(x0, x1), ...] (스퍼 판정용)
+        self.raw_all = []       # raw와 같되 매트 밖 바닥으로 뺀 조각도 남김(라인 추종용: 바닥에 붙은 선도 따라감)
         self.ctrl_idx = 0
         self.patch_fracs = {}
         self.line_mask = None
@@ -211,6 +214,7 @@ def analyze(bgr, cfg):
         an.rows.append((int(y), [(a + b) / 2.0 for a, b in runs]))
         an.widths.append([float(b - a + 1) for a, b in runs])
         an.raw.append(allruns)
+    an.raw_all = per_row
     an.ctrl_idx = int(np.argmin(np.abs(ys - lc["control_row"] * h)))
 
     pc = cfg["patch"]
@@ -523,7 +527,8 @@ class Follower(object):
         self.c = cfg["follow"]
         self.last_x = None
         self.prev_err = 0.0
-        self.rejected = 0       # 이번 프레임에 버린 먼 화면-끝 조각 수(디버그용)
+        self.rejected = 0       # 이번 프레임에 버린 조각 수(디버그용)
+        self.missed = 999       # 라인을 못 본 연속 프레임 수
 
     def _ok(self, run, x, w):
         """마지막 라인 위치에서 갑자기 멀리 있는 조각은 받지 않는다(화면 옆 끝에 붙은 조각은 더 엄하게).
@@ -531,6 +536,8 @@ class Follower(object):
         라인으로 잡아 계속 그쪽으로 도는 것을 막는다."""
         a, b = run
         lim = self.c.get("jump_frac", 0.3) if (a <= 1 or b >= w - 2) else self.c.get("max_jump_frac", 0.5)
+        if self.missed == 0:
+            lim = min(lim, self.c.get("track_jump_frac", 0.2))
         return abs(x - self.last_x) <= lim * w
 
     def edge_side(self, w):
@@ -551,6 +558,9 @@ class Follower(object):
         if self.last_x is None:
             self.last_x = an.w / 2.0
         ctrl_segs = an.rows[an.ctrl_idx][1]
+        wmin = self.c.get("min_w_k", 0.3) * lw if lw else 0.0
+        if wmin and an.widths:
+            ctrl_segs = [c for c, wd in zip(ctrl_segs, an.widths[an.ctrl_idx]) if wd >= wmin]
         x = None
         if choice in ("left", "right") and len(ctrl_segs) >= 2:
             x = ctrl_segs[0] if choice == "left" else ctrl_segs[-1]
@@ -560,12 +570,13 @@ class Follower(object):
             if not near_only:
                 order += list(range(an.ctrl_idx - 1, -1, -1))
             self.rejected = 0
+            runs_by_row = an.raw_all or an.raw
             for i in order:
-                if an.raw:
+                if runs_by_row:
                     cand = []
-                    for r in an.raw[i]:
+                    for r in runs_by_row[i]:
                         cx = _line_x(r, self.last_x, lw)
-                        if self._ok(r, cx, an.w):
+                        if (r[1] - r[0] + 1) >= wmin and self._ok(r, cx, an.w):
                             cand.append(cx)
                         else:
                             self.rejected += 1
@@ -576,6 +587,9 @@ class Follower(object):
                     break
         if x is not None:
             self.last_x = float(x)
+            self.missed = 0
+        else:
+            self.missed += 1
         return x
 
     def command(self, x, w, dt):

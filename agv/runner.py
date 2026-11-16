@@ -589,6 +589,7 @@ class ExploreRunner(object):
         turn = 0.0
         if x0 is not None:
             self.follow.last_x = x0
+            self.follow.missed = 0
             k = 3
             x1 = self._line_at(an, max(0, an.ctrl_idx - k), x0)
             e = (x0 - an.w / 2.0) / (an.w / 2.0)
@@ -650,6 +651,7 @@ class ExploreRunner(object):
     def _rejoin(self, an, x):
         self.state = "follow"
         self.follow.last_x = float(x)
+        self.follow.missed = 0
         self.follow.prev_err = 0.0
         self.junc.state = "one"
         self.junc.in_split = False

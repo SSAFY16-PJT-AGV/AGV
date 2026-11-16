@@ -145,6 +145,29 @@ class TestLostLineAtCorner(unittest.TestCase):
         self.assertEqual(f.edge_side(an.w), "left")
         self.assertIsNotNone(f.target(analyze(self._frame(25), cfg), near_only=True))   # 왼쪽에서 다시 들어오면 잡음
 
+    def test_thin_patch_edge_is_not_the_line(self):
+        """어두운 조명에서 파란 패치 가장자리가 가는 어두운 띠로 잡히고, 라인이 옆 가지와 붙어 화면 끝까지 넓어져
+        매트 밖 바닥으로 빠지는 순간 그 띠로 넘어가 제자리에서 돌던 문제(실물 주행)."""
+        import cv2
+        import numpy as np
+        from agv.linecam import Follower
+        cfg = self._cfg()
+        f = Follower(cfg)
+
+        def frame(tape_top):
+            im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+            cv2.rectangle(im, (276, 0), (287, 239), (55, 55, 58), -1)            # 가는 띠(패치 가장자리)
+            cv2.rectangle(im, (148, tape_top), (184, 239), (25, 25, 25), -1)      # 테이프
+            return im
+        for _ in range(3):
+            an = analyze(frame(0), cfg)
+            x = f.target(an, lw=36.0)
+            self.assertAlmostEqual(x, 166, delta=3)
+        an = analyze(frame(205), cfg)                                            # 조향 줄에서 테이프가 안 보임
+        self.assertTrue(any(a > 260 for a, b in an.raw[an.ctrl_idx]), an.raw[an.ctrl_idx])
+        x = f.target(an, lw=36.0)
+        self.assertAlmostEqual(x, 166, delta=3)                                  # 아래 줄의 테이프를 계속 따라감
+
     def _runner(self, tmp):
         from agv.runner import ExploreRunner
         from agv.topo import EventLogger, Explorer

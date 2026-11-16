@@ -81,8 +81,17 @@ def base_stats(frames, cfg, step=5):
     s = np.concatenate(ss)
     thr, _ = cv2.threshold(v.astype(np.uint8).reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     bright = v >= thr
+    line_v = float(np.median(v[~bright])) if (~bright).any() else 0.0
+    dark = v[~bright]
+    if dark.size > 50:
+        # 어두운 무리에는 테이프 말고도 어두운 패치(파랑·보라)·바닥·그림자가 섞인다(어두운 조명에서 실제로
+        # 라인 밝기가 64로 잡혀 패치 가장자리가 라인이 됨). 한 번 더 나눠 가장 어두운 쪽을 라인으로 본다.
+        t2, _ = cv2.threshold(dark.astype(np.uint8).reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        darker = dark[dark < t2]
+        if darker.size >= 0.01 * v.size:
+            line_v = float(np.median(darker))
     st = {"otsu": float(thr),
-          "line_v": float(np.median(v[~bright])) if (~bright).any() else 0.0,
+          "line_v": line_v,
           "mat_v": float(np.median(v[bright])) if bright.any() else 255.0,
           "mat_s": 30.0}
     if bright.any():
