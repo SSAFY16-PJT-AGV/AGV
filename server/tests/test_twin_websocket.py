@@ -24,6 +24,8 @@ class TwinWebSocketTest(unittest.IsolatedAsyncioTestCase):
         self.env = patch.dict(os.environ, {'AGV_TWIN_WEBSOCKET': '1', 'AGV_TWIN_ROBOT_ID': 'sim-r1',
                                            'AGV_TWIN_UNREAL_TOKEN': '', 'AGV_TWIN_POSE_MAP_ID': ''})
         self.env.start()
+        # Unit tests must not inherit a caller's explicit multi-robot map.
+        os.environ.pop('AGV_TWIN_ROBOT_MAP', None)
 
     async def asyncTearDown(self):
         if self.task is not None:

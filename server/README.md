@@ -192,6 +192,65 @@ Start-Process -FilePath 'D:\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor
 로컬 프로세스 인증을 제공하지 않고, 같은 계정의 프로세스에서 환경변수를
 읽을 가능성도 있으므로 외부 네트워크나 실물 브로커에 노출하지 않는다.
 
+### 격리된 가상 로봇 두 대 관측 시험
+
+실물과 공유하지 않는 MQTT 브로커에서 두 가상 발행기를 사용할 때,
+서버를 실행하기 전 MQTT의 가상 ID와 Unreal 액터 ID를 명시적으로 매핑한다.
+
+```powershell
+$env:AGV_TWIN_ROBOT_MAP = '{"sim-r1":"AGV_01","sim-r2":"AGV_02"}'
+```
+
+이 설정에서는 `sim-r1`, `sim-r2`의 새 상태를 각각 `AGV_01`, `AGV_02`로
+하나의 WebSocket에서 전달하며 `AGV_TWIN_ROBOT_ID`는 무시한다. Unreal 액터의
+실제 `AGVId`도 고유하게 일치해야 한다. ID에 `sim-`을 붙이는 것만으로 브로커
+분리나 실물 안전을 보장할 수 없다.
+
+정확히 서로 다른 두 항목만 허용하고 MQTT ID는 `sim-` 뒤 ASCII 영문·숫자·
+`_`·`-` 1~60자, Unreal ID는 같은 문자 1~64자여야 한다. 빈 값이나 잘못된
+JSON, 중복, 와일드카드, 비시뮬레이션 ID, 다른 항목 수는 연결을 거부한다.
+매핑이 없는 기존 단일 모드로 돌아가려면 빈 값을 넣지 말고 환경변수를 제거한다.
+
+```powershell
+Remove-Item Env:AGV_TWIN_ROBOT_MAP -ErrorAction SilentlyContinue
+```
+
+두 로봇 관측이 동시에 연결된다는 사실은 충돌 방지 또는 실물 운행의 검증을
+의미하지 않는다. 위치 전송은 아래의 별도 가상 pose 설정과 유효성 제한을 따른다.
+
+#### Unreal 화면 시험 재현
+
+2026-11-16에 두 가상 로봇이 서로 다른 직선 구간에서 부드럽게 왕복하는
+것을 Unreal Editor 화면에서 확인했다. 현식님이 구현한 좌표 보간을 사용한다.
+집에서 시험하려면 서버 의존성을 설치하고 별도의 aMQTT 의존성을 준비한다.
+
+```powershell
+.\.venv\Scripts\python -m pip install --target .venv/broker-deps 'amqtt==0.11.3'
+```
+
+Unreal 프로젝트는 별도로 준비한다. 기존 Unreal 에디터를 닫고, 별도 테스트
+사본에 [로컬 인증 패치](docs/unreal_local_auth.patch)를 `git apply --check
+--unidiff-zero`로 확인한 뒤 적용·빌드한다. 패치는 `feature/digital-twin`의
+`44cc000` 기준이며, 다른 커밋은 적용 가능 여부를 먼저 확인한다. 액터의
+`AGVId`는 각각 `AGV_01`, `AGV_02`여야 한다. Unreal 엔진과 프로젝트는
+이 서버 브랜치에 포함되지 않는다.
+
+저장소 루트에서 실제 PC에 맞게 아래 두 경로를 바꾸어 실행한다.
+
+```powershell
+$editor = 'C:\경로\UnrealEditor.exe'
+$project = 'C:\경로\agvSimulation.uproject'
+.\.venv\Scripts\python -m server.tools.twin_multi_test --editor $editor --project $project
+```
+
+스크립트는 루프백 전용 임시 브로커와 서버, 가상 발행기를 시작하고 Unreal을
+연다. `Content/AGV/NewMap`을 열고 플레이한다. 로봇들이 움직이지 않으면
+Unreal 로그에서 WebSocket 연결과 `AGV_01`, `AGV_02` 상태 수신을 확인한다.
+스크립트가 Unreal 연결 자체를 보증하지는 않는다. 콘솔에서 Ctrl+C를 누르면
+시험 서버와 브로커는 종료되며 Unreal은 직접 닫는다. 8000번 포트가 이미
+사용 중이면 시험을 시작하지 않는다. 두 로봇의 직선 시험은 충돌 방지나
+실물 주행 시험이 아니다.
+
 ID만으로 가상 장비와 네트워크의 격리를 보장할 수 없다. 오래된 상태는 다시
 보내지 않고 경로 주문은 전송하지 않는다. 기본 모드는 노드 상태만 보내며,
 현재 트윈은 노드 메시지를 받으면 표시 위치를 바꿀 수 있으므로 같은 맵의

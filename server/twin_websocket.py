@@ -1,6 +1,7 @@
-"""Opt-in local, observation-only prototype for a single digital twin robot."""
+"""Opt-in local, observation-only prototype for simulated digital twins."""
 import asyncio
 import ipaddress
+import json
 import math
 import os
 import re
@@ -16,6 +17,40 @@ _TOKEN_FORMAT = re.compile(r'[A-Za-z0-9_-]{32,128}\Z', re.ASCII)
 _VALIDATION_MAP_ID = 'twin-validation-v1'
 _MAX_VALIDATION_COORDINATE_MM = 1000000
 _MAX_VALIDATION_YAW_DEGREES = 3600
+_SIM_ID = re.compile(r'sim-[A-Za-z0-9_-]{1,60}\Z', re.ASCII)
+_TWIN_ID = re.compile(r'[A-Za-z0-9_-]{1,64}\Z', re.ASCII)
+
+
+def _robot_mapping():
+    """Return explicit MQTT-to-Unreal IDs, or reject an invalid configuration."""
+    raw = os.getenv('AGV_TWIN_ROBOT_MAP')
+    if raw is None:
+        robot_id = os.getenv('AGV_TWIN_ROBOT_ID', '')
+        return {robot_id: robot_id} if robot_id.startswith('sim-') else None
+    if len(raw) > 4096:
+        return None
+
+    def unique_pairs(pairs):
+        values = {}
+        for key, value in pairs:
+            if key in values:
+                raise ValueError('duplicate robot ID')
+            values[key] = value
+        return values
+
+    try:
+        mapping = json.loads(raw, object_pairs_hook=unique_pairs)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(mapping, dict) or len(mapping) != 2:
+        return None
+    if any(not isinstance(key, str) or _SIM_ID.fullmatch(key) is None
+           or not isinstance(value, str) or _TWIN_ID.fullmatch(value) is None
+           for key, value in mapping.items()):
+        return None
+    if len(set(mapping.values())) != 2:
+        return None
+    return mapping
 
 
 def _allowed_origin(headers):
@@ -66,12 +101,12 @@ def _message(robot_id, observation):
 
 @router.websocket('/ws/digital-twin')
 async def digital_twin(websocket: WebSocket):
-    robot_id = os.getenv('AGV_TWIN_ROBOT_ID', '')
+    mapping = _robot_mapping()
     try:
         local_client = ipaddress.ip_address(websocket.client.host).is_loopback
     except (AttributeError, ValueError):
         local_client = False
-    if (os.getenv('AGV_TWIN_WEBSOCKET') != '1' or not robot_id.startswith('sim-')
+    if (os.getenv('AGV_TWIN_WEBSOCKET') != '1' or mapping is None
             or not local_client or not _allowed_origin(websocket.headers)):
         await websocket.close(code=1008)
         return
@@ -80,8 +115,9 @@ async def digital_twin(websocket: WebSocket):
         await websocket.close(code=1011)
         return
     try:
-        revision = service.twin_observation(robot_id)['revision']
         await websocket.accept()
+        revisions = {robot_id: service.twin_observation(robot_id)['revision']
+                     for robot_id in mapping}
         while True:
             try:
                 event = await asyncio.wait_for(websocket.receive(), timeout=POLL_SECONDS)
@@ -89,17 +125,19 @@ async def digital_twin(websocket: WebSocket):
                     return
             except asyncio.TimeoutError:
                 pass
-            snapshot = service.twin_observation(robot_id)
-            current_revision = snapshot['revision']
-            if current_revision == revision:
-                continue
-            revision = current_revision
-            received_at = snapshot['received_at']
-            if (not snapshot['connected'] or not snapshot['ready'] or received_at is None
-                    or not 0 <= time.monotonic() - received_at <= MAX_OBSERVATION_AGE_SECONDS):
-                continue
-            payload = _message(robot_id, snapshot['observation'])
-            if payload is not None:
-                await websocket.send_json(payload)
+            for robot_id, twin_id in mapping.items():
+                snapshot = service.twin_observation(robot_id)
+                current_revision = snapshot['revision']
+                if current_revision == revisions[robot_id]:
+                    continue
+                revisions[robot_id] = current_revision
+                received_at = snapshot['received_at']
+                if (not snapshot['connected'] or not snapshot['ready'] or received_at is None
+                        or not 0 <= time.monotonic() - received_at <= MAX_OBSERVATION_AGE_SECONDS):
+                    continue
+                payload = _message(robot_id, snapshot['observation'])
+                if payload is not None:
+                    payload['data']['agv_id'] = twin_id
+                    await websocket.send_json(payload)
     except WebSocketDisconnect:
         return
