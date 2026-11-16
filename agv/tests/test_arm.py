@@ -169,3 +169,66 @@ class _Chain(object):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeBus(object):
+    """PCA9685 흉내: 0x60에만 응답, 레지스터 값을 기억."""
+
+    def __init__(self, addr=0x60):
+        self.addr = addr
+        self.reg = {}
+
+    def read_byte_data(self, addr, reg):
+        if addr != self.addr:
+            raise IOError("no device")
+        return self.reg.get(reg, 0x11)
+
+    def write_byte_data(self, addr, reg, val):
+        assert addr == self.addr
+        self.reg[reg] = val
+
+    def pwm(self, ch):
+        b = 0x06 + 4 * ch
+        r = self.reg
+        return (r.get(b, 0) | r.get(b + 1, 0) << 8, r.get(b + 2, 0) | r.get(b + 3, 0) << 8)
+
+
+class TestPCA9685Motors(unittest.TestCase):
+    """jetbot 라이브러리 없이 모터 보드를 움직이는 드라이버(Waveshare jetbot 포크와 같은 레지스터)."""
+
+    def test_finds_board_and_sets_frequency(self):
+        from agv.motordrv import PCA9685Motors
+        bus = FakeBus(0x60)
+        m = PCA9685Motors(smbus=bus)
+        self.assertEqual(m.addr, 0x60)
+        self.assertEqual(bus.reg[0xFE], 3)                        # 1600Hz 프리스케일
+
+    def test_forward_and_reverse_pins(self):
+        from agv.motordrv import PCA9685Motors
+        bus = FakeBus(0x60)
+        m = PCA9685Motors(smbus=bus)
+        m.set_motors(0.5, -0.5)
+        s = int(255 * 0.5) * 16
+        self.assertEqual(bus.pwm(8), (0, s))                      # 왼쪽 속도(Adafruit 핀)
+        self.assertEqual((bus.pwm(1), bus.pwm(0)), ((0, s), (0, 0)))   # 왼쪽 +: Waveshare ina에 PWM
+        self.assertEqual((bus.pwm(2), bus.pwm(3)), ((0, 0), (0, s)))   # 오른쪽 -: inb에 PWM
+        m.stop()
+        self.assertEqual([bus.pwm(c) for c in (0, 1, 2, 3)], [(0, 0)] * 4)
+
+    def test_no_board(self):
+        from agv.motordrv import PCA9685Motors
+        with self.assertRaises(RuntimeError):
+            PCA9685Motors(smbus=FakeBus(0x70))
+
+    def test_wrapper_falls_back_without_jetbot(self):
+        import agv.motordrv as md
+        from agv.hw import JetbotMotors
+        orig = md.open_bus
+        md.open_bus = lambda bus=1: FakeBus(0x60)
+        try:
+            jm = JetbotMotors(invert_left=True, trim=0.0)
+        finally:
+            md.open_bus = orig
+        self.assertEqual(jm.driver, "pca9685@0x60")
+        jm.set(0.3, 0.3)                                          # 왼쪽 반대(invert_left)
+        self.assertEqual(jm.robot.bus.pwm(0)[1], int(255 * 0.3) * 16)

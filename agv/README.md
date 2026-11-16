@@ -14,7 +14,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `runner.py` | 한 프레임 처리 로직. 시뮬레이터(`sim/mat/`)도 같은 코드를 쓴다 |
 | `linecam.py` | 라인·색 패치·갈림길 검출, 라인 추종 조향 |
 | `topo/` | 이벤트 로그 형식, 탐색 정책(안 가 본 가지 우선), 맵 빌더, 주행 기록으로 맵 모양 계산(`shape.py`) |
-| `hw.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot) |
+| `hw.py`, `motordrv.py` | 카메라(GStreamer / jetbot / 녹화 영상), 모터(jetbot Robot, 없으면 모터 보드 PCA9685를 I2C로 바로) |
 | `arm.py` | 카메라 자세(팔 서보 1·2·3·5번 각도) 읽기·맞추기·저장. 저장한 자세는 시작할 때 자동으로 맞춤 |
 | `tools/camtool.py` | 현장 보정: 카메라 자세 맞추기·저장(`arm`), 화면 저장(체커보드 확인 포함), 바닥 좌표계용 회전 사진, HSV 측정, 속도 측정 |
 | `camcalib.py`, `tools/calib.py` | 체커보드 사진으로 렌즈 보정값(어안/핀홀 자동 선택) 계산·불러오기 |

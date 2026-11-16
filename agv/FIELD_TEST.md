@@ -30,6 +30,13 @@ git pull
 git stash pop      # 되돌리기. 충돌이 나면 agv/config/explore.json에서 <<<< 표시 부분을 골라 고친다
 ```
 
+**모터 (처음 한 번 확인)**: JetPack 4.5 JetBot 이미지는 `jetbot` 라이브러리가 도커 컨테이너 안에만 있어서 SSH 터미널의 python3에서는 `No module named 'jetbot'`이 난다. 이때는 모터 보드(PCA9685, I2C)를 바로 움직이는 내장 드라이버로 바꿔 쓴다. 시작할 때 `모터: pca9685@0x60`이 나오면 그것이다(`jetbot`이 있으면 `모터: jetbot`).
+
+- `I2C 라이브러리가 없어요`: `sudo apt install python3-smbus`(또는 `pip3 install --user smbus2`)
+- `I2C 버스 1을 못 열었어요`: `sudo usermod -aG i2c $USER` 후 다시 로그인
+- `모터 보드를 못 찾았어요`: `sudo i2cdetect -y -r 1`로 `60`(또는 `40`)이 보이는지 확인. 다른 주소면 설정 `robot.motor_i2c_addr`에 적는다(예: `"0x40"`)
+- 바퀴가 반대로 돌면 `robot.invert_left/right`, 한쪽으로 쏠리면 `robot.trim`. 드라이버를 고정하려면 `robot.motor_driver`를 `jetbot`이나 `pca9685`로
+
 **팔 서보 라이브러리 (처음 한 번)**: 카메라 자세(`camtool arm`)는 Waveshare 서보 라이브러리 `SCSCtrl`을 쓴다. `서보를 못 써요: SCSCtrl ... 못 찾았어요`가 나오면 설치한다.
 
 ```

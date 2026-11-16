@@ -102,9 +102,23 @@ class NullMotors(object):
 
 
 class JetbotMotors(object):
-    def __init__(self, invert_left=False, invert_right=False, trim=0.0):
-        from jetbot import Robot
-        self.robot = Robot()
+    """모터. jetbot 라이브러리가 있으면 그 Robot을, 없으면(JetPack 4.5 이미지는 도커 안에만 있음)
+    모터 보드를 바로 움직이는 agv.motordrv.PCA9685Motors를 쓴다. driver: auto | jetbot | pca9685."""
+
+    def __init__(self, invert_left=False, invert_right=False, trim=0.0, driver="auto", i2c_bus=1, i2c_addr=None):
+        self.robot = None
+        if driver in ("auto", "jetbot"):
+            try:
+                from jetbot import Robot
+                self.robot = Robot()
+                self.driver = "jetbot"
+            except ImportError:
+                if driver == "jetbot":
+                    raise
+        if self.robot is None:
+            from .motordrv import PCA9685Motors
+            self.robot = PCA9685Motors(bus=i2c_bus, addr=i2c_addr)
+            self.driver = "pca9685@0x%02x" % self.robot.addr
         self.sl = -1.0 if invert_left else 1.0
         self.sr = -1.0 if invert_right else 1.0
         self.trim = trim            # 직진 시 한쪽으로 쏠리면 보정(+면 왼쪽을 더 세게)
@@ -114,6 +128,17 @@ class JetbotMotors(object):
 
     def stop(self):
         self.robot.stop()
+
+
+def make_motors(cfg):
+    """설정(robot.*)으로 모터를 연다. robot.motor_driver: auto(기본) | jetbot | pca9685,
+    robot.i2c_bus(기본 1), robot.motor_i2c_addr(기본 자동: 0x60, 0x40 순서로 찾음)."""
+    rob = cfg["robot"]
+    addr = rob.get("motor_i2c_addr")
+    if isinstance(addr, str):
+        addr = int(addr, 0)
+    return JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False), rob.get("trim", 0.0),
+                        driver=rob.get("motor_driver", "auto"), i2c_bus=rob.get("i2c_bus", 1), i2c_addr=addr)
 
 
 # ---------- 팔(카메라 자세) ----------

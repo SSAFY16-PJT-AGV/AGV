@@ -37,7 +37,7 @@ import time
 
 import cv2
 
-from .hw import JetbotMotors, NullMotors, open_camera
+from .hw import NullMotors, make_motors, open_camera
 from .linecam import DEFAULT_CONFIG, draw_debug, merge_config
 from .runner import ExploreRunner
 from .topo import EventLogger, Explorer
@@ -193,8 +193,13 @@ def main(argv=None):
     rob = cfg["robot"]
     motors = NullMotors()
     if a.mode != "passive":
-        motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False),
-                              rob.get("trim", 0.0))
+        try:
+            motors = make_motors(cfg)
+        except RuntimeError as e:
+            cam.close()
+            print(u"모터를 못 열었어요: %s" % e)
+            return 1
+        print(u"모터: %s" % motors.driver)
 
     # 영상 재생이면 영상 시간으로 기록
     clock = time.time

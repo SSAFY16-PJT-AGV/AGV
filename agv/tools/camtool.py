@@ -35,7 +35,7 @@ import numpy as np
 
 from ..camcalib import find_corners, guess_board
 from ..explore import HERE, ROOT, _offmat_text, load_config
-from ..hw import JetbotMotors, open_camera
+from ..hw import make_motors, open_camera
 from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
 
 
@@ -117,8 +117,7 @@ def cmd_ground(a, cfg):
     arm_res = _apply_arm(a, cfg)
     motors = None
     if a.enable_motors:
-        rob = cfg["robot"]
-        motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False), rob.get("trim", 0.0))
+        motors = make_motors(cfg)
     else:
         print(u"--enable-motors가 없어서 지금 자세 한 장만 찍어요(회전 사진 없음).")
     # 왼쪽 두 번, 오른쪽 네 번, 왼쪽 두 번: 0, +1, +2, +1, 0, -1, -2, -1, 0 위치
@@ -396,8 +395,7 @@ def cmd_speed(a, cfg):
     if not a.enable_motors:
         print(u"로봇이 직진해요. 앞을 비우고 --enable-motors를 붙여 다시 실행하세요.")
         return 2
-    rob = cfg["robot"]
-    m = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False), rob.get("trim", 0.0))
+    m = make_motors(cfg)
     base = cfg["follow"]["base_speed"]
     print(u"%.1f초 동안 base_speed=%.2f로 직진합니다. 출발점을 표시해 두세요." % (a.seconds, base))
     time.sleep(2.0)
