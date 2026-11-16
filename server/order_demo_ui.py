@@ -34,6 +34,7 @@ HTML_PAGE = r'''<!doctype html>
     dt { color: #64748b; font-size: .9rem; }
     dd { margin: 0; font-size: .95rem; overflow-wrap: anywhere; }
     .notice { margin: 20px 0 0; padding: 14px 16px; border-radius: 10px; background: #f0f6fb; color: #486079; font-size: .87rem; line-height: 1.6; }
+    .fleet-row { white-space: pre-line; line-height: 1.7; border-top: 1px solid #edf1f5; padding: 12px 0; overflow-wrap: anywhere; }
     @media (max-width: 660px) { main { padding: 26px 16px 48px; } .grid { grid-template-columns: 1fr; } .card { padding: 21px; } }
   </style>
 </head>
@@ -71,12 +72,15 @@ HTML_PAGE = r'''<!doctype html>
     <section class="card" aria-labelledby="status-title">
       <h2 id="status-title">진행 현황</h2>
       <p class="help">서버가 보고하는 가상 운반 상태입니다.</p>
+      <div id="single-status">
       <span class="badge" id="status">확인 중</span>
       <dl aria-live="polite">
         <div><dt>단계</dt><dd id="phase">확인 중</dd></div>
         <div><dt>현재 노드</dt><dd id="current-node">—</dd></div>
         <div><dt>계산 경로</dt><dd id="route">—</dd></div>
       </dl>
+      </div>
+      <div id="fleet-status" aria-live="polite" hidden></div>
       <p id="status-feedback" class="feedback" role="status" aria-live="polite"></p>
       <p class="notice">이 화면은 가상 시연입니다. 실제 상품이나 로봇 운행 결과는 아닙니다.</p>
     </section>
@@ -99,7 +103,8 @@ HTML_PAGE = r'''<!doctype html>
   let products = new Map();
   let submitting = false;
   let polling = false;
-  let jobActive = false;
+  let jobActive = true;
+  let fleetMode = false;
 
   function message(element, text, success = false) {
     element.textContent = text;
@@ -178,10 +183,12 @@ HTML_PAGE = r'''<!doctype html>
   }
   const statuses = {idle: '대기 중', pending: '요청 접수', queued: '요청 접수',
     running: '이동 중', moving: '이동 중', completed: '가상 도착', arrived: '가상 도착',
+    waiting: '확인 중', waiting_reservation: '구간 예약 대기', reservation_wait: '구간 예약 대기',
     waiting_grab: '집기 확인 중', waiting_place: '적재 확인 중',
     unknown: '결과 확인 불가', failed: '작업 실패', error: '오류'};
   const phases = {idle: '대기 중', pending: '경로 준비 중', to_pickup: '출발지로 이동',
     pickup: '출발지 도착', to_destination: '도착지로 이동', completed: '가상 도착', done: '가상 도착',
+    waiting_reservation: '구간 예약 대기', reservation_wait: '구간 예약 대기',
     waiting_grab: '집기 확인 중', waiting_place: '적재 확인 중', unknown: '결과 확인 불가',
     arrived: '가상 도착', failed: '처리 실패'};
   function textValue(value) { return typeof value === 'string' && value ? value : '—'; }
@@ -190,6 +197,35 @@ HTML_PAGE = r'''<!doctype html>
     polling = true;
     try {
       const data = await readJson(await fetch('/order-demo/api/status', {cache: 'no-store'}));
+      fleetMode = data.mode === 'fleet';
+      document.getElementById('single-status').hidden = fleetMode;
+      document.getElementById('fleet-status').hidden = !fleetMode;
+      if (fleetMode) {
+        if (typeof data.accepting_orders !== 'boolean' || !Array.isArray(data.robots) ||
+            !data.robots.every(robot => robot && typeof robot.robot_id === 'string' && robot.robot_id)) {
+          throw new Error('invalid fleet status');
+        }
+        document.getElementById('direct-orders').hidden = true;
+        const fleet = document.getElementById('fleet-status');
+        fleet.replaceChildren();
+        for (const robot of data.robots) {
+          const row = document.createElement('p');
+          row.className = 'fleet-row';
+          const phase = phases[robot.phase] || textValue(robot.phase);
+          const effectiveStatus = robot.status === 'waiting' && robot.phase === 'reservation_wait'
+            ? 'reservation_wait' : robot.status;
+          const status = robot.status === 'completed' && robot.product_type && robot.phase === 'done'
+            ? '가상 적재 확인됨' : (statuses[effectiveStatus] || textValue(effectiveStatus));
+          const route = Array.isArray(robot.route) && robot.route.length
+            ? robot.route.map(textValue).join(' → ') : '—';
+          row.textContent = `${robot.robot_id} · ${status}\n단계: ${phase}\n현재 노드: ${textValue(robot.current_node)}\n경로: ${route}`;
+          fleet.appendChild(row);
+        }
+        jobActive = !data.accepting_orders;
+        updateButton();
+        message(statusFeedback, jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : '');
+        return;
+      }
       const terminalIssue = ['unknown', 'failed'].includes(data.status) ? data.status : null;
       const exhausted = data.mode === 'coordinated' && data.orders_remaining === 0 && data.status === 'completed';
       document.getElementById('direct-orders').hidden = data.mode === 'coordinated';
@@ -207,6 +243,7 @@ HTML_PAGE = r'''<!doctype html>
       message(statusFeedback, terminalIssue || exhausted
         ? '시연 서버와 Unreal 에디터를 종료한 뒤 다시 시작해 주세요.' : '');
     } catch (_) {
+      if (fleetMode) { jobActive = true; updateButton(); }
       message(statusFeedback, '진행 현황을 불러오지 못했습니다. 서버 연결을 확인해 주세요.');
     } finally { polling = false; }
   }

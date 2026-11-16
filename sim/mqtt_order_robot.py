@@ -19,8 +19,6 @@ from sim.order_executor import SimOrderExecutor
 
 MAX_QUEUED_ORDERS = 32
 MAX_ORDER_BYTES = 256 * 1024
-ORDER_TOPIC = 'agv/sim-r1/order'
-EVENT_TOPIC = 'agv/sim-r1/event'
 
 
 def _verify_no_proxy():
@@ -35,17 +33,21 @@ def _verify_no_proxy():
 
 
 class SimMqttOrderRobot:
-    """Receive only sim-r1 orders; callers own ticks and recovery decisions."""
+    """Receive one isolated robot's orders; callers own ticks and recovery."""
 
     def __init__(self, executor, port, *, order_authorizer=None, authorization_guard=None):
-        if not isinstance(executor, SimOrderExecutor) or executor._inbox.robot_id != 'sim-r1':
-            raise ValueError('the sim-r1 executor is required')
+        if (not isinstance(executor, SimOrderExecutor)
+                or executor._inbox.robot_id not in ('sim-r1', 'sim-r2')):
+            raise ValueError('a sim-r1 or sim-r2 executor is required')
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError('invalid isolated broker port')
         if ((order_authorizer is not None and not callable(order_authorizer))
                 or (authorization_guard is not None and not callable(authorization_guard))):
             raise ValueError('order authorization hooks must be callable')
         self.executor, self.port = executor, port
+        self.robot_id = executor._inbox.robot_id
+        self.order_topic = 'agv/{}/order'.format(self.robot_id)
+        self.event_topic = 'agv/{}/event'.format(self.robot_id)
         self._order_authorizer, self._authorization_guard = order_authorizer, authorization_guard
         self._queue = queue.Queue(maxsize=MAX_QUEUED_ORDERS)
         self._ready = threading.Event()
@@ -55,7 +57,7 @@ class SimMqttOrderRobot:
         self._pending_mid = None
         self._event_segments = set()
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                   client_id='sim-r1-order-executor',
+                                   client_id='{}-order-executor'.format(self.robot_id),
                                    protocol=mqtt.MQTTv311, reconnect_on_failure=False)
         configure_mqtt_client(self._client, *read_mqtt_security())
         self._client.manual_ack_set(True)
@@ -73,7 +75,7 @@ class SimMqttOrderRobot:
             self._fail()
             return
         try:
-            rc, mid = client.subscribe(ORDER_TOPIC, qos=1)
+            rc, mid = client.subscribe(self.order_topic, qos=1)
             if rc != mqtt.MQTT_ERR_SUCCESS:
                 self._fail()
                 return
@@ -93,7 +95,7 @@ class SimMqttOrderRobot:
         # The network thread never validates JSON, touches SQLite or moves pose.
         if self._failed.is_set() or self._stopping:
             return
-        if (not self._ready.is_set() or message.topic != ORDER_TOPIC or message.qos != 1
+        if (not self._ready.is_set() or message.topic != self.order_topic or message.qos != 1
                 or message.retain or not isinstance(message.payload, bytes)
                 or len(message.payload) > MAX_ORDER_BYTES):
             self._fail()
@@ -212,7 +214,7 @@ class SimMqttOrderRobot:
                     raise RuntimeError('a virtual event was already attempted for this segment')
                 # Claim before network I/O: an uncertain publish is never repeated.
                 self._event_segments.add(segment)
-                info = self._client.publish(EVENT_TOPIC, encoded, qos=1, retain=False)
+                info = self._client.publish(self.event_topic, encoded, qos=1, retain=False)
                 if info.rc != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('virtual event queueing failed')
                 info.wait_for_publish(timeout=5)

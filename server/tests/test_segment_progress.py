@@ -96,15 +96,34 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(set(self.store.list_occupancy()), self.new)
 
     def test_blocked_next_segment_rolls_back_entire_event(self):
+        from server.segment_progress import SegmentOccupied
+        from sim.event_inbox import SimEventInbox
         self.store.create_task('T2')
         self.store.allocate('T2', 'sim-r2', 'layout@v4', ['N4', 'N5'], 'N5',
             [('node','N4'),('node','N5'),('edge','["N4","N5"]'),('zone','cross2')],
             {'type':'load'}, map_fingerprint=self.fingerprint)
+        inbox = SimEventInbox(self.store.path, robot_tasks={'sim-r1': ('T1',)}, simulation_enabled=True)
+        inbox.initialize()
+        inbox.store('sim-r1', self.event)
         before = self.store.list_occupancy()
-        with self.assertRaises((ValueError, AllocationConflict)):
-            self.progress.advance('sim-r1', self.event)
+        with self.assertRaises(SegmentOccupied):
+            inbox.retry('sim-r1', self.event['event_id'], self.progress)
         self.assertEqual(self.store.list_occupancy(), before)
         self.assertIsNone(self.progress.get_order('T1', 2))
+        self.assertEqual(inbox.get('sim-r1', 'event-1')['state'], 'pending')
+        self.gate.expected = ('T1', 'old-boot', 1, 'N3')
+        with self.assertRaises(ValueError):
+            inbox.retry('sim-r1', 'event-1', self.progress)
+        self.assertEqual(self.store.list_occupancy(), before)
+        self.gate.expected = ('T1', 'boot-1', 1, 'N3')
+        # Test-only release of the simulated competitor's resources.
+        with self.store._write() as db:
+            db.execute("DELETE FROM allocation_occupancy WHERE task_id='T2'")
+        result = inbox.retry('sim-r1', 'event-1', self.progress)
+        self.assertEqual((result['status'], result['next_seq']), ('advanced', 2))
+        self.assertEqual(inbox.get('sim-r1', 'event-1')['state'], 'applied')
+        self.assertEqual(inbox.retry('sim-r1', 'event-1', self.progress), result)
+        self.assertEqual(set(self.store.list_occupancy()), self.new)
 
     def test_disabled_or_changed_map_fails_without_mutation(self):
         from server.segment_progress import SegmentProgress
@@ -116,6 +135,27 @@ class ProgressTests(unittest.TestCase):
             other = SegmentProgress(self.store, altered, simulation_enabled=True, recovery_gate=self.gate)
             other.initialize(); other.advance('sim-r1', self.event)
         self.assertEqual(set(self.store.list_occupancy()), self.old)
+
+    def test_waiting_for_idle_robot_node_is_classified_without_releasing_resources(self):
+        from server.segment_progress import SegmentOccupied, SegmentProgress
+        from server.sim_handoff_store import SimHandoffStore
+        path = Path(self.tmp.name) / 'idle.sqlite3'
+        store = SimHandoffStore.create_new(path, simulation_enabled=True,
+                                            idle_positions={'sim-r1': 'N1', 'sim-r2': 'N4'})
+        store.create_task('T1')
+        allocation = store.allocate('T1', 'sim-r1', 'layout@v4', self.path,
+            self.segment.released_until, self.segment.resources, {'type': 'load'},
+            map_fingerprint=self.fingerprint)
+        order = store.get_order('T1')
+        store.mark_attempted('T1', order['payload'], allocation, self.segment.resources)
+        store.mark_broker_acked('T1', order['payload'], allocation, self.segment.resources)
+        progress = SegmentProgress(store, self.map, simulation_enabled=True, recovery_gate=FakeGate(store))
+        progress.initialize()
+        before = store.list_occupancy()
+        with self.assertRaises(SegmentOccupied):
+            progress.advance('sim-r1', self.event)
+        self.assertEqual(store.list_occupancy(), before)
+        self.assertIsNone(progress.get_order('T1', 2))
 
     def test_new_order_transition_and_final_clear_keep_waiting_node(self):
         result = self.progress.advance('sim-r1', self.event)

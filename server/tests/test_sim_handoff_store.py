@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 import paho.mqtt.client as mqtt
@@ -16,7 +17,7 @@ from server.segments import plan_segment
 from server.tests.test_segment_progress import map_data
 from sim.event_inbox import SimEventInbox
 from sim.event_receiver import SimEventReceiver
-from server.sim_handoff_store import SimHandoffStore, SimHandoffCoordinatorStore
+from server.sim_handoff_store import SimHandoffStore, SimHandoffCoordinatorStore, SimResourceBusy
 from server.coordinator import Coordinator
 from server.dispatch import RobotCandidate
 from server.tests.test_coordinator import FakePublisher
@@ -30,9 +31,10 @@ class HandoffTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self._setup_source('load')
 
-    def _setup_source(self, source_action):
-        self.path = Path(self.tmp.name) / ('isolated-' + source_action + '.sqlite3')
-        self.store = SimHandoffStore.create_new(self.path, simulation_enabled=True)
+    def _setup_source(self, source_action, idle_positions=None):
+        suffix = '-fleet' if idle_positions is not None else ''
+        self.path = Path(self.tmp.name) / ('isolated-' + source_action + suffix + '.sqlite3')
+        self.store = SimHandoffStore.create_new(self.path, simulation_enabled=True, idle_positions=idle_positions)
         self.map = map_data()
         self.fingerprint = hashlib.sha256(json.dumps(self.map, sort_keys=True, ensure_ascii=True,
                                        allow_nan=False, separators=(',', ':')).encode('ascii')).hexdigest()
@@ -144,12 +146,21 @@ class HandoffTests(unittest.TestCase):
         self.store.allocate('other', 'sim-r2', 'layout@v4', blocked_nodes, blocked.released_until,
                             blocked.resources, {'type': 'load'}, map_fingerprint=self.fingerprint)
         before = self.store.list_occupancy()
-        with self.assertRaises((ValueError, RuntimeError)):
+        with self.assertRaises(SimResourceBusy):
             self.transfer()
         self.assertEqual(self.store.list_occupancy(), before)
         self.assertIsNone(self.store.get_allocation('delivery'))
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT task_id FROM sim_active_robots WHERE robot_id='sim-r1'").fetchone(), ('pick',))
+
+    def test_other_idle_robot_blocks_handoff_without_losing_old_ownership(self):
+        self._setup_source('load', {'sim-r1': 'N1', 'sim-r2': 'N4'})
+        before = self.store.list_occupancy()
+        with self.assertRaises(SimResourceBusy):
+            self.transfer()
+        self.assertEqual(self.store.list_occupancy(), before)
+        self.assertEqual(before, {('node', 'N3'): 'sim-r1', ('node', 'N4'): 'sim-r2'})
+        self.assertIsNone(self.store.get_allocation('delivery'))
 
     def test_direct_second_allocation_cannot_reuse_active_robot(self):
         with self.assertRaises(AllocationConflict):
@@ -214,6 +225,53 @@ class HandoffTests(unittest.TestCase):
                              self.next_segment.released_until, self.next_segment.resources,
                              {'type': 'unload'}, map_fingerprint=self.fingerprint)
         self.assertEqual(self.store.list_occupancy(), {('node', 'N3'): 'sim-r1'})
+
+    def test_handoff_adapter_retries_only_rolled_back_resource_conflict(self):
+        adapter = SimHandoffCoordinatorStore(self.store, target_task_id='delivery',
+            source_task_id='pick', robot_id='sim-r1', robot_session='boot-1', seq=1,
+            stopped_at='N3', event_id='final-1', action_ack=self.ack, expected_twin_id='AGV_01',
+            gate=self.gate, progress=self.progress, receiver=self.receiver, simulation_enabled=True)
+        self.store.create_task('other')
+        blocked_nodes = ['N4', 'N5']
+        blocked = plan_segment(self.map, blocked_nodes)
+        self.store.allocate('other', 'sim-r2', 'layout@v4', blocked_nodes, blocked.released_until,
+                            blocked.resources, {'type': 'load'}, map_fingerprint=self.fingerprint)
+        args = ('delivery', 'sim-r1', 'layout@v4', self.next_nodes,
+                self.next_segment.released_until, self.next_segment.resources, {'type': 'unload'})
+        before = self.store.list_occupancy()
+        with self.assertRaises(SimResourceBusy):
+            adapter.allocate(*args, map_fingerprint=self.fingerprint)
+        self.assertEqual(self.store.list_occupancy(), before)
+        self.assertIsNone(self.store.get_allocation('delivery'))
+        with self.store._write() as db:
+            db.execute("DELETE FROM allocation_occupancy WHERE task_id='other'")
+        self.assertEqual(adapter.allocate(*args, map_fingerprint=self.fingerprint)['robot_id'], 'sim-r1')
+        with self.assertRaises(AllocationConflict):
+            adapter.allocate(*args, map_fingerprint=self.fingerprint)
+
+    def test_handoff_busy_then_revoked_proof_permanently_consumes_adapter(self):
+        from server.recovery import RecoveryError
+        adapter = SimHandoffCoordinatorStore(self.store, target_task_id='delivery',
+            source_task_id='pick', robot_id='sim-r1', robot_session='boot-1', seq=1,
+            stopped_at='N3', event_id='final-1', action_ack=self.ack, expected_twin_id='AGV_01',
+            gate=self.gate, progress=self.progress, receiver=self.receiver, simulation_enabled=True)
+        self.store.create_task('other')
+        blocked_nodes = ['N4', 'N5']
+        blocked = plan_segment(self.map, blocked_nodes)
+        self.store.allocate('other', 'sim-r2', 'layout@v4', blocked_nodes, blocked.released_until,
+                            blocked.resources, {'type': 'load'}, map_fingerprint=self.fingerprint)
+        args = ('delivery', 'sim-r1', 'layout@v4', self.next_nodes,
+                self.next_segment.released_until, self.next_segment.resources, {'type': 'unload'})
+        with self.assertRaises(SimResourceBusy):
+            adapter.allocate(*args, map_fingerprint=self.fingerprint)
+        self.gate.invalidate('pick')
+        with self.assertRaises(RecoveryError):
+            adapter.allocate(*args, map_fingerprint=self.fingerprint)
+        with self.store._write() as db:
+            db.execute("DELETE FROM allocation_occupancy WHERE task_id='other'")
+        with self.assertRaises(AllocationConflict):
+            adapter.allocate(*args, map_fingerprint=self.fingerprint)
+        self.assertIsNone(self.store.get_allocation('delivery'))
 
     def test_runtime_injected_handoff_prepares_and_publishes(self):
         sessions = {'sim-r1': {'pick': 'boot-1', 'delivery': 'boot-1'}}
@@ -299,6 +357,78 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(old.read_bytes(), before)
         with self.assertRaises(ValueError):
             SimHandoffStore.create_new(Path(self.tmp.name) / 'no.sqlite3', simulation_enabled=False)
+
+
+class IdleFleetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.map = map_data()
+        self.fingerprint = hashlib.sha256(json.dumps(self.map, sort_keys=True, ensure_ascii=True,
+                                      allow_nan=False, separators=(',', ':')).encode('ascii')).hexdigest()
+        self.store = SimHandoffStore.create_new(Path(self.tmp.name) / 'fleet.sqlite3',
+                    simulation_enabled=True, idle_positions={'sim-r1': 'N1', 'sim-r2': 'N5'})
+        for task in ('one', 'two'):
+            self.store.create_task(task)
+
+    def allocate(self, task, robot, path):
+        segment = plan_segment(self.map, path)
+        return self.store.allocate(task, robot, 'layout@v4', path, segment.released_until,
+                                   segment.resources, {'type': 'load'}, map_fingerprint=self.fingerprint)
+
+    def test_idle_positions_are_protected_and_transfer_atomically(self):
+        self.assertEqual(self.store.list_occupancy(), {('node', 'N1'): 'sim-r1', ('node', 'N5'): 'sim-r2'})
+        self.allocate('one', 'sim-r1', ['N1', 'N2', 'N3'])
+        self.assertEqual(self.store.list_occupancy()[('node', 'N5')], 'sim-r2')
+        self.assertEqual(self.store.list_occupancy()[('node', 'N1')], 'sim-r1')
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(db.execute('SELECT robot_id,node FROM sim_idle_robots').fetchall(), [('sim-r2', 'N5')])
+            self.assertEqual(db.execute("SELECT task_id FROM allocation_occupancy WHERE kind='node' AND resource_id='N1'").fetchone(), ('one',))
+
+    def test_other_robot_idle_node_blocks_allocation_and_rolls_back(self):
+        store = SimHandoffStore.create_new(Path(self.tmp.name) / 'block.sqlite3',
+                    simulation_enabled=True, idle_positions={'sim-r1': 'N1', 'sim-r2': 'N3'})
+        store.create_task('blocked')
+        segment = plan_segment(self.map, ['N1', 'N2', 'N3'])
+        with self.assertRaises(SimResourceBusy):
+            store.allocate('blocked', 'sim-r1', 'layout@v4', ['N1', 'N2', 'N3'],
+                           segment.released_until, segment.resources, {'type': 'load'},
+                           map_fingerprint=self.fingerprint)
+        self.assertEqual(store.list_occupancy(), {('node', 'N1'): 'sim-r1', ('node', 'N3'): 'sim-r2'})
+        self.assertIsNone(store.get_allocation('blocked'))
+        self.assertIsNone(store.get_order('blocked'))
+
+    def test_wrong_origin_and_unknown_robot_cannot_consume_idle_reservations(self):
+        for robot, path in [('sim-r1', ['N2', 'N3']), ('sim-r3', ['N1', 'N2', 'N3'])]:
+            with self.subTest(robot=robot), self.assertRaises((ValueError, RuntimeError)):
+                self.allocate('one', robot, path)
+        self.assertEqual(self.store.list_occupancy(), {('node', 'N1'): 'sim-r1', ('node', 'N5'): 'sim-r2'})
+
+    def test_two_robots_competing_for_same_segment_have_exactly_one_winner(self):
+        barrier = threading.Barrier(2)
+        outcomes = []
+        def run(task, robot, path):
+            barrier.wait()
+            try:
+                self.allocate(task, robot, path)
+                outcomes.append((robot, 'won'))
+            except AllocationConflict:
+                outcomes.append((robot, 'blocked'))
+        threads = [threading.Thread(target=run, args=('one', 'sim-r1', ['N1','N2','N3'])),
+                   threading.Thread(target=run, args=('two', 'sim-r2', ['N5','N4','N3']))]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(10)
+        self.assertEqual(sorted(outcome for _, outcome in outcomes), ['blocked', 'won'])
+        loser = next(robot for robot, outcome in outcomes if outcome == 'blocked')
+        self.assertEqual(self.store.list_occupancy()[('node', 'N1' if loser == 'sim-r1' else 'N5')], loser)
+
+    def test_invalid_or_duplicate_initial_positions_are_rejected(self):
+        for positions in ({}, {'jetank': 'N1'}, {'sim-r1': ''},
+                          {'sim-r1': 'N1', 'sim-r2': 'N1'}, {'sim-r1': 1}):
+            with self.subTest(positions=positions), self.assertRaises((ValueError, RuntimeError)):
+                SimHandoffStore.create_new(Path(self.tmp.name) / 'invalid.sqlite3',
+                        simulation_enabled=True, idle_positions=positions)
+            self.assertFalse((Path(self.tmp.name) / 'invalid.sqlite3').exists())
 
 
 if __name__ == '__main__':

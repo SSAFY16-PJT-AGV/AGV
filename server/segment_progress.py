@@ -21,6 +21,10 @@ _EVENT_KEYS = frozenset(('type', 'event_id', 'robot_session', 'order_id', 'seq',
                          'map_id', 'stopped_at', 'cleared_resources'))
 
 
+class SegmentOccupied(AllocationConflict):
+    """A validated simulated progression cannot reserve its next resources."""
+
+
 def _canonical(value):
     _validate_json(value)
     return json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False,
@@ -228,6 +232,15 @@ class SegmentProgress:
             removable = current - keep
             if cleared != removable:
                 raise AllocationConflict('clearance must exactly cover the previous resources to release')
+            # The fresh simulation store also represents not-yet-assigned
+            # robots as idle node occupants. Check those under the same write
+            # transaction before changing the current segment.
+            from server.sim_handoff_store import SimHandoffStore, SimResourceBusy
+            if type(self.store) is SimHandoffStore:
+                try:
+                    self.store._check_resource_availability(db, keep - current, ignore_task=task_id)
+                except SimResourceBusy as error:
+                    raise SegmentOccupied('next segment is occupied') from error
             for kind, resource_id in sorted(removable):
                 deleted = db.execute('DELETE FROM allocation_occupancy WHERE task_id=? AND kind=? AND resource_id=?',
                                      (task_id, kind, resource_id))
@@ -238,7 +251,10 @@ class SegmentProgress:
                     db.execute('INSERT INTO allocation_occupancy(kind,resource_id,task_id) VALUES(?,?,?)',
                                (kind, resource_id, task_id))
             except sqlite3.IntegrityError as error:
-                raise AllocationConflict('next segment is occupied') from error
+                if getattr(error, 'sqlite_errorcode', None) in (
+                        sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT_UNIQUE):
+                    raise SegmentOccupied('next segment is occupied') from error
+                raise AllocationConflict('next segment reservation failed') from error
             if not db.execute('SELECT 1 FROM progress_orders WHERE task_id=? AND seq=1', (task_id,)).fetchone():
                 initial = db.execute('SELECT payload,state FROM allocation_outbox WHERE task_id=?', (task_id,)).fetchone()
                 db.execute('INSERT INTO progress_orders(task_id,seq,payload,state) VALUES(?,?,?,?)',

@@ -9,6 +9,7 @@ import threading
 import uuid
 
 from server.order_pickup_workflow import PickupWorkflow
+from server.allocation_store import _id
 from server.routing import MapGraph
 from server.sim_handoff_store import SimHandoffCoordinatorStore
 
@@ -22,9 +23,21 @@ class ProductControlEngine:
     TWIN = 'AGV_01'
     MAX_ORDERS = 16
 
-    def __init__(self, runtime, robot, sim_map, product_lookup):
+    def __init__(self, runtime, robot, sim_map, product_lookup, *,
+                 robot_id='sim-r1', twin_id='AGV_01', session='demo-session', task_prefix='web',
+                 wait_for_reservation=False):
         if not isinstance(product_lookup, dict) or not product_lookup:
             raise ValueError('explicit simulated product mapping required')
+        for name, value in (('robot_id', robot_id), ('twin_id', twin_id),
+                            ('session', session), ('task_prefix', task_prefix)):
+            _id(value, name)
+        if not robot_id.startswith('sim-') or robot_id == 'sim-':
+            raise ValueError('isolated simulated robot required')
+        self.ROBOT, self.TWIN, self.SESSION = robot_id, twin_id, session
+        self.task_prefix = task_prefix
+        if type(wait_for_reservation) is not bool:
+            raise ValueError('reservation waiting must be explicit')
+        self.wait_for_reservation = wait_for_reservation
         self.runtime, self.robot = runtime, robot
         self.map = copy.deepcopy(sim_map)
         self.graph = MapGraph(self.map)
@@ -37,6 +50,7 @@ class ProductControlEngine:
         self._shelf = self._slot = None
         self._route, self._pending = [], None
         self._pickup_workflow = self._delivery_workflow = None
+        self._current_leg = None
         self._pickup_evidence = self._delivery_evidence = self._last_place_ack = None
         self._pickup_task = self._delivery_task = None
 
@@ -114,12 +128,14 @@ class ProductControlEngine:
                 raise
             self._route = list(first) + list(second[1:])
             self._cycle += 1
-            self._pickup_task = self.PICKUP_TASK if self._cycle == 1 else 'web-{}-pickup'.format(self._cycle)
-            self._delivery_task = self.DELIVERY_TASK if self._cycle == 1 else 'web-{}-delivery'.format(self._cycle)
+            prefix = self.task_prefix if self._cycle == 1 else '{}-{}'.format(self.task_prefix, self._cycle)
+            self._pickup_task = '{}-pickup'.format(prefix)
+            self._delivery_task = '{}-delivery'.format(prefix)
             self._product, self._pickup, self._destination = product_type, pickup, destination
             self._shelf, self._slot = shelf, slot
             self._pickup_evidence = self._delivery_evidence = self._last_place_ack = None
             self._status, self._phase = 'moving', 'to_pickup'
+            self._current_leg = 'pickup'
             try:
                 options = {}
                 if previous is not None:
@@ -142,7 +158,8 @@ class ProductControlEngine:
                     options = {'accept_preceding': (source, stop), 'prepare_options': {'handoff_store': adapter}}
                 self._pickup_workflow = PickupWorkflow(
                     self.runtime, self.robot, self.map, self.products,
-                    simulation_enabled=True, task_id=self._pickup_task, session=self.SESSION, **options)
+                    simulation_enabled=True, task_id=self._pickup_task, session=self.SESSION,
+                    robot_id=self.ROBOT, wait_for_reservation=self.wait_for_reservation, **options)
                 result = self._pickup_workflow.submit(product_type)
                 if result.get('status') == 'unknown':
                     self._mark_unknown()
@@ -206,14 +223,18 @@ class ProductControlEngine:
             if not self.control_ready:
                 self._mark_unknown()
                 return self.snapshot()
-            if self._status == 'waiting':
+            if self._pending is not None:
                 return self.snapshot()
             try:
-                pickup = self._phase == 'to_pickup'
+                pickup = self._current_leg == 'pickup'
                 workflow = self._pickup_workflow if pickup else self._delivery_workflow
                 result = workflow.tick(dt_seconds)
                 if not isinstance(result, dict) or result.get('status') == 'unknown':
                     raise RuntimeError('simulated workflow outcome unknown')
+                if result.get('status') == 'waiting_reservation':
+                    self._status, self._phase = 'waiting', 'reservation_wait'
+                else:
+                    self._status, self._phase = 'moving', 'to_pickup' if pickup else 'to_destination'
                 if result.get('status') == 'pickup_reached':
                     task = self._pickup_task if pickup else self._delivery_task
                     node = self._pickup if pickup else self._destination
@@ -262,13 +283,15 @@ class ProductControlEngine:
                 products = {self._product: {'pickup_node': self._destination}}
                 self._delivery_workflow = PickupWorkflow(
                     self.runtime, self.robot, self.map, products, simulation_enabled=True,
-                    task_id=self._delivery_task, session=self.SESSION,
+                    task_id=self._delivery_task, session=self.SESSION, robot_id=self.ROBOT,
+                    wait_for_reservation=self.wait_for_reservation,
                     action_at_end={'type': 'unload'}, accept_preceding=(self._pickup_task, self._pickup),
                     prepare_options={'handoff_store': adapter})
                 result = self._delivery_workflow.submit(self._product)
                 if result.get('status') == 'unknown':
                     raise RuntimeError('delivery allocation outcome unknown')
                 self._status, self._phase = 'moving', 'to_destination'
+                self._current_leg = 'delivery'
             except Exception:
                 self._mark_unknown()
             return True

@@ -10,7 +10,8 @@ import threading
 import time
 
 from server.allocation_store import _id
-from server.order_publisher import validate_order
+from server.order_publisher import validate_order, _topic
+from server.sim_handoff_store import SimResourceBusy, SimHandoffCoordinatorStore
 from server.segments import plan_segment
 
 
@@ -23,7 +24,8 @@ class PickupWorkflow:
 
     def __init__(self, runtime, robot, map_data, product_lookup, *, simulation_enabled=False,
                  clock=time.monotonic, timeout_seconds=30, task_id=TASK, session=SESSION,
-                 action_at_end=None, accept_preceding=None, prepare_options=None):
+                 action_at_end=None, accept_preceding=None, prepare_options=None,
+                 robot_id=ROBOT, wait_for_reservation=False):
         if simulation_enabled is not True:
             raise ValueError('isolated simulation must be explicitly enabled')
         if not isinstance(product_lookup, dict) or not product_lookup or not callable(clock):
@@ -37,6 +39,11 @@ class PickupWorkflow:
             raise ValueError('invalid simulated workflow timeout')
         _id(task_id, 'task_id')
         _id(session, 'robot_session')
+        _topic(robot_id)
+        if type(wait_for_reservation) is not bool:
+            raise ValueError('reservation waiting must be explicitly enabled')
+        self.ROBOT = robot_id
+        self.wait_for_reservation = wait_for_reservation
         action = copy.deepcopy({'type': 'load'} if action_at_end is None else action_at_end)
         validate_order(self.ROBOT, {'order_id': task_id, 'seq': 1, 'map_id': 'demo@v1',
                                     'nodes': ['a', 'b'], 'released_until': 'b',
@@ -63,6 +70,7 @@ class PickupWorkflow:
         self._expected_seq = 1
         self._segment_start = None
         self._waiting = None
+        self._next_retry = None
         self._finished_evidence = None
         self._deadline = None
         self._last_position = None
@@ -119,26 +127,41 @@ class PickupWorkflow:
             self._segment_start = initial['current_node']
             self._product_id, self._pickup = product_id, product['pickup_node']
             # From the first mutating call onward, failures are uncertain;
-            # neither a partially reserved task nor a publish is retried.
+            # only a classified, rolled-back reservation conflict is retried.
             try:
                 self.runtime.create_task(self.task_id)
-                allocation = self.runtime.prepare(
-                    self.task_id, self._pickup,
-                    [{'robot_id': self.ROBOT, 'node': self._segment_start, 'available': True}],
-                    copy.deepcopy(self.action_at_end), **self.prepare_options)
-                if (not isinstance(allocation, dict) or allocation.get('task_id') != self.task_id
-                        or allocation.get('robot_id') != self.ROBOT
-                        or not isinstance(allocation.get('nodes'), list)
-                        or allocation['nodes'][0] != self._segment_start
-                        or allocation['nodes'][-1] != self._pickup):
-                    raise ValueError('invalid isolated allocation')
-                self._allocation = copy.deepcopy(allocation)
-                self.runtime.publish(self.task_id)
-                self._status = 'awaiting_order'
                 self._reset_deadline()
+                self._prepare_once()
             except Exception:
                 self._unknown()
             return self.snapshot()
+
+    def _prepare_once(self):
+        try:
+            allocation = self.runtime.prepare(
+                self.task_id, self._pickup,
+                [{'robot_id': self.ROBOT, 'node': self._segment_start, 'available': True}],
+                copy.deepcopy(self.action_at_end), **self.prepare_options)
+        except SimResourceBusy:
+            adapter = self.prepare_options.get('handoff_store')
+            valid_handoff = (set(self.prepare_options) == {'handoff_store'}
+                             and type(adapter) is SimHandoffCoordinatorStore
+                             and adapter._target == self.task_id and adapter._robot == self.ROBOT)
+            if not self.wait_for_reservation or (self.prepare_options and not valid_handoff):
+                raise
+            self._status = 'waiting_reservation'
+            self._next_retry = self.clock() + .25
+            return
+        if (not isinstance(allocation, dict) or allocation.get('task_id') != self.task_id
+                or allocation.get('robot_id') != self.ROBOT
+                or not isinstance(allocation.get('nodes'), list)
+                or allocation['nodes'][0] != self._segment_start
+                or allocation['nodes'][-1] != self._pickup):
+            raise ValueError('invalid isolated allocation')
+        self._allocation = copy.deepcopy(allocation)
+        self.runtime.publish(self.task_id)
+        self._status = 'awaiting_order'
+        self._reset_deadline()
 
     def _order_and_receipt(self, state):
         order, receipt = state.get('order'), state.get('receipt')
@@ -156,6 +179,19 @@ class PickupWorkflow:
     def _confirm_waiting(self):
         waiting = self._waiting
         stored = self.runtime.inbox.get(self.ROBOT, waiting['event_id'])
+        if stored is not None and stored.get('state') == 'pending' and self.wait_for_reservation:
+            if self._next_retry is None or self.clock() >= self._next_retry:
+                self._next_retry = self.clock() + .25
+                result = self.runtime.receiver.retry_occupied_event(self.ROBOT, waiting['event_id'])
+                if result.get('status') == 'occupied':
+                    self._status = 'waiting_reservation'
+                elif result.get('status') == 'not_occupied':
+                    if self._status == 'waiting_reservation':
+                        raise ValueError('reservation wait evidence disappeared')
+                elif result.get('status') == 'advanced':
+                    stored = self.runtime.inbox.get(self.ROBOT, waiting['event_id'])
+                else:
+                    raise ValueError('invalid reservation retry result')
         if stored is None or stored.get('state') == 'pending':
             return False
         result = stored.get('result')
@@ -208,6 +244,7 @@ class PickupWorkflow:
                     'map_id': order['map_id'], 'digest': receipt['digest']}
         self._waiting = {'event_id': event_id, 'stop': stop, 'final': final,
                          'evidence': evidence}
+        self._next_retry = self.clock() + .25
         self._status = 'waiting_progress'
         self._reset_deadline()
         self.robot.publish_event(event)
@@ -227,6 +264,12 @@ class PickupWorkflow:
                 if (self.robot.ready is not True or self.runtime.status().get('ready') is not True
                         or self.clock() >= self._deadline):
                     raise RuntimeError('isolated simulation not ready or timed out')
+                if self._status == 'waiting_reservation' and self._allocation is None:
+                    if self.robot.tick(0) != self._robot_state:
+                        raise ValueError('idle simulation state changed during reservation wait')
+                    if self.clock() >= self._next_retry:
+                        self._prepare_once()
+                    return self.snapshot()
                 if self._waiting and not self._confirm_waiting():
                     return self.snapshot()
                 state = self.robot.tick(dt_seconds)

@@ -106,6 +106,24 @@ class MqttRobotTests(unittest.TestCase):
         self.assertEqual(self.client.acks, [(10, 1)])
         self.assertEqual(self.robot.tick(20)['current_node'], 'B')
 
+    def test_second_robot_receives_its_own_order_and_publishes_its_event(self):
+        inbox = SimOrderInbox(Path(self.tmp.name) / 'second.sqlite3', 'sim-r2', 'synthetic@v1')
+        inbox.initialize()
+        executor = SimOrderExecutor(inbox, test_map(), 'A')
+        client = FakeClient()
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=client):
+            robot = SimMqttOrderRobot(executor, 19123).start()
+        self.addCleanup(robot.stop)
+        self.assertEqual(client.subscription, ('agv/sim-r2/order', 1))
+        client.deliver(payload(), topic='agv/sim-r2/order')
+        stopped = robot.tick(2)
+        self.assertEqual((stopped['status'], stopped['current_node']), ('stopped', 'B'))
+        event = {'type': 'rear_clear', 'event_id': 'r2-event', 'robot_session': 'boot-2',
+                 'order_id': stopped['receipt']['order_id'], 'seq': stopped['receipt']['seq'],
+                 'map_id': stopped['order']['map_id'], 'stopped_at': 'B', 'cleared_resources': []}
+        robot.publish_event(event)
+        self.assertEqual(client.publishes, [('agv/sim-r2/event', event, 1, False)])
+
     def test_disconnect_and_invalid_messages_fail_closed(self):
         self.client.deliver(payload(), qos=0)
         self.assertFalse(self.robot.ready)
@@ -254,6 +272,72 @@ class MqttRobotTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class MqttRobotBrokerTest(unittest.TestCase):
+    def test_two_robots_use_distinct_broker_sessions_and_order_topics(self):
+        import paho.mqtt.client as mqtt
+        from server.tests.test_twin_broker_integration import (
+            BROKER, connect_publisher, free_port, loopback_environment, stop, wait_for_owned_broker,
+        )
+        port = free_port()
+        env = loopback_environment()
+        env['PYTHONPATH'] = os.environ['AMQTT_TEST_PATH']
+        python = getattr(sys, '_base_executable', sys.executable)
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        with tempfile.TemporaryDirectory(prefix='sim-two-robots-') as folder, \
+                open(os.devnull, 'w', encoding='utf-8') as broker_log:
+            ready_file = str(Path(folder) / 'broker.ready')
+            broker = subprocess.Popen([python, '-c', BROKER, str(port), ready_file], env=env,
+                                      stdout=broker_log, stderr=broker_log, creationflags=flags)
+            robots = []
+            publisher = None
+            try:
+                wait_for_owned_broker(self, broker, ready_file)
+                with patch('sim.mqtt_order_robot.read_mqtt_security', return_value=(None, None, None)), \
+                        patch.dict(os.environ, {'NO_PROXY': '127.0.0.1,localhost',
+                                                'no_proxy': '127.0.0.1,localhost'}):
+                    for robot_id, start in (('sim-r1', 'A'), ('sim-r2', 'C')):
+                        inbox = SimOrderInbox(Path(folder) / (robot_id + '.sqlite3'), robot_id, 'synthetic@v1')
+                        inbox.initialize()
+                        robots.append(SimMqttOrderRobot(SimOrderExecutor(inbox, test_map(), start), port).start())
+                    publisher = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
+                    connect_publisher(publisher, port)
+                    publisher.loop_start()
+                    order1 = payload(order_id='task-1')
+                    order2 = payload(order_id='task-2', nodes=['C', 'D'], stop='D')
+                    for topic, body in (('agv/sim-r1/order', order1), ('agv/sim-r2/order', order2)):
+                        info = publisher.publish(topic, body, qos=1, retain=False)
+                        info.wait_for_publish(timeout=5)
+                        self.assertTrue(info.is_published())
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        first = robots[0].tick(0)
+                        second = robots[1].tick(0)
+                        if first['status'] == second['status'] == 'moving':
+                            break
+                        time.sleep(0.03)
+                    self.assertEqual((first['status'], first['order']['order_id']), ('moving', 'task-1'))
+                    self.assertEqual((second['status'], second['order']['order_id']), ('moving', 'task-2'))
+                    first, second = (robot.tick(0.25) for robot in robots)
+                    self.assertEqual((first['status'], second['status']), ('moving', 'moving'))
+                    self.assertGreater(first['pose']['x'], 0)
+                    self.assertGreater(second['pose']['x'], 2000)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        first = robots[0].tick(0.5)
+                        second = robots[1].tick(0.5)
+                        if first['status'] == second['status'] == 'stopped':
+                            break
+                        time.sleep(0.03)
+                    self.assertEqual((first['status'], first['current_node']), ('stopped', 'B'))
+                    self.assertEqual((second['status'], second['current_node']), ('stopped', 'D'))
+                    self.assertTrue(all(robot.ready for robot in robots))
+            finally:
+                if publisher is not None:
+                    publisher.disconnect()
+                    publisher.loop_stop()
+                for robot in robots:
+                    robot.stop()
+                stop(broker)
+
     def test_actual_qos1_order_and_event_through_owned_loopback_broker(self):
         import paho.mqtt.client as mqtt
         from server.tests.test_twin_broker_integration import (

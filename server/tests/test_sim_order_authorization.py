@@ -74,6 +74,23 @@ class SimOrderAuthorizationTests(unittest.TestCase):
         self.store.mark_broker_acked('T1', self.record['payload'], self.allocation, self.segment.resources)
         self.assertTrue(self.authorizer(self.payload))
 
+    def test_second_robot_guard_accepts_only_its_own_reserved_order(self):
+        self.attempted()
+        self.store.create_task('T2')
+        publisher = FakePublisher()
+        coordinator = Coordinator(self.store, self.map, publisher)
+        allocation = coordinator.prepare('T2', 'N6', [RobotCandidate('sim-r2', 'N5', True)], {'type': 'load'})
+        segment = plan_segment(self.map, allocation['nodes'])
+        record = self.store.get_order('T2')
+        self.store.mark_attempted('T2', record['payload'], allocation, segment.resources)
+        payload2 = record['payload'].encode('utf-8')
+        self.runtime._tasks['T2'] = ('sim-r2', 'boot-2')
+        self.runtime.receiver.robot_sessions['sim-r2'] = {'T2': 'boot-2'}
+        second = SimOrderAuthorizer(self.runtime, robot_id='sim-r2')
+        self.assertTrue(second(payload2))
+        self.assertFalse(second(self.payload))
+        self.assertFalse(self.authorizer(payload2))
+
     def test_wrong_task_sequence_release_map_and_payload_fail_closed(self):
         self.attempted()
         order = json.loads(self.payload)

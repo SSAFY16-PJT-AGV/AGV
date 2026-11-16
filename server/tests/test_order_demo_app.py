@@ -94,6 +94,29 @@ class OrderDemoApiTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DemoRuntimeFailureTest(unittest.TestCase):
+    def test_fleet_publishes_each_robot_on_its_own_topic(self):
+        class Engine:
+            def tick(self, elapsed):
+                return {'mode': 'fleet', 'robots': [
+                    {'robot_id': 'sim-r1', 'status': 'moving', 'current_node': 'N1',
+                     'battery': .8, 'pose': {'x': 0, 'y': 0, 'th': 0}},
+                    {'robot_id': 'sim-r2', 'status': 'waiting', 'current_node': 'N2',
+                     'battery': .8, 'pose': {'x': 1000, 'y': 0, 'th': 0}}]}
+        class Publisher:
+            def __init__(self, demo):
+                self.demo, self.messages = demo, []
+            def publish(self, topic, payload, qos, retain):
+                self.messages.append((topic, json.loads(payload)))
+                self.demo.stop_event.set()
+                return type('Result', (), {'rc': 0})()
+        demo = DemoRuntime(Engine(), 1883, [])
+        publisher = Publisher(demo)
+        demo.client = publisher
+        demo.connected.set()
+        demo._run()
+        self.assertEqual([(topic, payload['status']) for topic, payload in publisher.messages],
+                         [('agv/sim-r1/state', 'MOVING'), ('agv/sim-r2/state', 'WAITING')])
+
     def test_worker_failure_disables_further_orders(self):
         class BrokenEngine:
             def tick(self, elapsed):

@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import create_autospec
+import threading
 
 from server.recovery import RecoveryGate
 
@@ -63,6 +64,8 @@ class FakeInbox:
         self.robot_tasks = robot_tasks or {'sim-r1': frozenset(('T1',))}
         self.stored = []
         self.fail = None
+        self._lock = threading.RLock()
+        self.state = 'pending'
 
     def store(self, robot_id, event):
         if self.fail:
@@ -71,7 +74,12 @@ class FakeInbox:
         return {'status': 'stored', 'event_id': 'E1', 'state': 'pending'}
 
     def retry(self, robot_id, event_id, progress):
-        return progress.advance(robot_id, self.stored[-1][1], retained=False)
+        result = progress.advance(robot_id, self.stored[-1][1], retained=False)
+        self.state = 'applied'
+        return result
+
+    def get(self, robot_id, event_id):
+        return {'state': self.state}
 
 
 def message(topic='agv/sim-r1/event', payload=b'{"type":"rear_clear","order_id":"T1"}', qos=1, retain=False):
@@ -173,6 +181,51 @@ class ReceiverTest(unittest.TestCase):
         self.progress.failure = None
         result = self.inbox.retry('sim-r1', 'E1', self.progress)
         self.assertEqual(result['status'], 'advanced')
+
+    def test_occupied_event_retries_once_after_clear_without_duplicate_callback(self):
+        from server.segment_progress import SegmentOccupied
+        self.ready()
+        self.progress.failure = SegmentOccupied('occupied')
+        self.client.on_message(self.client, None, message())
+        self.assertEqual(self.client.acks, [(42, 1)])
+        self.assertEqual(self.results, [])
+        self.assertEqual(self.receiver.retry_occupied_event('sim-r1', 'E1')['status'], 'occupied')
+        self.progress.failure = None
+        self.assertEqual(self.receiver.retry_occupied_event('sim-r1', 'E1')['status'], 'advanced')
+        self.assertEqual(self.results, [{'status': 'advanced', 'next_seq': 2}])
+        self.assertEqual(self.receiver.retry_occupied_event('sim-r1', 'E1')['status'], 'not_occupied')
+        self.assertEqual(len(self.results), 1)
+
+    def test_unclassified_failures_are_not_silently_retried(self):
+        self.ready()
+        self.progress.failure = ValueError('bad proof')
+        self.client.on_message(self.client, None, message())
+        self.progress.failure = None
+        self.assertEqual(self.receiver.retry_occupied_event('sim-r1', 'E1')['status'], 'not_occupied')
+        self.assertEqual(len(self.progress.calls), 1)
+
+    def test_occupied_retry_revalidates_and_propagates_revoked_proof(self):
+        from server.segment_progress import SegmentOccupied
+        self.ready()
+        self.progress.failure = SegmentOccupied('occupied')
+        self.client.on_message(self.client, None, message())
+        self.progress.failure = ValueError('proof revoked')
+        with self.assertRaisesRegex(ValueError, 'proof revoked'):
+            self.receiver.retry_occupied_event('sim-r1', 'E1')
+        self.assertEqual(self.results, [])
+        self.assertEqual(self.inbox.state, 'pending')
+
+    def test_occupied_event_applied_elsewhere_never_fires_callback_twice(self):
+        from server.segment_progress import SegmentOccupied
+        self.ready()
+        self.progress.failure = SegmentOccupied('occupied')
+        self.client.on_message(self.client, None, message())
+        self.inbox.state = 'applied'
+        self.progress.failure = None
+        with self.assertRaises(RuntimeError):
+            self.receiver.retry_occupied_event('sim-r1', 'E1')
+        self.assertEqual(len(self.progress.calls), 1)
+        self.assertEqual(self.results, [])
 
     def test_offline_qos_one_is_acked_only_after_invalidation(self):
         self.ready()

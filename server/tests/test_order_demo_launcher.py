@@ -20,6 +20,7 @@ class OrderDemoLauncherTests(unittest.TestCase):
                   'AGV_SIM_CONFIG': 'real.json', 'AGV_TWIN_ROBOT_MAP': '{}',
                   'HTTP_PROXY': 'http://remote:1', 'PATH': 'p'}
         env = tool.make_server_environment(source, 12345, 'temporary-token', Path('map.json'))
+        self.assertEqual(env['AGV_ORDER_FLEET'], '1')
         self.assertEqual(env['MQTT_HOST'], '127.0.0.1')
         self.assertEqual(env['MQTT_PORT'], '12345')
         self.assertEqual(env['AGV_ORDER_DEMO_ENABLED'], '1')

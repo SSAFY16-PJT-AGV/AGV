@@ -17,10 +17,12 @@ import paho.mqtt.client as mqtt
 from server.allocation_store import _validate_json
 from server.order_publisher import _topic
 from server.recovery import RecoveryGate, _id
+from server.segment_progress import SegmentOccupied
 
 
 MAX_EVENT_BYTES = 256 * 1024
 MAX_PENDING_ACKS = 64
+MAX_OCCUPIED_EVENTS = 256
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -116,6 +118,7 @@ class SimEventReceiver:
         self._lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
         self._pending_acks = []
+        self._occupied_events = set()
         self._ready = False
         self._connected = False
         self._closed = False
@@ -163,6 +166,7 @@ class SimEventReceiver:
             self._ready = False
             self._pending_mid = None
             self._pending_acks.clear()
+            self._occupied_events.clear()
         # The gate blocks all tasks locally before attempting one database
         # transaction, including if the database subsequently fails.
         failures = self._invalidate(self.task_ids)
@@ -326,7 +330,13 @@ class SimEventReceiver:
             if stored['status'] == 'duplicate':
                 result = stored
             else:
-                result = self.inbox.retry(parts[1], stored['event_id'], self.progress)
+                try:
+                    result = self.inbox.retry(parts[1], stored['event_id'], self.progress)
+                except SegmentOccupied:
+                    if len(self._occupied_events) >= MAX_OCCUPIED_EVENTS:
+                        raise RuntimeError('too many occupied simulated events')
+                    self._occupied_events.add((parts[1], stored['event_id']))
+                    raise
             with self._lock:
                 self.last_result = result
             if self.on_result is not None:
@@ -336,6 +346,35 @@ class SimEventReceiver:
                 self._close_and_invalidate(exc)
             else:
                 self._report(exc)
+
+    @_serialized
+    def retry_occupied_event(self, robot_id, event_id):
+        """Retry only a previously validated conflict in this live simulation.
+
+        The inbox lock covers its state check and the transactional retry; an
+        event applied through another path is never re-published here.
+        """
+        if not self.ready:
+            raise RuntimeError('simulation receiver is not ready')
+        key = (robot_id, event_id)
+        if key not in self._occupied_events:
+            return {'status': 'not_occupied'}
+        with self.inbox._lock:
+            record = self.inbox.get(robot_id, event_id)
+            if record is None or record.get('state') != 'pending':
+                self._occupied_events.discard(key)
+                raise RuntimeError('occupied event is no longer pending')
+            try:
+                result = self.inbox.retry(robot_id, event_id, self.progress)
+            except SegmentOccupied:
+                return {'status': 'occupied'}
+            if not isinstance(result, dict) or result.get('status') != 'advanced':
+                self._occupied_events.discard(key)
+                raise RuntimeError('occupied event did not advance')
+            self._occupied_events.discard(key)
+            if self.on_result is not None:
+                self.on_result(result)
+            return result
 
     @_serialized
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):

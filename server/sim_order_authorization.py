@@ -14,10 +14,11 @@ from sim.order_inbox import _decode
 class SimOrderAuthorizer:
     """Hold the simulation's normal lock order through durable inbox accept."""
 
-    ROBOT = 'sim-r1'
-
-    def __init__(self, runtime):
+    def __init__(self, runtime, *, robot_id='sim-r1'):
+        if robot_id not in ('sim-r1', 'sim-r2'):
+            raise ValueError('a sim-r1 or sim-r2 robot ID is required')
         self.runtime = runtime
+        self.robot_id = robot_id
 
     def __call__(self, payload):
         try:
@@ -49,16 +50,16 @@ class SimOrderAuthorizer:
                         try:
                             gate._active(db)
                             progress._check_database(db)
-                            parsed, canonical, _digest = _decode(payload, self.ROBOT, progress._map_id)
+                            parsed, canonical, _digest = _decode(payload, self.robot_id, progress._map_id)
                             task = parsed['order_id']
                             mapping = runtime._tasks.get(task)
-                            if (not isinstance(mapping, tuple) or len(mapping) != 2 or mapping[0] != self.ROBOT
-                                    or receiver.robot_sessions.get(self.ROBOT, {}).get(task) != mapping[1]):
+                            if (not isinstance(mapping, tuple) or len(mapping) != 2 or mapping[0] != self.robot_id
+                                    or receiver.robot_sessions.get(self.robot_id, {}).get(task) != mapping[1]):
                                 raise ValueError('order is not mapped to this simulated session')
                             with gate._state_lock:
                                 if task in gate._blocked:
                                     raise ValueError('simulated recovery is blocked')
-                            robot, path, stop = progress._job(db, task, self.ROBOT)
+                            robot, path, stop = progress._job(db, task, self.robot_id)
                             seq, _stored_payload, state, stored = progress._latest(db, task, robot, path, stop)
                             encoded = json.dumps(stored, sort_keys=True, ensure_ascii=True,
                                                  allow_nan=False, separators=(',', ':'))
@@ -72,7 +73,7 @@ class SimOrderAuthorizer:
                             if type(runtime.store) is SimHandoffStore and table is None:
                                 raise ValueError('active simulated robot ownership is missing')
                             if table is not None and db.execute(
-                                    'SELECT task_id FROM sim_active_robots WHERE robot_id=?', (self.ROBOT,)
+                                    'SELECT task_id FROM sim_active_robots WHERE robot_id=?', (self.robot_id,)
                                     ).fetchone() != (task,):
                                 raise ValueError('simulated robot has a different active task')
                             runtime._ready()

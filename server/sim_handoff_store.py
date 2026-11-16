@@ -25,6 +25,10 @@ from sim.event_receiver import SimEventReceiver
 _CONSTRUCTION_KEY = object()
 
 
+class SimResourceBusy(AllocationConflict):
+    """A verified segment is occupied in the isolated simulation transaction."""
+
+
 class SimHandoffStore(AllocationStore):
     """Store for a new, private simulation DB with durable per-robot ownership."""
 
@@ -34,15 +38,25 @@ class SimHandoffStore(AllocationStore):
         super().__init__(path)
 
     @classmethod
-    def create_new(cls, path, *, simulation_enabled=False):
+    def create_new(cls, path, *, simulation_enabled=False, idle_positions=None):
         if simulation_enabled is not True:
             raise ValueError('explicit isolated simulation is required')
+        if idle_positions is not None:
+            if not isinstance(idle_positions, dict) or not idle_positions:
+                raise ValueError('nonempty simulated idle positions required')
+            idle_positions = copy.deepcopy(idle_positions)
+            for robot, node in idle_positions.items():
+                _topic(robot)
+                _id(node, 'idle node')
+            if len(set(idle_positions.values())) != len(idle_positions):
+                raise ValueError('idle robots cannot occupy the same node')
         name = os.fspath(path)
         if not isinstance(name, str) or not name or name == ':memory:':
             raise ValueError('a new file-backed database path is required')
         descriptor = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(descriptor)
         store = cls(name, _key=_CONSTRUCTION_KEY)
+        store._idle_enabled = idle_positions is not None
         store._created_path = os.path.normcase(os.path.realpath(name))
         store._creation_id = secrets.token_hex(32)
         created_stat = os.stat(name)
@@ -79,6 +93,17 @@ class SimHandoffStore(AllocationStore):
                        "SELECT RAISE(ABORT,'active ownership requires a recorded handoff'); END")
         # Adds the unmodified legacy occupancy, outbox and map metadata tables.
         super(SimHandoffStore, store).initialize()
+        if store._idle_enabled:
+            with store._write() as db:
+                db.execute('CREATE TABLE sim_idle_robots (robot_id TEXT PRIMARY KEY NOT NULL, '
+                           'node TEXT UNIQUE NOT NULL)')
+                db.executemany('INSERT INTO sim_idle_robots VALUES (?,?)', idle_positions.items())
+                db.execute('CREATE TRIGGER sim_idle_blocks_occupancy BEFORE INSERT ON allocation_occupancy '
+                           "WHEN NEW.kind='node' AND EXISTS (SELECT 1 FROM sim_idle_robots WHERE node=NEW.resource_id) "
+                           "BEGIN SELECT RAISE(ABORT,'idle simulated robot occupies node'); END")
+                db.execute('CREATE TRIGGER sim_idle_blocks_occupancy_update BEFORE UPDATE OF kind,resource_id ON allocation_occupancy '
+                           "WHEN NEW.kind='node' AND EXISTS (SELECT 1 FROM sim_idle_robots WHERE node=NEW.resource_id) "
+                           "BEGIN SELECT RAISE(ABORT,'idle simulated robot occupies node'); END")
         return store
 
     def validate_bound(self, path):
@@ -94,6 +119,11 @@ class SimHandoffStore(AllocationStore):
             with closing(sqlite3.connect(uri, uri=True)) as db:
                 values = db.execute('SELECT value FROM sim_store_identity').fetchall()
                 trigger = db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name='sim_activate_robot'").fetchone()
+                if self._idle_enabled:
+                    triggers = db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name IN "
+                                          "('sim_idle_blocks_occupancy','sim_idle_blocks_occupancy_update')").fetchall()
+                    if len(triggers) != 2:
+                        raise ValueError('simulation idle protection is invalid')
             if values != [(self._creation_id,)] or trigger != ('sim_activate_robot',):
                 raise ValueError('simulation database identity is invalid')
         except (OSError, sqlite3.Error) as exc:
@@ -101,8 +131,66 @@ class SimHandoffStore(AllocationStore):
 
     def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint):
         _topic(robot_id)
+        if self._idle_enabled:
+            self.validate_bound(self.path)
+            _fingerprint(map_fingerprint)
+            nodes, resources, action_at_end = copy.deepcopy((nodes, resources, action_at_end))
+            checked, payload = _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end)
+            try:
+                with self._write() as db:
+                    if db.execute('SELECT status FROM tasks WHERE task_id=?', (task_id,)).fetchone() != ('PENDING',):
+                        raise AllocationConflict('task is missing or not pending')
+                    idle = db.execute('SELECT node FROM sim_idle_robots WHERE robot_id=?', (robot_id,)).fetchone()
+                    if idle != (nodes[0],):
+                        raise AllocationConflict('robot must own the first node as its idle position')
+                    active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
+                    fingerprint = db.execute("SELECT value FROM allocation_meta WHERE key='map_fingerprint'").fetchone()
+                    has_jobs = db.execute('SELECT 1 FROM allocation_jobs LIMIT 1').fetchone() is not None
+                    if active is None and fingerprint is None and not has_jobs:
+                        db.execute('INSERT INTO allocation_meta(key,value) VALUES (?,?)', ('active_map', map_id))
+                        db.execute('INSERT INTO allocation_meta(key,value) VALUES (?,?)', ('map_fingerprint', map_fingerprint))
+                    elif active != (map_id,) or fingerprint != (map_fingerprint,):
+                        raise AllocationConflict('map or fingerprint differs from the persistent active map')
+                    if db.execute('SELECT 1 FROM sim_active_robots WHERE robot_id=?', (robot_id,)).fetchone():
+                        raise AllocationConflict('robot is already active')
+                    self._check_resource_availability(db, checked, ignore_idle_robot=robot_id)
+                    if db.execute('DELETE FROM sim_idle_robots WHERE robot_id=? AND node=?',
+                                  (robot_id, nodes[0])).rowcount != 1:
+                        raise AllocationConflict('idle ownership changed')
+                    db.execute('INSERT INTO allocation_jobs VALUES (?,?,?,?,?)',
+                               (task_id, robot_id, map_id, json.dumps(nodes, ensure_ascii=False), released_until))
+                    db.executemany('INSERT INTO allocation_occupancy VALUES (?,?,?)',
+                                   [(kind, key, task_id) for kind, key in sorted(checked)])
+                    db.execute('INSERT INTO allocation_outbox VALUES (?,?,?)', (task_id, payload, 'pending'))
+                    db.execute("UPDATE tasks SET status='ASSIGNED' WHERE task_id=?", (task_id,))
+            except sqlite3.IntegrityError as exc:
+                raise AllocationConflict('robot or resource already allocated') from exc
+            return self.get_allocation(task_id)
         return super().allocate(task_id, robot_id, map_id, nodes, released_until, resources,
                                 action_at_end, map_fingerprint=map_fingerprint)
+
+    def _check_resource_availability(self, db, resources, *, ignore_task=None, ignore_idle_robot=None):
+        """Check under the caller's write transaction; only known occupancy is retryable."""
+        for kind, resource in resources:
+            owner = db.execute('SELECT task_id FROM allocation_occupancy WHERE kind=? AND resource_id=?',
+                               (kind, resource)).fetchone()
+            if owner is not None and owner[0] != ignore_task:
+                raise SimResourceBusy('simulation segment resource is occupied')
+            if self._idle_enabled and kind == 'node':
+                idle = db.execute('SELECT robot_id FROM sim_idle_robots WHERE node=?', (resource,)).fetchone()
+                if idle is not None and idle[0] != ignore_idle_robot:
+                    raise SimResourceBusy('simulation idle node is occupied')
+
+    def list_occupancy(self):
+        if not self._idle_enabled:
+            return super().list_occupancy()
+        self.validate_bound(self.path)
+        with closing(self._connect()) as db:
+            db.execute('BEGIN')
+            rows = db.execute('SELECT o.kind,o.resource_id,j.robot_id FROM allocation_occupancy o '
+                              'JOIN allocation_jobs j ON j.task_id=o.task_id').fetchall()
+            rows += [('node', node, robot) for robot, node in db.execute('SELECT robot_id,node FROM sim_idle_robots')]
+        return {(kind, resource_id): robot for kind, resource_id, robot in rows}
 
     def handoff_allocate(self, *, task_id, robot_id, map_id, nodes, released_until,
                          resources, action_at_end, map_fingerprint, source_task_id,
@@ -189,6 +277,10 @@ class SimHandoffStore(AllocationStore):
                         or not isinstance(result, dict) or result.get('status') != 'finished'
                         or result.get('task_id') != source_task_id or result.get('next_seq') is not None):
                     raise AllocationConflict('finished event and simulated proof do not match')
+                if db.execute('SELECT 1 FROM sim_handoff_transfers WHERE source_task_id=? OR target_task_id=? OR action_id=?',
+                              (source_task_id, task_id, action_ack['action_id'])).fetchone():
+                    raise AllocationConflict('handoff or action was already used')
+                self._check_resource_availability(db, checked, ignore_task=source_task_id)
                 db.execute('INSERT INTO sim_handoff_transfers VALUES (?,?,?,?,?,?,?,?,?)',
                            (source_task_id, task_id, robot_id, robot_session, seq, stopped_at,
                             event_id, action_ack['action_id'], json.dumps(action_ack, sort_keys=True)))
@@ -242,9 +334,17 @@ class SimHandoffCoordinatorStore:
             self._used = True
         if task_id != self._target or robot_id != self._robot:
             raise AllocationConflict('handoff target or robot does not match')
-        return self._store.handoff_allocate(task_id=task_id, robot_id=robot_id, map_id=map_id,
-                    nodes=nodes, released_until=released_until, resources=resources,
-                    action_at_end=action_at_end, map_fingerprint=map_fingerprint, **self._context)
+        try:
+            return self._store.handoff_allocate(task_id=task_id, robot_id=robot_id, map_id=map_id,
+                        nodes=nodes, released_until=released_until, resources=resources,
+                        action_at_end=action_at_end, map_fingerprint=map_fingerprint, **self._context)
+        except SimResourceBusy:
+            # This exception is raised inside the write transaction before
+            # mutation and only after ownership and proof checks. Its rollback
+            # is definite; every other failure consumes this adapter.
+            with self._lock:
+                self._used = False
+            raise
 
     def get_allocation(self, task_id):
         return self._store.get_allocation(task_id)

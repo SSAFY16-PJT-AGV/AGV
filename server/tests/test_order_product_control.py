@@ -99,6 +99,27 @@ class ProductControlTests(unittest.TestCase):
     def product_order(self):
         return self.engine.create_product_order('Red', 'P', 'D', 'SHELF_RED', 0)
 
+    def test_second_robot_has_distinct_task_and_twin_identity(self):
+        robot = Robot()
+        engine = ProductControlEngine(self.runtime, robot, map_data(), PRODUCTS,
+                                      robot_id='sim-r2', twin_id='AGV_02',
+                                      session='demo-session-r2', task_prefix='r2-web',
+                                      wait_for_reservation=True)
+        result = engine.create_product_order('Red', 'P', 'D', 'SHELF_RED', 0)
+        self.assertEqual(result['order_id'], 'r2-web-pickup')
+        self.assertEqual(Workflow.created[-1].kwargs['robot_id'], 'sim-r2')
+        self.assertEqual(Workflow.created[-1].kwargs['session'], 'demo-session-r2')
+        self.assertTrue(Workflow.created[-1].kwargs['wait_for_reservation'])
+
+    def test_reserved_segment_wait_is_visible_and_can_resume(self):
+        self.product_order()
+        Workflow.created[0].current['status'] = 'waiting_reservation'
+        waiting = self.engine.tick(.1)
+        self.assertEqual((waiting['status'], waiting['phase']), ('waiting', 'reservation_wait'))
+        Workflow.created[0].current['status'] = 'moving'
+        resumed = self.engine.tick(.1)
+        self.assertEqual((resumed['status'], resumed['phase']), ('moving', 'to_pickup'))
+
     def finish_pickup(self):
         self.robot.executor.state = {'status': 'stopped', 'current_node': 'P',
             'pose': {'x': 1000, 'y': 0, 'th': 0},

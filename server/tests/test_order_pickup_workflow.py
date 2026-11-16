@@ -90,6 +90,145 @@ class PickupWorkflowTest(unittest.TestCase):
                 PickupWorkflow(self.runtime, self.robot, self.map,
                                {'red': {'pickup_node': 'C'}}, **options)
 
+    def test_second_simulated_robot_is_explicitly_mapped(self):
+        class SecondRuntime(Runtime):
+            def prepare(self, task, pickup, candidates, action):
+                self.calls.append(('candidate', candidates))
+                return {'task_id': task, 'robot_id': 'sim-r2', 'nodes': ['A', 'B', 'C'],
+                        'released_until': 'B', 'map_id': 'demo@v1'}
+        runtime = SecondRuntime()
+        workflow = PickupWorkflow(runtime, Robot(), self.map, {'red': {'pickup_node': 'C'}},
+                                  simulation_enabled=True, robot_id='sim-r2')
+        self.assertEqual(workflow.submit('red')['status'], 'awaiting_order')
+        self.assertEqual(runtime.calls[1][1][0]['robot_id'], 'sim-r2')
+        for robot_id in ('jetank1', 'sim-', 'sim-a/b', None):
+            with self.subTest(robot_id=robot_id), self.assertRaises(ValueError):
+                PickupWorkflow(runtime, Robot(), self.map, {'red': {'pickup_node': 'C'}},
+                               simulation_enabled=True, robot_id=robot_id)
+
+    def test_contested_segment_waits_then_retries_only_identical_clearance(self):
+        class BlockedReceiver:
+            def __init__(self, runtime):
+                self.runtime, self.calls, self.free = runtime, [], False
+            def retry_occupied_event(self, robot, event_id):
+                self.calls.append((robot, event_id))
+                if not self.free:
+                    return {'status': 'occupied'}
+                self.runtime.inbox.rows[(robot, event_id)] = {
+                    'state': 'applied', 'result': {'status': 'advanced',
+                        'task_id': 'web-pickup', 'next_seq': 2}}
+                return {'status': 'advanced'}
+        self.runtime.receiver = BlockedReceiver(self.runtime)
+        wf = PickupWorkflow(self.runtime, self.robot, self.map, {'red': {'pickup_node': 'C'}},
+                            simulation_enabled=True, clock=lambda: self.clock[0],
+                            timeout_seconds=5, wait_for_reservation=True)
+        wf.submit('red')
+        self.robot.states = [state('stopped', 'B', 1, 'B')]
+        self.assertEqual(wf.tick(0)['status'], 'waiting_progress')
+        event = self.robot.events[0]
+        self.runtime.inbox.rows[('sim-r1', event['event_id'])] = {'state': 'pending'}
+        for _ in range(3):
+            self.clock[0] += .3
+            self.assertEqual(wf.tick(0)['status'], 'waiting_reservation')
+        self.assertEqual(len(self.robot.events), 1)
+        self.assertTrue(all(call == ('sim-r1', event['event_id']) for call in self.runtime.receiver.calls))
+        self.runtime.receiver.free = True
+        self.clock[0] += .3
+        self.assertEqual(wf.tick(0)['status'], 'awaiting_order')
+        self.assertEqual(len(self.robot.events), 1)
+
+    def test_initial_reservation_wait_keeps_task_and_publishes_once(self):
+        from server.sim_handoff_store import SimResourceBusy
+        class BusyRuntime(Runtime):
+            def __init__(self):
+                super().__init__()
+                self.blocked = True
+            def prepare(self, task, pickup, candidates, action):
+                if self.blocked:
+                    self.calls.append(('blocked', task))
+                    raise SimResourceBusy('occupied')
+                return super().prepare(task, pickup, candidates, action)
+        runtime = BusyRuntime()
+        wf = PickupWorkflow(runtime, self.robot, self.map, {'red': {'pickup_node': 'C'}},
+                            simulation_enabled=True, clock=lambda: self.clock[0],
+                            timeout_seconds=5, wait_for_reservation=True)
+        self.assertEqual(wf.submit('red')['status'], 'waiting_reservation')
+        for _ in range(3):
+            self.clock[0] += .3
+            self.assertEqual(wf.tick(0)['status'], 'waiting_reservation')
+        self.assertEqual([c[0] for c in runtime.calls].count('create'), 1)
+        self.assertNotIn('publish', [c[0] for c in runtime.calls])
+        runtime.blocked = False
+        self.clock[0] += .3
+        self.assertEqual(wf.tick(0)['status'], 'awaiting_order')
+        self.assertEqual([c[0] for c in runtime.calls].count('create'), 1)
+        self.assertEqual([c[0] for c in runtime.calls].count('publish'), 1)
+
+    def test_contested_initial_reservation_timeout_never_publishes(self):
+        from server.sim_handoff_store import SimResourceBusy
+        class BusyRuntime(Runtime):
+            def prepare(self, *args, **kwargs):
+                raise SimResourceBusy('occupied')
+        runtime = BusyRuntime()
+        wf = PickupWorkflow(runtime, self.robot, self.map, {'red': {'pickup_node': 'C'}},
+                            simulation_enabled=True, clock=lambda: self.clock[0],
+                            timeout_seconds=5, wait_for_reservation=True)
+        self.assertEqual(wf.submit('red')['status'], 'waiting_reservation')
+        self.clock[0] += 6
+        self.assertEqual(wf.tick(0)['status'], 'unknown')
+        self.assertEqual(wf.tick(0)['status'], 'unknown')
+        self.assertEqual(runtime.calls, [('create', 'web-pickup')])
+        self.assertEqual(self.robot.events, [])
+
+    def test_changed_idle_state_during_initial_wait_fails_closed(self):
+        from server.sim_handoff_store import SimResourceBusy
+        class BusyRuntime(Runtime):
+            def prepare(self, *args, **kwargs):
+                raise SimResourceBusy('occupied')
+        runtime = BusyRuntime()
+        wf = PickupWorkflow(runtime, self.robot, self.map, {'red': {'pickup_node': 'C'}},
+                            simulation_enabled=True, clock=lambda: self.clock[0],
+                            timeout_seconds=5, wait_for_reservation=True)
+        self.assertEqual(wf.submit('red')['status'], 'waiting_reservation')
+        self.robot.states = [state('idle', 'B')]
+        self.clock[0] += .3
+        self.assertEqual(wf.tick(0)['status'], 'unknown')
+        self.assertNotIn('publish', [c[0] for c in runtime.calls])
+
+    def test_handoff_wait_reuses_only_same_adapter_and_unchanged_stop(self):
+        from server.sim_handoff_store import SimHandoffCoordinatorStore, SimResourceBusy
+        adapter = object.__new__(SimHandoffCoordinatorStore)
+        adapter._target, adapter._robot = 'web-delivery', 'sim-r1'
+        class BusyHandoffRuntime(Runtime):
+            def __init__(self):
+                super().__init__()
+                self.blocked = True
+            def prepare(self, task, pickup, candidates, action, **options):
+                self.calls.append(('attempt', options.get('handoff_store')))
+                if self.blocked:
+                    raise SimResourceBusy('occupied')
+                return {'task_id': task, 'robot_id': 'sim-r1', 'nodes': ['A', 'B', 'C'],
+                        'released_until': 'B', 'map_id': 'demo@v1'}
+        runtime = BusyHandoffRuntime()
+        previous = state('stopped', 'A', 1, 'A')
+        previous['order'].update(order_id='earlier', nodes=['X', 'A'])
+        previous['receipt']['order_id'] = 'earlier'
+        self.robot.states = [previous]
+        wf = PickupWorkflow(runtime, self.robot, self.map, {'red': {'pickup_node': 'C'}},
+            simulation_enabled=True, clock=lambda: self.clock[0], timeout_seconds=5,
+            task_id='web-delivery', action_at_end={'type': 'unload'},
+            accept_preceding=('earlier', 'A'), prepare_options={'handoff_store': adapter},
+            wait_for_reservation=True)
+        self.assertEqual(wf.submit('red')['status'], 'waiting_reservation')
+        self.clock[0] += .3
+        self.assertEqual(wf.tick(0)['status'], 'waiting_reservation')
+        runtime.blocked = False
+        self.clock[0] += .3
+        self.assertEqual(wf.tick(0)['status'], 'awaiting_order')
+        self.assertEqual([c[0] for c in runtime.calls].count('create'), 1)
+        self.assertEqual([c[0] for c in runtime.calls].count('publish'), 1)
+        self.assertTrue(all(call[1] is adapter for call in runtime.calls if call[0] == 'attempt'))
+
     def test_submit_uses_robot_location_and_existing_coordinator(self):
         result = self.workflow.submit('red')
         self.assertEqual(result['status'], 'awaiting_order')

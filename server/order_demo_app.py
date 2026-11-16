@@ -124,16 +124,22 @@ class DemoRuntime:
                 if self._ready():
                     with self.lock:
                         state = self.engine.tick(min(now - previous, 0.5))
-                    payload = {'map_id': 'twin-validation-v1',
-                               'last_node': state['current_node'],
-                               'status': SIMULATION_STATUS.get(state['status'], 'ERROR'),
-                               'battery': state['battery'], 'pose': state['pose']}
-                    result = self.client.publish('agv/sim-r1/state', json.dumps(payload),
-                                                 qos=0, retain=False)
-                    if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                        self.connected.clear()
-                        with self.lock:
-                            self.engine.action_unknown()
+                    states = state.get('robots') if state.get('mode') == 'fleet' else [dict(state, robot_id='sim-r1')]
+                    if (not isinstance(states, list) or not states or
+                            any(item.get('robot_id') not in ('sim-r1', 'sim-r2') for item in states)):
+                        raise ValueError('invalid isolated robot states')
+                    for item in states:
+                        payload = {'map_id': 'twin-validation-v1',
+                                   'last_node': item['current_node'],
+                                   'status': SIMULATION_STATUS.get(item['status'], 'ERROR'),
+                                   'battery': item['battery'], 'pose': item['pose']}
+                        result = self.client.publish('agv/{}/state'.format(item['robot_id']), json.dumps(payload),
+                                                     qos=0, retain=False)
+                        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                            self.connected.clear()
+                            with self.lock:
+                                self.engine.action_unknown()
+                            break
                 else:
                     with self.lock:
                         self.engine.action_unknown()
@@ -172,33 +178,55 @@ async def lifespan(app):
             from server.sim_runtime import SimRuntime
             from server.sim_order_authorization import SimOrderAuthorizer
             from server.order_product_control import ProductControlEngine
+            from server.order_fleet import FleetProductControlEngine
             from sim.order_inbox import SimOrderInbox
             from sim.order_executor import SimOrderExecutor
             from sim.mqtt_order_robot import SimMqttOrderRobot
             folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
             sim_map = make_order_sim_map(map_data)
             db_path = folder / 'server.sqlite3'
-            store = SimHandoffStore.create_new(db_path, simulation_enabled=True)
+            fleet_enabled = os.environ.get('AGV_ORDER_FLEET') == '1'
+            if fleet_enabled:
+                starts = {'sim-r1': 'J01', 'sim-r2': 'J05'}
+                if not set(starts.values()).issubset({node['id'] for node in sim_map['nodes']}):
+                    raise ValueError('fleet demo start nodes are absent from the map')
+                store = SimHandoffStore.create_new(db_path, simulation_enabled=True, idle_positions=starts)
+            else:
+                starts = {'sim-r1': sim_map['nodes'][0]['id']}
+                store = SimHandoffStore.create_new(db_path, simulation_enabled=True)
             # Fixed bounded task/session bindings keep the existing event and
             # recovery allowlists immutable during this isolated run.
-            task_ids = ['web-pickup', 'web-delivery']
-            for index in range(2, 17):
-                task_ids.extend(('web-{}-pickup'.format(index), 'web-{}-delivery'.format(index)))
-            sessions = {'sim-r1': {task: 'demo-session' for task in task_ids}}
+            prefixes = {'sim-r1': 'web', 'sim-r2': 'r2-web'}
+            session_names = {'sim-r1': 'demo-session', 'sim-r2': 'demo-session-r2'}
+            sessions = {}
+            for robot_id in starts:
+                prefix = prefixes[robot_id]
+                task_ids = ['{}-pickup'.format(prefix), '{}-delivery'.format(prefix)]
+                for index in range(2, 17):
+                    task_ids.extend(('{}-{}-pickup'.format(prefix, index), '{}-{}-delivery'.format(prefix, index)))
+                sessions[robot_id] = {task: session_names[robot_id] for task in task_ids}
             runtime = SimRuntime(db_path, sim_map, sessions, port=port,
                                  client_id='web-order-workflow', simulation_store=store)
             runtime.start()
             cleanup.callback(runtime.stop)
             map_id = '{}@v{}'.format(sim_map['map_id'], sim_map['version'])
-            inbox = SimOrderInbox(folder / 'robot.sqlite3', 'sim-r1', map_id)
-            inbox.initialize()
-            authorizer = SimOrderAuthorizer(runtime)
-            robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, sim_map['nodes'][0]['id']),
-                                      port, authorization_guard=authorizer.guard)
-            robot.start()
-            cleanup.callback(robot.stop)
             product_lookup = {item['product_type']: dict(item) for item in PRODUCTS}
-            engine = ProductControlEngine(runtime, robot, sim_map, product_lookup)
+            engines = {}
+            for robot_id, start in starts.items():
+                filename = '{}.sqlite3'.format(robot_id) if fleet_enabled else 'robot.sqlite3'
+                inbox = SimOrderInbox(folder / filename, robot_id, map_id)
+                inbox.initialize()
+                authorizer = SimOrderAuthorizer(runtime, robot_id=robot_id)
+                robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, start),
+                                          port, authorization_guard=authorizer.guard)
+                robot.start()
+                cleanup.callback(robot.stop)
+                engines[robot_id] = ProductControlEngine(
+                    runtime, robot, sim_map, product_lookup, robot_id=robot_id,
+                    twin_id={'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}[robot_id],
+                    session=session_names[robot_id], task_prefix=prefixes[robot_id],
+                    wait_for_reservation=fleet_enabled)
+            engine = FleetProductControlEngine(engines, sim_map) if fleet_enabled else engines['sim-r1']
         else:
             from server.order_demo_engine import OrderDemoEngine
             engine = OrderDemoEngine(map_data)

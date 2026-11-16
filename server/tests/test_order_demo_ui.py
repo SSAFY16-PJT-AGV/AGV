@@ -89,7 +89,11 @@ const context = {
     if (url.endsWith('/status')) return {ok:true, json:async () => current};
     if (url.endsWith('/product-orders')) {
       posted = JSON.parse(options.body);
-      current = {status:'moving', phase:'waiting_grab', product_type:'Red', current_node:'D01', route:['D01','D04']};
+      if (current.mode === 'fleet') {
+        current = {...current, accepting_orders:false};
+      } else {
+        current = {status:'moving', phase:'waiting_grab', product_type:'Red', current_node:'D01', route:['D01','D04']};
+      }
       return {ok:true, json:async () => ({status:'moving'})};
     }
     throw new Error('unexpected URL: ' + url);
@@ -130,6 +134,34 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   assert.strictEqual(element('direct-orders').hidden, true);
   assert.strictEqual(element('submit-product').disabled, true);
   assert(element('status-feedback').textContent.includes('다시 시작'));
+  current = {mode:'fleet', accepting_orders:true, robots:[
+    {robot_id:'sim-r1', status:'moving', phase:'to_pickup', current_node:'N1', route:['N1','D01']},
+    {robot_id:'sim-r2', status:'idle', phase:null, current_node:'N5', route:[]}
+  ]};
+  await timer();
+  assert.strictEqual(element('direct-orders').hidden, true);
+  assert.strictEqual(element('submit-product').disabled, false);
+  const rows = element('fleet-status').children;
+  assert.strictEqual(rows.length, 2);
+  assert(rows[0].textContent.includes('sim-r1') && rows[0].textContent.includes('N1'));
+  assert(rows[0].textContent.includes('이동 중') && rows[0].textContent.includes('N1 → D01'));
+  assert(rows[1].textContent.includes('sim-r2') && rows[1].textContent.includes('N5'));
+  assert(rows[1].textContent.includes('대기 중'));
+  current.robots[0].status = 'waiting';
+  current.robots[0].phase = 'reservation_wait';
+  await timer();
+  assert(element('fleet-status').children[0].textContent.includes('구간 예약 대기'));
+  current.robots[0].status = 'moving';
+  current.robots[0].phase = 'waiting_grab';
+  await timer();
+  assert(element('fleet-status').children[0].textContent.includes('집기 확인 중'));
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posted.product_id, 'red');
+  assert.strictEqual(element('submit-product').disabled, true);
+  current = {mode:'fleet', accepting_orders:'invalid', robots:[]};
+  await timer();
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('status-feedback').textContent.includes('불러오지 못했습니다'));
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''
         result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,
