@@ -113,3 +113,38 @@ class DemoRuntimeFailureTest(unittest.TestCase):
         demo.connected.set()
         with self.assertRaises(ConnectionError):
             demo.create_order('A', 'B')
+
+    def test_unready_coordinated_robot_is_not_ready(self):
+        class CoordinatedEngine:
+            control_ready = False
+        demo = DemoRuntime(CoordinatedEngine(), 1883, [])
+        demo.connected.set()
+        self.assertFalse(demo._ready())
+
+    def test_mqtt_state_preserves_waiting_and_failure_meaning(self):
+        class Engine:
+            def __init__(self, status):
+                self.status = status
+            def tick(self, elapsed):
+                return {'status': self.status, 'current_node': 'N1', 'battery': 0.8,
+                        'pose': {'x': 0, 'y': 0, 'th': 0}}
+        class Publisher:
+            def __init__(self, demo):
+                self.demo = demo
+                self.messages = []
+            def publish(self, topic, payload, qos, retain):
+                self.messages.append((topic, json.loads(payload), qos, retain))
+                self.demo.stop_event.set()
+                return type('Result', (), {'rc': 0})()
+        for engine_status, expected in (('failed', 'ERROR'), ('unknown', 'ERROR'),
+                                        ('waiting', 'WAITING'), ('moving', 'MOVING'),
+                                        ('idle', 'IDLE'), ('completed', 'IDLE')):
+            demo = DemoRuntime(Engine(engine_status), 1883, [])
+            publisher = Publisher(demo)
+            demo.client = publisher
+            demo.connected.set()
+            demo._run()
+            with self.subTest(engine_status=engine_status):
+                self.assertEqual(len(publisher.messages), 1)
+                self.assertEqual(publisher.messages[0][0], 'agv/sim-r1/state')
+                self.assertEqual(publisher.messages[0][1]['status'], expected)

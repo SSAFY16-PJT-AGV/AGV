@@ -3,13 +3,14 @@
 This process publishes simulated observations, never physical robot commands.
 Launch it via the isolated demo launcher, not the production server.
 """
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, ExitStack
 import json
 import logging
 import os
 from pathlib import Path
 import threading
 import time
+import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -26,6 +27,11 @@ PRODUCTS = (
     {'id': 'blue', 'label': '파란 상품', 'product_type': 'Blue', 'pickup_node': 'D06',
      'destination_node': 'D05', 'shelf_id': 'SHELF_BLUE', 'slot_index': 0},
 )
+
+# Labels for local simulated observations only; they do not authorize a real
+# robot to move or assert its physical state.
+SIMULATION_STATUS = {'moving': 'MOVING', 'waiting': 'WAITING', 'failed': 'ERROR',
+                     'unknown': 'ERROR', 'idle': 'IDLE', 'completed': 'IDLE'}
 
 
 class DemoRuntime:
@@ -73,6 +79,11 @@ class DemoRuntime:
     def _ready(self):
         if not self.connected.is_set():
             return False
+        try:
+            if getattr(self.engine, 'control_ready', True) is not True:
+                return False
+        except Exception:
+            return False
         if self.observer is None:
             return True
         try:
@@ -115,7 +126,7 @@ class DemoRuntime:
                         state = self.engine.tick(min(now - previous, 0.5))
                     payload = {'map_id': 'twin-validation-v1',
                                'last_node': state['current_node'],
-                               'status': 'MOVING' if state['status'] == 'moving' else 'IDLE',
+                               'status': SIMULATION_STATUS.get(state['status'], 'ERROR'),
                                'battery': state['battery'], 'pose': state['pose']}
                     result = self.client.publish('agv/sim-r1/state', json.dumps(payload),
                                                  qos=0, retain=False)
@@ -150,25 +161,60 @@ async def lifespan(app):
     raw = Path(os.environ['AGV_ORDER_DEMO_MAP']).read_bytes()
     if len(raw) > 4 * 1024 * 1024:
         raise ValueError('demo map too large')
-    from server.order_demo_engine import OrderDemoEngine
     map_data = json.loads(raw.decode('utf-8'))
-    engine = OrderDemoEngine(map_data)
     nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in map_data['nodes']]
-    service = start_mqtt()
-    demo = DemoRuntime(engine, port, nodes, service)
-    app.state.mqtt_service = service
-    try:
-        demo.start()
-        app.state.demo = demo
-        app.state.demo_actions = demo.actions
-        yield
-    finally:
-        app.state.demo = None
-        app.state.demo_actions = None
+    with ExitStack() as cleanup:
+        if os.environ.get('AGV_ORDER_COORDINATED') == '1':
+            # A fresh, disposable DB and dedicated robot are only for the
+            # launcher-owned isolated broker; never share them with hardware.
+            from server.order_sim_map import make_order_sim_map
+            from server.sim_handoff_store import SimHandoffStore
+            from server.sim_runtime import SimRuntime
+            from server.sim_order_authorization import SimOrderAuthorizer
+            from server.order_product_control import ProductControlEngine
+            from sim.order_inbox import SimOrderInbox
+            from sim.order_executor import SimOrderExecutor
+            from sim.mqtt_order_robot import SimMqttOrderRobot
+            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
+            sim_map = make_order_sim_map(map_data)
+            db_path = folder / 'server.sqlite3'
+            store = SimHandoffStore.create_new(db_path, simulation_enabled=True)
+            # Fixed bounded task/session bindings keep the existing event and
+            # recovery allowlists immutable during this isolated run.
+            task_ids = ['web-pickup', 'web-delivery']
+            for index in range(2, 17):
+                task_ids.extend(('web-{}-pickup'.format(index), 'web-{}-delivery'.format(index)))
+            sessions = {'sim-r1': {task: 'demo-session' for task in task_ids}}
+            runtime = SimRuntime(db_path, sim_map, sessions, port=port,
+                                 client_id='web-order-workflow', simulation_store=store)
+            runtime.start()
+            cleanup.callback(runtime.stop)
+            map_id = '{}@v{}'.format(sim_map['map_id'], sim_map['version'])
+            inbox = SimOrderInbox(folder / 'robot.sqlite3', 'sim-r1', map_id)
+            inbox.initialize()
+            authorizer = SimOrderAuthorizer(runtime)
+            robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, sim_map['nodes'][0]['id']),
+                                      port, authorization_guard=authorizer.guard)
+            robot.start()
+            cleanup.callback(robot.stop)
+            product_lookup = {item['product_type']: dict(item) for item in PRODUCTS}
+            engine = ProductControlEngine(runtime, robot, sim_map, product_lookup)
+        else:
+            from server.order_demo_engine import OrderDemoEngine
+            engine = OrderDemoEngine(map_data)
+        service = start_mqtt()
+        cleanup.callback(stop_mqtt, service)
+        demo = DemoRuntime(engine, port, nodes, service)
+        app.state.mqtt_service = service
         try:
-            demo.stop()
+            demo.start()
+            cleanup.callback(demo.stop)
+            app.state.demo = demo
+            app.state.demo_actions = demo.actions
+            yield
         finally:
-            stop_mqtt(service)
+            app.state.demo = None
+            app.state.demo_actions = None
 
 
 app = FastAPI(title='격리 가상 주문 시연', lifespan=lifespan, docs_url=None, redoc_url=None,

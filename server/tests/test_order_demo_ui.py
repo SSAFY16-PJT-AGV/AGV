@@ -125,6 +125,11 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   current = {status:'completed', phase:'done', product_type:null, current_node:'D04', route:[]};
   await timer();
   assert.strictEqual(element('status').textContent, '가상 도착');
+  current = {status:'completed', phase:'done', product_type:'Red', mode:'coordinated', orders_remaining:0, current_node:'D04', route:[]};
+  await timer();
+  assert.strictEqual(element('direct-orders').hidden, true);
+  assert.strictEqual(element('submit-product').disabled, true);
+  assert(element('status-feedback').textContent.includes('다시 시작'));
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''
         result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,

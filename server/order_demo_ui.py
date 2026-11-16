@@ -55,7 +55,7 @@ HTML_PAGE = r'''<!doctype html>
         <button id="submit-product" type="submit" disabled>가상 상품 주문</button>
       </form>
       <p id="product-feedback" class="feedback" role="status" aria-live="polite"></p>
-      <details>
+      <details id="direct-orders">
       <summary>노드 직접 선택</summary>
       <p class="help">가상 운반 지점을 직접 지정할 때 사용합니다.</p>
       <form id="order-form">
@@ -191,6 +191,8 @@ HTML_PAGE = r'''<!doctype html>
     try {
       const data = await readJson(await fetch('/order-demo/api/status', {cache: 'no-store'}));
       const terminalIssue = ['unknown', 'failed'].includes(data.status) ? data.status : null;
+      const exhausted = data.mode === 'coordinated' && data.orders_remaining === 0 && data.status === 'completed';
+      document.getElementById('direct-orders').hidden = data.mode === 'coordinated';
       const pendingPhase = ['waiting_grab', 'waiting_place', 'unknown', 'failed'].includes(data.phase);
       const effectiveStatus = terminalIssue || (pendingPhase ? data.phase : data.status);
       const effectivePhase = terminalIssue || data.phase;
@@ -200,9 +202,9 @@ HTML_PAGE = r'''<!doctype html>
       document.getElementById('current-node').textContent = textValue(data.current_node);
       document.getElementById('route').textContent = Array.isArray(data.route) && data.route.length
         ? data.route.map(textValue).join(' → ') : '—';
-      jobActive = ['moving', 'running', 'waiting_grab', 'waiting_place', 'unknown', 'failed'].includes(effectiveStatus);
+      jobActive = exhausted || ['moving', 'running', 'waiting_grab', 'waiting_place', 'unknown', 'failed'].includes(effectiveStatus);
       updateButton();
-      message(statusFeedback, terminalIssue
+      message(statusFeedback, terminalIssue || exhausted
         ? '시연 서버와 Unreal 에디터를 종료한 뒤 다시 시작해 주세요.' : '');
     } catch (_) {
       message(statusFeedback, '진행 현황을 불러오지 못했습니다. 서버 연결을 확인해 주세요.');

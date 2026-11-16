@@ -64,7 +64,7 @@ class _DatabaseOwner:
 
 class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
-                 host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0):
+                 host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None):
         if host != '127.0.0.1':
             raise ValueError('simulation broker must use explicit IPv4 loopback')
         if type(port) is not int or not 1 <= port <= 65535:
@@ -90,6 +90,12 @@ class SimRuntime:
         self.path = os.path.realpath(os.fspath(db_path))
         if os.fspath(db_path) == ':memory:':
             raise ValueError('file-backed database required')
+        if simulation_store is not None:
+            from server.sim_handoff_store import SimHandoffStore
+            if type(simulation_store) is not SimHandoffStore:
+                raise ValueError('fresh isolated simulation store required')
+            simulation_store.validate_bound(self.path)
+        self._simulation_store = simulation_store
         self.map_data, self.host, self.port = copy.deepcopy(map_data), host, port
         self.client_id, self.connect_timeout, self.ack_timeout = client_id, float(connect_timeout), float(ack_timeout)
         self._mqtt_security = read_mqtt_security()
@@ -150,9 +156,12 @@ class SimRuntime:
         with self._lock:
             if self._started or self._stopped:
                 raise RuntimeError('runtime may only be started once')
+            if self._simulation_store is not None:
+                self._simulation_store.validate_bound(self.path)
             self._owner.acquire()
             try:
-                self.store = AllocationStore(self.path); self.store.initialize()
+                self.store = self._simulation_store or AllocationStore(self.path)
+                self.store.initialize()
                 self.gate = RecoveryGate(self.path); self.gate.initialize()
                 self.progress = SegmentProgress(self.store, self.map_data, simulation_enabled=True, recovery_gate=self.gate)
                 self.progress.initialize()
@@ -243,12 +252,22 @@ class SimRuntime:
             self.store.create_task(task_id)
             return {'task_id': task_id, 'state': 'PENDING'}
 
-    def prepare(self, task_id, destination, candidates, action):
+    def prepare(self, task_id, destination, candidates, action, *, handoff_store=None):
         with self._lock:
             self._ready()
             robot, _session = self._tasks.get(task_id, (None, None))
             if robot is None or not isinstance(candidates, list) or not candidates:
                 raise ValueError('mapped task and candidates required')
+            if handoff_store is not None:
+                from server.sim_handoff_store import SimHandoffCoordinatorStore
+                if (type(handoff_store) is not SimHandoffCoordinatorStore
+                        or self._simulation_store is None or self.store is not self._simulation_store
+                        or handoff_store._store is not self.store or handoff_store._target != task_id
+                        or handoff_store._robot != robot or handoff_store._context['gate'] is not self.gate
+                        or handoff_store._context['progress'] is not self.progress
+                        or handoff_store._context['receiver'] is not self.receiver):
+                    raise ValueError('handoff store does not match this simulation task and runtime')
+                self._simulation_store.validate_bound(self.path)
             checked = []
             for item in candidates:
                 if not isinstance(item, dict) or set(item) != {'robot_id', 'node', 'available'} or item['robot_id'] != robot:
@@ -256,7 +275,7 @@ class SimRuntime:
                 checked.append(RobotCandidate(item['robot_id'], item['node'], item['available']))
             client, publisher = self._connect_publisher()
             try:
-                coordinator = Coordinator(self.store, self.map_data, publisher, ack_timeout=self.ack_timeout)
+                coordinator = Coordinator(handoff_store or self.store, self.map_data, publisher, ack_timeout=self.ack_timeout)
                 with self.receiver._dispatch_lock, self.gate.serialized():
                     self._ready()
                     with self.gate._state_lock:

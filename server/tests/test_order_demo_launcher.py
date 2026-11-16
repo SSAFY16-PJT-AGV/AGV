@@ -23,6 +23,7 @@ class OrderDemoLauncherTests(unittest.TestCase):
         self.assertEqual(env['MQTT_HOST'], '127.0.0.1')
         self.assertEqual(env['MQTT_PORT'], '12345')
         self.assertEqual(env['AGV_ORDER_DEMO_ENABLED'], '1')
+        self.assertEqual(env['AGV_ORDER_COORDINATED'], '1')
         self.assertTrue(Path(env['AGV_ORDER_DEMO_MAP']).is_absolute())
         self.assertEqual(env['AGV_SIM_CONFIG'], '')
         self.assertEqual(env['PYTHON_DOTENV_DISABLED'], '1')
