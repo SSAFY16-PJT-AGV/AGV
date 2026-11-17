@@ -3,7 +3,7 @@
 This process publishes simulated observations, never physical robot commands.
 Launch it via the isolated demo launcher, not the production server.
 """
-from contextlib import asynccontextmanager, ExitStack
+from contextlib import asynccontextmanager, ExitStack, nullcontext
 import copy
 import json
 import logging
@@ -38,7 +38,8 @@ SIMULATION_STATUS = {'moving': 'MOVING', 'waiting': 'WAITING', 'failed': 'ERROR'
 
 
 class DemoRuntime:
-    def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic):
+    def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic,
+                 auto_recovery=False):
         self.engine = engine
         self.port = port
         self._nodes = nodes
@@ -56,8 +57,13 @@ class DemoRuntime:
         self._snapshot_at = self.clock()
         self._snapshot_valid = True
         self._cached_ready = False
+        self.auto_recovery = auto_recovery is True
+        self._recovering = threading.Event()
+        self._recovery_checkpoints = None
+        self._recovery_owner = None
         self.actions = DemoActionSession(engine, self.lock, can_dispatch=self._ready,
-                                         on_change=self._invalidate_snapshot)
+                                         on_change=self._invalidate_snapshot,
+                                         pause_on_unavailable=self.auto_recovery)
         self.admission = OrderAdmission()
         self.connected = threading.Event()
         self.stop_event = threading.Event()
@@ -91,7 +97,7 @@ class DemoRuntime:
         # is still using them; it remains unknown after shutdown.
         self.admission.join()
         if self.thread is not None:
-            self.thread.join(timeout=5)
+            self.thread.join()
         self.client.disconnect()
         self.client.loop_stop()
 
@@ -99,7 +105,11 @@ class DemoRuntime:
         return [dict(node) for node in self._nodes]
 
     def _ready(self):
-        if not self.connected.is_set():
+        return (self._transport_ready()
+                and (not self.auto_recovery or self.actions.available_fast()))
+
+    def _transport_ready(self):
+        if self.stop_event.is_set() or self._recovering.is_set() or not self.connected.is_set():
             return False
         try:
             if getattr(self.engine, 'control_ready', True) is not True:
@@ -114,6 +124,30 @@ class DemoRuntime:
         except Exception:
             return False
 
+    def _refresh_waiting_snapshot(self):
+        # The launcher must be able to see broker readiness before starting
+        # Unreal. This cached observation does not authorize any tick or order.
+        with self.lock:
+            state = self.engine.snapshot()
+            states = state.get('robots', [state])
+            if (not self.actions.available_fast() and self._transport_ready()
+                    and all(item.get('status') in ('idle', 'completed') for item in states)):
+                self._store_snapshot(state, True)
+
+    def _tick_if_ready(self, elapsed):
+        with self.lock:
+            if self.auto_recovery:
+                with self.actions.motion_guard() as owner_available:
+                    if not owner_available or not self._ready():
+                        return None
+                    state = self.engine.tick(elapsed)
+                    self._store_snapshot(state, self._ready())
+                    return state
+            if not self._ready():
+                return None
+            state = self.engine.tick(elapsed)
+            self._store_snapshot(state, self._ready())
+            return state
     def _invalidate_snapshot(self):
         with self._snapshot_lock:
             self._snapshot_valid = False
@@ -151,15 +185,16 @@ class DemoRuntime:
         # caller receives a pending ID. The operation remains exactly-once.
         self.lock.acquire()
         try:
-            if self.stop_event.is_set() or not self._ready():
-                raise ConnectionError('isolated broker unavailable')
-            self._invalidate_snapshot()
-            try:
-                result = self.engine.create_order(pickup, destination)
-                self._store_snapshot(self.engine.snapshot(), self._ready())
-                return result
-            except Exception as exc:
-                raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
+            with self.actions.motion_guard() if self.auto_recovery else nullcontext(True) as owner_available:
+                if not owner_available or self.stop_event.is_set() or not self._ready():
+                    raise ConnectionError('isolated broker unavailable')
+                self._invalidate_snapshot()
+                try:
+                    result = self.engine.create_order(pickup, destination)
+                    self._store_snapshot(self.engine.snapshot(), self._ready())
+                    return result
+                except Exception as exc:
+                    raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
         finally:
             self.lock.release()
 
@@ -169,17 +204,19 @@ class DemoRuntime:
             raise ValueError('unknown product')
         self.lock.acquire()
         try:
-            if self.stop_event.is_set() or not self._ready() or not self.actions.available():
-                raise ConnectionError('authenticated Unreal connection unavailable')
-            self._invalidate_snapshot()
-            try:
-                result = self.engine.create_product_order(product['product_type'], product['pickup_node'],
-                                                          product['destination_node'], product['shelf_id'],
-                                                          product['slot_index'])
-                self._store_snapshot(self.engine.snapshot(), self._ready())
-                return result
-            except Exception as exc:
-                raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
+            with self.actions.motion_guard() if self.auto_recovery else nullcontext(True) as owner_available:
+                if (not owner_available or self.stop_event.is_set() or not self._ready()
+                        or not self.actions.available()):
+                    raise ConnectionError('authenticated Unreal connection unavailable')
+                self._invalidate_snapshot()
+                try:
+                    result = self.engine.create_product_order(product['product_type'], product['pickup_node'],
+                                                              product['destination_node'], product['shelf_id'],
+                                                              product['slot_index'])
+                    self._store_snapshot(self.engine.snapshot(), self._ready())
+                    return result
+                except Exception as exc:
+                    raise AdmissionOutcomeUnknown('simulated order outcome is unknown') from exc
         finally:
             self.lock.release()
 
@@ -198,15 +235,113 @@ class DemoRuntime:
         return self._submit(lambda: self.create_order(pickup, destination),
                             json.dumps(['nodes', pickup, destination], ensure_ascii=True), request_key)
 
+    def _enter_recovery(self):
+        with self.lock:
+            if not self._recovering.is_set():
+                if (not self.actions.available_fast() and
+                        all(item.snapshot()['status'] in ('idle', 'completed')
+                            for item in self.engine.engines.values())):
+                    return
+                self._recovering.set()
+                self._recovery_owner = self.actions.owner if self.actions.available_fast() else None
+                uncertain = self.actions.action_id if self.actions.sent_at is not None else None
+                self.engine.suspend(uncertain)
+                if self._recovery_owner is None:
+                    self.engine.action_unknown()
+                self.actions.action_id = self.actions.observed_at = self.actions.sent_at = None
+                self._invalidate_snapshot()
+
+    def _try_recovery(self):
+        """Recover only this running fleet's frozen, in-memory simulation."""
+        from server.sim_order_authorization import SimOrderAuthorizer
+        with self.lock:
+            if self.stop_event.is_set():
+                return False
+            if (self._recovery_owner is None or not self.actions.available_fast()
+                    or self.actions.owner is not self._recovery_owner):
+                self.engine.action_unknown()
+                return False
+            engines = self.engine.engines
+            # An ambiguous in-flight Unreal action or workflow remains unknown.
+            if any(item.snapshot()['status'] in ('unknown', 'failed') for item in engines.values()):
+                return False
+            if self._recovery_checkpoints is None:
+                self._recovery_checkpoints = {
+                    key: (item.robot.connected_recovery_checkpoint() if item.robot.ready
+                          else item.robot.recovery_checkpoint()) for key, item in engines.items()}
+            checkpoints = self._recovery_checkpoints
+            runtime = next(iter(engines.values())).runtime
+            if any(item.runtime is not runtime for item in engines.values()):
+                raise RuntimeError('fleet runtime changed during recovery')
+            if not runtime.status()['ready']:
+                runtime.reconnect()
+            if self.stop_event.is_set():
+                return False
+            # Freeze and revoke both robots' previous proofs even when only
+            # one transport dropped; each active segment is then revalidated.
+            for key in engines:
+                runtime.invalidate_robot(key)
+            for key, item in engines.items():
+                if not item.robot.ready:
+                    authorizer = SimOrderAuthorizer(runtime, robot_id=key)
+                    item.robot.reconnect(authorization_guard=authorizer.guard)
+                if self.stop_event.is_set():
+                    return False
+            if not self.connected.is_set():
+                self.client.loop_stop()
+                if self.client.reconnect() != mqtt.MQTT_ERR_SUCCESS:
+                    raise ConnectionError('demo publisher reconnect failed')
+                self.client.loop_start()
+                if not self.connected.wait(5):
+                    raise ConnectionError('demo publisher reconnect timed out')
+            if self.observer is not None:
+                observation = self.observer.snapshot()
+                if not observation.get('connected') or not observation.get('ready'):
+                    return False
+            if (self.stop_event.is_set() or not self.actions.available_fast()
+                    or self.actions.owner is not self._recovery_owner):
+                self.engine.action_unknown()
+                return False
+            if any(not item.robot.ready or not item.robot.check_recovery_checkpoint(checkpoints[key])
+                   for key, item in engines.items()) or not runtime.status()['ready']:
+                return False
+            for key, item in engines.items():
+                if not item.robot.check_recovery_checkpoint(checkpoints[key]):
+                    raise RuntimeError('simulated checkpoint changed during recovery')
+                state = item.robot.executor.snapshot()
+                if item.snapshot()['status'] == 'suspended':
+                    order = state.get('order')
+                    if state.get('status') != 'moving' or not isinstance(order, dict):
+                        raise RuntimeError('only confirmed in-progress segments can resume automatically')
+                    runtime.reconcile_moving(key, order['order_id'], item.SESSION, item.robot, checkpoints[key])
+            if (self.stop_event.is_set() or not self.actions.available_fast()
+                    or self.actions.owner is not self._recovery_owner):
+                self.engine.action_unknown()
+                return False
+            if any(not item.robot.ready or not item.robot.check_recovery_checkpoint(checkpoints[key])
+                   for key, item in engines.items()) or not runtime.status()['ready']:
+                return False
+            if not self.engine.resume_after_reconnect():
+                raise RuntimeError('fleet state could not resume')
+            if (self.stop_event.is_set() or not self.actions.available_fast()
+                    or self.actions.owner is not self._recovery_owner):
+                self.engine.action_unknown()
+                return False
+            self._recovery_checkpoints = None
+            self._recovery_owner = None
+            self._recovering.clear()
+            return True
+
     def _run(self):
         try:
             previous = time.monotonic()
             while not self.stop_event.is_set():
                 now = time.monotonic()
                 if self._ready():
-                    with self.lock:
-                        state = self.engine.tick(min(now - previous, 0.5))
-                        self._store_snapshot(state, self._ready())
+                    state = self._tick_if_ready(min(now - previous, 0.5))
+                    if state is None:
+                        previous = now
+                        continue
                     states = state.get('robots') if state.get('mode') == 'fleet' else [dict(state, robot_id='sim-r1')]
                     if (not isinstance(states, list) or not states or
                             any(item.get('robot_id') not in ('sim-r1', 'sim-r2') for item in states)):
@@ -220,13 +355,28 @@ class DemoRuntime:
                                                      qos=0, retain=False)
                         if result.rc != mqtt.MQTT_ERR_SUCCESS:
                             self.connected.clear()
-                            with self.lock:
-                                self.engine.action_unknown()
+                            if self.auto_recovery:
+                                self._enter_recovery()
+                            else:
+                                with self.lock:
+                                    self.engine.action_unknown()
                             break
                 else:
-                    with self.lock:
-                        self.engine.action_unknown()
-                        self._invalidate_snapshot()
+                    if self.auto_recovery:
+                        if not self.actions.available_fast():
+                            self._refresh_waiting_snapshot()
+                        self._enter_recovery()
+                        if self._recovering.is_set():
+                            try:
+                                self._try_recovery()
+                            except Exception:
+                                # A disconnected test-owned broker can take time to
+                                # return. No tick or new order is allowed meanwhile.
+                                logging.getLogger(__name__).debug('fleet recovery pending')
+                    else:
+                        with self.lock:
+                            self.engine.action_unknown()
+                            self._invalidate_snapshot()
                 previous = now
                 self.stop_event.wait(0.2)
         except Exception:
@@ -317,7 +467,9 @@ async def lifespan(app):
             engine = OrderDemoEngine(map_data)
         service = start_mqtt()
         cleanup.callback(stop_mqtt, service)
-        demo = DemoRuntime(engine, port, nodes, service)
+        demo = DemoRuntime(engine, port, nodes, service,
+                           auto_recovery=(os.environ.get('AGV_ORDER_COORDINATED') == '1'
+                                          and os.environ.get('AGV_ORDER_FLEET') == '1'))
         app.state.mqtt_service = service
         try:
             demo.start()

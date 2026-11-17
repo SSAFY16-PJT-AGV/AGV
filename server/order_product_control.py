@@ -53,6 +53,7 @@ class ProductControlEngine:
         self._current_leg = None
         self._pickup_evidence = self._delivery_evidence = self._last_place_ack = None
         self._pickup_task = self._delivery_task = None
+        self._suspended_state = None
 
     @property
     def control_ready(self):
@@ -169,10 +170,45 @@ class ProductControlEngine:
 
     def _mark_unknown(self):
         self._status, self._phase, self._pending = 'unknown', 'unknown', None
+        self._suspended_state = None
+
+    def suspend(self, uncertain_action_id=None):
+        """Freeze an in-process demo without inventing an Unreal result."""
+        with self.lock:
+            if uncertain_action_id is not None and self._pending is not None:
+                if self._pending.get('action_id') == uncertain_action_id:
+                    self._mark_unknown()
+                    return False
+            if self._status == 'suspended':
+                return True
+            if self._status not in ('moving', 'waiting'):
+                return self._status in ('idle', 'completed')
+            workflow = self._pickup_workflow if self._current_leg == 'pickup' else self._delivery_workflow
+            # A partially submitted rear-clear or allocation cannot safely be
+            # retried merely because the transport has reconnected.
+            if workflow is None or (hasattr(workflow, 'pause_for_reconnect')
+                                    and not workflow.pause_for_reconnect()):
+                self._mark_unknown()
+                return False
+            self._suspended_state = (self._status, self._phase)
+            self._status, self._phase = 'suspended', 'connection_lost'
+            return True
+
+    def resume_after_reconnect(self):
+        with self.lock:
+            if self._status != 'suspended' or self._suspended_state is None or not self.control_ready:
+                return False
+            workflow = self._pickup_workflow if self._current_leg == 'pickup' else self._delivery_workflow
+            if hasattr(workflow, 'resume_after_reconnect') and not workflow.resume_after_reconnect():
+                self._mark_unknown()
+                return False
+            self._status, self._phase = self._suspended_state
+            self._suspended_state = None
+            return True
 
     def action_unknown(self):
         with self.lock:
-            if self._status not in ('moving', 'waiting'):
+            if self._status not in ('moving', 'waiting', 'suspended'):
                 return False
             self._mark_unknown()
             return True
@@ -215,13 +251,34 @@ class ProductControlEngine:
         self._status, self._phase = 'waiting', 'waiting_' + name
 
     def tick(self, dt_seconds):
+        return self._tick(dt_seconds, pause_on_disconnect=False)
+
+    def tick_recoverable(self, dt_seconds):
+        """Fleet-only tick which can freeze a verifiably unambiguous outage."""
+        return self._tick(dt_seconds, pause_on_disconnect=True)
+
+    def _tick(self, dt_seconds, *, pause_on_disconnect):
         if type(dt_seconds) not in (int, float) or not math.isfinite(dt_seconds) or dt_seconds < 0:
             raise ValueError('elapsed time must be finite and nonnegative')
         with self.lock:
             if self._status not in ('moving', 'waiting'):
                 return self.snapshot()
             if not self.control_ready:
-                self._mark_unknown()
+                if pause_on_disconnect and self._pending is None:
+                    try:
+                        # The robot checkpoint rejects queued commands,
+                        # ambiguous event publication, or any non-recoverable
+                        # failure. It is a simulation-only in-process check.
+                        if self.robot.ready:
+                            self.robot.connected_recovery_checkpoint()
+                        else:
+                            self.robot.recovery_checkpoint()
+                        if not self.suspend():
+                            self._mark_unknown()
+                    except Exception:
+                        self._mark_unknown()
+                else:
+                    self._mark_unknown()
                 return self.snapshot()
             if self._pending is not None:
                 return self.snapshot()

@@ -21,6 +21,10 @@ MAX_QUEUED_ORDERS = 32
 MAX_ORDER_BYTES = 256 * 1024
 
 
+class _ConnectionLost(RuntimeError):
+    """A readiness check failed before a new simulated side effect began."""
+
+
 def _verify_no_proxy():
     # PySocks can redirect even a 127.0.0.1 connection outside this PC.
     if mqtt.socks is None:
@@ -53,24 +57,37 @@ class SimMqttOrderRobot:
         self._ready = threading.Event()
         self._failed = threading.Event()
         self._lock = threading.RLock()
+        # Disconnect completion and an already-entered geometry update are
+        # serialized separately from _lock: Paho's network callback must not
+        # need _lock while reconnect/stop waits for its network thread.
+        self._motion_fence = threading.Lock()
         self._started = self._stopping = self._stopped = False
+        self._recoverable_disconnect = False
+        self._event_uncertain = False
         self._pending_mid = None
         self._event_segments = set()
-        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+        self._client = self._new_client()
+
+    def _new_client(self):
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                    client_id='{}-order-executor'.format(self.robot_id),
                                    protocol=mqtt.MQTTv311, reconnect_on_failure=False)
-        configure_mqtt_client(self._client, *read_mqtt_security())
-        self._client.manual_ack_set(True)
-        self._client.on_connect = self._on_connect
-        self._client.on_subscribe = self._on_subscribe
-        self._client.on_message = self._on_message
-        self._client.on_disconnect = self._on_disconnect
+        configure_mqtt_client(client, *read_mqtt_security())
+        client.manual_ack_set(True)
+        client.on_connect = self._on_connect
+        client.on_subscribe = self._on_subscribe
+        client.on_message = self._on_message
+        client.on_disconnect = self._on_disconnect
+        return client
 
     def _fail(self):
+        self._recoverable_disconnect = False
         self._failed.set()
         self._ready.clear()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if client is not self._client:
+            return
         if self._failed.is_set() or self._stopping or reason_code.is_failure:
             self._fail()
             return
@@ -84,6 +101,8 @@ class SimMqttOrderRobot:
             self._fail()
 
     def _on_subscribe(self, client, userdata, mid, reason_codes, properties):
+        if client is not self._client:
+            return
         if (self._failed.is_set() or self._stopping or mid != self._pending_mid
                 or len(reason_codes) != 1 or reason_codes[0].is_failure
                 or reason_codes[0].value != 1):
@@ -93,6 +112,8 @@ class SimMqttOrderRobot:
 
     def _on_message(self, client, userdata, message):
         # The network thread never validates JSON, touches SQLite or moves pose.
+        if client is not self._client:
+            return
         if self._failed.is_set() or self._stopping:
             return
         if (not self._ready.is_set() or message.topic != self.order_topic or message.qos != 1
@@ -106,9 +127,14 @@ class SimMqttOrderRobot:
             self._fail()
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
-        self._ready.clear()
-        if not self._stopping:
-            self._fail()
+        with self._motion_fence:
+            if client is not self._client:
+                return
+            self._ready.clear()
+            if not self._stopping:
+                recoverable = self._recoverable_disconnect or not self._failed.is_set()
+                self._fail()
+                self._recoverable_disconnect = recoverable
 
     @property
     def ready(self):
@@ -153,29 +179,128 @@ class SimMqttOrderRobot:
                     self._client.loop_stop()
                 self._stopped = True
 
+    def _checkpoint(self):
+        # The caller holds the robot lock; the executor lock also prevents an
+        # accidental direct tick from changing its cursor while copying it.
+        with self.executor._lock:
+            return (id(self), id(self.executor), id(self.executor._inbox),
+                    json.dumps(self.executor.snapshot(), sort_keys=True, allow_nan=False,
+                               separators=(',', ':')),
+                    self.executor._waypoints, self.executor._next_waypoint,
+                    frozenset(self._event_segments))
+
+    def recovery_checkpoint(self):
+        """Capture in-process simulated state after an observed disconnect."""
+        with self._lock:
+            if (not self._started or self._stopped or not self._failed.is_set()
+                    or not self._recoverable_disconnect or self._event_uncertain
+                    or not self._queue.empty()):
+                raise RuntimeError('simulated state cannot be checkpointed')
+            return self._checkpoint()
+
+    def connected_recovery_checkpoint(self):
+        """Capture a connected simulator already frozen by its caller.
+
+        The caller must stop all fleet ticks and check both readiness and this
+        checkpoint again before allowing any movement. This does not establish
+        physical position or authorize a robot to move.
+        """
+        with self._lock:
+            if not self.ready or self._event_uncertain or not self._queue.empty():
+                raise RuntimeError('connected simulated state cannot be checkpointed')
+            return self._checkpoint()
+
+    def check_recovery_checkpoint(self, checkpoint):
+        """Compare a checkpoint while the caller keeps simulator ticks stopped."""
+        with self._lock:
+            return (not self._stopped and not self._event_uncertain
+                    and self._queue.empty() and self._checkpoint() == checkpoint)
+
+    def reconnect(self, *, authorization_guard):
+        """Reconnect the same simulated executor after a known MQTT disconnect.
+
+        A fresh server-side authorization guard is mandatory on every motion
+        tick. Unprocessed messages and uncertain event attempts require manual
+        reconciliation, not automatic replay.
+        """
+        if not callable(authorization_guard):
+            raise ValueError('a server-side authorization guard is required')
+        with self._lock:
+            if (not self._started or self._stopped or not self._failed.is_set()
+                    or not self._recoverable_disconnect or self._event_uncertain):
+                raise RuntimeError('simulated robot is not eligible for reconnect')
+            self._stopping = True
+            old_client = self._client
+            try:
+                old_client.disconnect()
+            finally:
+                old_client.loop_stop()
+            if not self._queue.empty():
+                self._fail()
+                raise RuntimeError('unprocessed simulated orders require reconciliation')
+            self._authorization_guard = authorization_guard
+            self._order_authorizer = None
+            self._client = self._new_client()
+            self._pending_mid = None
+            self._failed.clear()
+            self._recoverable_disconnect = False
+            self._stopping = False
+            try:
+                _verify_no_proxy()
+                if self._client.connect('127.0.0.1', self.port, keepalive=15) != mqtt.MQTT_ERR_SUCCESS:
+                    raise RuntimeError('isolated broker connection failed')
+                if self._client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
+                    raise RuntimeError('isolated MQTT loop failed')
+                if not self._ready.wait(10) or not self.ready:
+                    raise RuntimeError('simulated order subscription is not ready')
+            except Exception:
+                retryable = not self._failed.is_set() or self._recoverable_disconnect
+                self._fail()
+                self._stopping = True
+                try:
+                    self._client.disconnect()
+                finally:
+                    self._client.loop_stop()
+                self._recoverable_disconnect = (retryable and self._queue.empty()
+                                                and not self._event_uncertain)
+                raise
+        return self
+
+    def _tick_executor(self, dt_seconds):
+        # A callback may detect socket failure while a simulation update is
+        # already underway. Such an update completes before disconnect is
+        # finalized; no later update can begin without a live connection.
+        with self._motion_fence:
+            if not self.ready:
+                raise _ConnectionLost('simulated MQTT connection lost')
+            return self.executor.tick(dt_seconds)
+
     def tick(self, dt_seconds):
         with self._lock:
             if not self.ready:
                 raise RuntimeError('simulated MQTT robot is unavailable')
+            processing_order = False
             try:
                 while True:
                     try:
                         payload, mid, qos = self._queue.get_nowait()
                     except queue.Empty:
                         break
+                    processing_order = True
                     if not self.ready:
-                        raise RuntimeError('simulated MQTT connection lost')
+                        raise _ConnectionLost('simulated MQTT connection lost')
                     guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
                     with guard:
                         if not self.ready:
-                            raise RuntimeError('simulated MQTT connection lost')
+                            raise _ConnectionLost('simulated MQTT connection lost')
                         if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
                             raise ValueError('order does not match a reserved simulated segment')
                         self.executor.accept(payload)
                     if not self.ready or self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
                         raise RuntimeError('simulated order acknowledgement failed')
+                    processing_order = False
                 if not self.ready:
-                    raise RuntimeError('simulated MQTT connection lost')
+                    raise _ConnectionLost('simulated MQTT connection lost')
                 state = self.executor.snapshot()
                 if (state.get('status') == 'moving' and type(dt_seconds) in (int, float)
                         and dt_seconds > 0 and (self._authorization_guard or self._order_authorizer)):
@@ -184,13 +309,22 @@ class SimMqttOrderRobot:
                     guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
                     with guard:
                         if not self.ready:
-                            raise RuntimeError('simulated MQTT connection lost')
+                            raise _ConnectionLost('simulated MQTT connection lost')
                         if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
                             raise ValueError('reserved simulated segment is no longer current')
-                        return self.executor.tick(dt_seconds)
-                return self.executor.tick(dt_seconds)
+                        return self._tick_executor(dt_seconds)
+                return self._tick_executor(dt_seconds)
             except Exception as exc:
-                self._fail()
+                if (isinstance(exc, _ConnectionLost) and not processing_order and not self._event_uncertain
+                        and (self._recoverable_disconnect or not self._failed.is_set())):
+                    # No command was removed from the queue and no event is
+                    # uncertain. Preserve this disconnect for reconciliation,
+                    # even if Paho's disconnect callback has not run yet.
+                    self._failed.set()
+                    self._ready.clear()
+                    self._recoverable_disconnect = True
+                else:
+                    self._fail()
                 raise RuntimeError('simulated order processing stopped') from exc
 
     def publish_event(self, event):
@@ -214,12 +348,14 @@ class SimMqttOrderRobot:
                     raise RuntimeError('a virtual event was already attempted for this segment')
                 # Claim before network I/O: an uncertain publish is never repeated.
                 self._event_segments.add(segment)
+                self._event_uncertain = True
                 info = self._client.publish(self.event_topic, encoded, qos=1, retain=False)
                 if info.rc != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('virtual event queueing failed')
                 info.wait_for_publish(timeout=5)
                 if not self.ready or info.is_published() is not True:
                     raise RuntimeError('virtual event publication was not confirmed')
+                self._event_uncertain = False
                 return {'event_id': checked['event_id'], 'published': True}
             except Exception as exc:
                 self._fail()

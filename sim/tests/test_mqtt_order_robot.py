@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -169,6 +169,280 @@ class MqttRobotTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.robot.tick(5)
         self.assertEqual(self.executor.snapshot()['pose']['x'], 250)
+
+    def test_disconnect_completion_waits_for_started_tick_and_blocks_later_ticks(self):
+        @contextmanager
+        def guard(_payload):
+            yield
+        self.robot._authorization_guard = guard
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        original_tick = self.executor.tick
+        entered, release, disconnected = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def delayed_tick(seconds):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError('test tick was not released')
+            return original_tick(seconds)
+
+        def move():
+            try:
+                self.robot.tick(.25)
+            except Exception as exc:
+                errors.append(exc)
+
+        def disconnect():
+            self.client.disconnect()
+            disconnected.set()
+
+        with patch.object(self.executor, 'tick', side_effect=delayed_tick):
+            moving = threading.Thread(target=move, daemon=True)
+            losing = threading.Thread(target=disconnect, daemon=True)
+            moving.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                losing.start()
+                # An already-started in-process mutation must finish before
+                # the disconnect callback can report that detection finished.
+                self.assertFalse(disconnected.wait(.2))
+            finally:
+                release.set()
+                moving.join(3)
+                if losing.ident is not None:
+                    losing.join(3)
+        self.assertFalse(moving.is_alive())
+        self.assertFalse(losing.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(disconnected.is_set())
+        pose_at_detection = self.executor.snapshot()['pose']
+        self.assertFalse(self.robot.ready)
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(.25)
+        self.assertEqual(self.executor.snapshot()['pose'], pose_at_detection)
+
+    def test_disconnect_before_movement_preserves_recovery_eligibility(self):
+        self.client.deliver(payload())
+        before = self.robot.tick(.25)
+
+        @contextmanager
+        def guard(_payload):
+            self.client.disconnect()
+            yield
+
+        self.robot._authorization_guard = guard
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(.25)
+        self.assertEqual(self.executor.snapshot(), before)
+        checkpoint = self.robot.recovery_checkpoint()
+        self.assertTrue(self.robot.check_recovery_checkpoint(checkpoint))
+        replacement = FakeClient()
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=lambda _: nullcontext())
+        self.assertEqual(self.robot.tick(.25)['pose']['x'], 500)
+
+    def test_disconnect_after_order_acceptance_before_ack_is_not_recoverable(self):
+        @contextmanager
+        def guard(_payload):
+            yield
+            self.client.disconnect()
+
+        self.robot._authorization_guard = guard
+        self.client.deliver(payload())
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(.25)
+        self.assertEqual(self.client.acks, [])
+        with self.assertRaises(RuntimeError):
+            self.robot.recovery_checkpoint()
+
+    def test_socket_closure_before_disconnect_callback_can_be_reconciled(self):
+        self.client.deliver(payload())
+        before = self.robot.tick(.25)
+
+        @contextmanager
+        def guard(_payload):
+            self.client.is_open = False
+            yield
+
+        self.robot._authorization_guard = guard
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(.25)
+        self.client.on_disconnect(self.client, None, None, SimpleNamespace(is_failure=True), None)
+        self.assertEqual(self.executor.snapshot(), before)
+        checkpoint = self.robot.recovery_checkpoint()
+        self.assertTrue(self.robot.check_recovery_checkpoint(checkpoint))
+
+    def test_authorizer_failure_during_disconnect_is_not_recoverable(self):
+        self.client.deliver(payload())
+        self.robot.tick(.25)
+
+        @contextmanager
+        def guard(_payload):
+            self.client.disconnect()
+            raise ValueError('reservation validation failed')
+            yield
+
+        self.robot._authorization_guard = guard
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(.25)
+        with self.assertRaises(RuntimeError):
+            self.robot.recovery_checkpoint()
+
+    def test_reconnect_preserves_intermediate_pose_and_requires_guard(self):
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        self.client.disconnect()
+        before = self.executor.snapshot()
+        replacement = FakeClient()
+        checks = []
+        @contextmanager
+        def guard(value):
+            checks.append(json.loads(value))
+            yield
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=guard)
+        self.assertEqual(self.executor.snapshot(), before)
+        replacement.deliver(payload())
+        result = self.robot.tick(0.25)
+        self.assertEqual(result['pose']['x'], 500)
+        self.assertEqual(result['receipt'], before['receipt'])
+        self.assertGreaterEqual(len(checks), 2)
+
+    def test_reconnect_refuses_unprocessed_orders(self):
+        self.client.deliver(payload())
+        self.client.disconnect()
+        with self.assertRaises(RuntimeError):
+            self.robot.reconnect(authorization_guard=lambda _: None)
+        self.assertFalse(self.robot.ready)
+        self.assertEqual(self.executor.snapshot()['status'], 'idle')
+
+    def test_reconnect_rejects_late_old_callbacks(self):
+        self.client.disconnect()
+        replacement = FakeClient()
+        @contextmanager
+        def guard(_):
+            yield
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=guard)
+        self.client.deliver(payload(), qos=0)
+        self.client.on_disconnect(self.client, None, None, SimpleNamespace(is_failure=True), None)
+        self.assertTrue(self.robot.ready)
+        self.assertEqual(self.robot.tick(1)['status'], 'idle')
+
+    def test_reconnect_refuses_unconfirmed_event_publication(self):
+        self.client.deliver(payload())
+        stopped = self.robot.tick(2)
+        event = {'type': 'rear_clear', 'event_id': 'e1', 'robot_session': 'boot-1',
+                 'order_id': stopped['receipt']['order_id'], 'seq': stopped['receipt']['seq'],
+                 'map_id': stopped['order']['map_id'], 'stopped_at': 'B', 'cleared_resources': []}
+        with patch.object(self.client, 'publish', side_effect=OSError('unknown publication')):
+            with self.assertRaises(RuntimeError):
+                self.robot.publish_event(event)
+        self.client.disconnect()
+        with self.assertRaises(RuntimeError):
+            self.robot.reconnect(authorization_guard=lambda _: None)
+        self.assertEqual(len(self.robot._event_segments), 1)
+
+    def test_reconnect_refuses_to_disable_guard(self):
+        self.client.disconnect()
+        with self.assertRaises((TypeError, ValueError)):
+            self.robot.reconnect(authorization_guard=None)
+        self.assertFalse(self.robot.ready)
+
+    def test_recovery_checkpoint_detects_waypoint_and_pose_changes(self):
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        self.client.disconnect()
+        checkpoint = self.robot.recovery_checkpoint()
+        self.assertTrue(self.robot.check_recovery_checkpoint(checkpoint))
+        self.executor.tick(0.1)
+        self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
+
+    def test_recovery_checkpoint_refuses_unprocessed_orders(self):
+        self.client.deliver(payload())
+        self.client.disconnect()
+        with self.assertRaises(RuntimeError):
+            self.robot.recovery_checkpoint()
+
+    def test_connected_recovery_checkpoint_detects_motion_and_keeps_order(self):
+        self.client.deliver(payload())
+        state = self.robot.tick(0.25)
+        checkpoint = self.robot.connected_recovery_checkpoint()
+        self.assertTrue(self.robot.check_recovery_checkpoint(checkpoint))
+        self.assertEqual(self.executor.snapshot(), state)
+        self.robot.tick(0.25)
+        self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
+
+    def test_connected_recovery_checkpoint_rejects_unprocessed_order(self):
+        self.client.deliver(payload())
+        with self.assertRaises(RuntimeError):
+            self.robot.connected_recovery_checkpoint()
+        self.assertEqual(self.executor.snapshot()['status'], 'idle')
+
+    def test_connected_recovery_checkpoint_rejects_disconnect(self):
+        self.client.disconnect()
+        with self.assertRaises(RuntimeError):
+            self.robot.connected_recovery_checkpoint()
+        self.robot.recovery_checkpoint()
+
+    def test_connected_checkpoint_detects_new_queued_order(self):
+        checkpoint = self.robot.connected_recovery_checkpoint()
+        self.client.deliver(payload())
+        self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
+
+    def test_reconnected_robot_does_not_move_if_reservation_guard_rejects(self):
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        self.client.disconnect()
+        before = self.executor.snapshot()
+        replacement = FakeClient()
+        @contextmanager
+        def guard(_):
+            raise ValueError('reservation changed')
+            yield
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=guard)
+        with self.assertRaises(RuntimeError):
+            self.robot.tick(1)
+        self.assertEqual(self.executor.snapshot(), before)
+
+    def test_reconnected_robot_does_not_repeat_confirmed_event(self):
+        self.client.deliver(payload())
+        stopped = self.robot.tick(2)
+        event = {'type': 'rear_clear', 'event_id': 'e1', 'robot_session': 'boot-1',
+                 'order_id': stopped['receipt']['order_id'], 'seq': stopped['receipt']['seq'],
+                 'map_id': stopped['order']['map_id'], 'stopped_at': 'B', 'cleared_resources': []}
+        self.robot.publish_event(event)
+        self.client.disconnect()
+        replacement = FakeClient()
+        @contextmanager
+        def guard(_):
+            yield
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=guard)
+        with self.assertRaises(RuntimeError):
+            self.robot.publish_event(event)
+        self.assertEqual(replacement.publishes, [])
+
+    def test_reconnect_can_retry_when_broker_is_unavailable(self):
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        self.client.disconnect()
+        before = self.executor.snapshot()
+        unavailable = FakeClient()
+        @contextmanager
+        def guard(_):
+            yield
+        with patch.object(unavailable, 'connect', side_effect=OSError('not listening')):
+            with patch('sim.mqtt_order_robot.mqtt.Client', return_value=unavailable):
+                with self.assertRaises(OSError):
+                    self.robot.reconnect(authorization_guard=guard)
+        replacement = FakeClient()
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=replacement):
+            self.robot.reconnect(authorization_guard=guard)
+        self.assertEqual(self.executor.snapshot(), before)
+        self.assertEqual(self.robot.tick(0.25)['pose']['x'], 500)
 
     def test_order_authorizer_rejects_before_persist_ack_or_motion(self):
         self.robot.stop()

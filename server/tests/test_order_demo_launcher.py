@@ -101,6 +101,51 @@ class OrderDemoLauncherTests(unittest.TestCase):
             self.assertEqual(popen.call_count, 2)
             self.assertEqual(stop.call_args_list, [unittest.mock.call(None), unittest.mock.call(broker)])
 
+    def test_broker_exit_restarts_only_owned_broker_and_preserves_server(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            map_file = root / 'map.json'
+            map_file.write_text(json.dumps(sample_map()), encoding='utf-8')
+            deps = root / 'deps'
+            (deps / 'amqtt').mkdir(parents=True)
+            broker, server, replacement = Mock(pid=101), Mock(pid=102), Mock(pid=103)
+            broker.poll.return_value = 1
+            server.poll.return_value = replacement.poll.return_value = None
+            with patch.object(tool, '_select_broker_port', return_value=18832), \
+                    patch.object(tool, 'wait_for_ready_log'), \
+                    patch.object(tool, 'wait_for_demo'), \
+                    patch.object(tool.subprocess, 'Popen', side_effect=[broker, server, replacement]) as popen, \
+                    patch.object(tool, 'stop_process') as stop, \
+                    patch.object(tool.time, 'sleep', side_effect=KeyboardInterrupt), \
+                    patch('builtins.print'):
+                tool.run(map_file, broker_deps=deps)
+            self.assertEqual(popen.call_count, 3)
+            self.assertEqual(popen.call_args_list[0].args, popen.call_args_list[2].args)
+            self.assertEqual(stop.call_args_list[-2:],
+                             [unittest.mock.call(server), unittest.mock.call(replacement)])
+
+    def test_failed_broker_spawn_keeps_server_and_retries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            map_file = root / 'map.json'
+            map_file.write_text(json.dumps(sample_map()), encoding='utf-8')
+            deps = root / 'deps'
+            (deps / 'amqtt').mkdir(parents=True)
+            broker, server, replacement = Mock(pid=101), Mock(pid=102), Mock(pid=103)
+            broker.poll.return_value = 1
+            server.poll.return_value = replacement.poll.return_value = None
+            with patch.object(tool, '_select_broker_port', return_value=18832), \
+                    patch.object(tool, 'wait_for_ready_log'), \
+                    patch.object(tool, 'wait_for_demo'), \
+                    patch.object(tool.subprocess, 'Popen', side_effect=[broker, server, OSError('busy'), replacement]) as popen, \
+                    patch.object(tool, 'stop_process') as stop, \
+                    patch.object(tool.time, 'sleep', side_effect=[None, KeyboardInterrupt]), \
+                    patch('builtins.print'):
+                tool.run(map_file, broker_deps=deps)
+            self.assertEqual(popen.call_count, 4)
+            self.assertEqual(stop.call_args_list[-2:],
+                             [unittest.mock.call(server), unittest.mock.call(replacement)])
+
 
 if __name__ == '__main__':
     unittest.main()

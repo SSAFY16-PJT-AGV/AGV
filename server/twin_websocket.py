@@ -41,7 +41,7 @@ async def _action_call(fn, *args, on_cancel=None):
         return await asyncio.shield(future)
     except asyncio.CancelledError:
         if on_cancel is not None:
-            on_cancel()
+            await asyncio.to_thread(on_cancel)
         try:
             await future
         except Exception:
@@ -58,7 +58,7 @@ async def _attach_action(actions, client, trusted):
     except asyncio.CancelledError:
         try:
             if await future:
-                _invalidate_action_owner(actions, client)
+                await asyncio.to_thread(_invalidate_action_owner, actions, client)
                 await _action_call(actions.detach, client)
         except Exception:
             pass
@@ -213,5 +213,5 @@ async def digital_twin(websocket: WebSocket):
         return
     finally:
         if claimed:
-            _invalidate_action_owner(actions, websocket)
+            await asyncio.to_thread(_invalidate_action_owner, actions, websocket)
             await _action_call(actions.detach, websocket)

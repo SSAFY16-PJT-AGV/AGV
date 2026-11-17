@@ -165,6 +165,9 @@ class RecoveryGate:
         self._operation_lock = threading.RLock()
         self._local = threading.local()
         self._blocked = set()
+        # Narrow in-process simulation exception: a frozen executor may only
+        # finish its already reserved command; progress remains blocked.
+        self._moving_permits = {}
         self._generations = {}
         self._token_generations = {}
 
@@ -187,6 +190,7 @@ class RecoveryGate:
                 generation = self._generations.get(task_id, 0) + 1
                 self._generations[task_id] = generation
                 self._blocked.add(task_id)
+                self._moving_permits.pop(task_id, None)
                 generations[task_id] = generation
             for old, identity in list(self._token_generations.items()):
                 if identity[0] in generations:

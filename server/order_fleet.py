@@ -84,7 +84,13 @@ class FleetProductControlEngine:
     def tick(self, dt):
         with self.lock:
             for engine in self.engines.values():
-                engine.tick(dt)
+                # A disconnect can arrive while an earlier robot is being
+                # advanced. Let the demo freeze and reconcile the whole fleet
+                # before touching another engine with unavailable transport.
+                if not self.control_ready:
+                    break
+                tick = getattr(engine, 'tick_recoverable', engine.tick)
+                tick(dt)
             return self.snapshot()
 
     def action_unknown(self):
@@ -92,6 +98,23 @@ class FleetProductControlEngine:
             for engine in self.engines.values():
                 engine.action_unknown()
             self._selected_action = None
+
+    def suspend(self, uncertain_action_id=None):
+        with self.lock:
+            return all([engine.suspend(uncertain_action_id) for engine in self.engines.values()])
+
+    def resume_after_reconnect(self):
+        with self.lock:
+            resumed = []
+            for engine in self.engines.values():
+                if engine.snapshot()['status'] == 'suspended' and not engine.resume_after_reconnect():
+                    for previous in resumed:
+                        previous.suspend()
+                    return False
+                if engine.snapshot()['status'] in ('moving', 'waiting'):
+                    resumed.append(engine)
+            return all(engine.snapshot()['status'] not in ('unknown', 'failed')
+                       for engine in self.engines.values())
 
     def apply_action_result(self, order_id, action_id, agv_id, action, applied):
         with self.lock:

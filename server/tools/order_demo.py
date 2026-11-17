@@ -133,8 +133,25 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
                     print('주문 화면: http://127.0.0.1:8000/order-demo/', flush=True)
                     print('Ctrl+C로 시연 서버와 브로커를 종료합니다. Unreal은 직접 닫으세요.', flush=True)
                     while True:
-                        if broker.poll() is not None or server.poll() is not None:
-                            raise RuntimeError('시연 서버 또는 브로커가 종료됐습니다')
+                        if server.poll() is not None:
+                            raise RuntimeError('시연 서버가 종료됐습니다')
+                        if broker is None or broker.poll() is not None:
+                            # Keep the same server, simulated robots and DB alive.
+                            # A failed broker restart is retried, never mistaken for
+                            # permission to advance or to connect to a real broker.
+                            print('격리 브로커가 종료되어 재시작을 시도합니다.', flush=True)
+                            broker = None
+                            try:
+                                broker = subprocess.Popen([base_python, '-c', BROKER_SCRIPT, str(broker_port)],
+                                                          cwd=ROOT, env=broker_env, stdout=broker_log,
+                                                          stderr=broker_log, creationflags=flags)
+                                wait_for_ready_log(broker, broker_path,
+                                                   '[AGV_ISOLATED_BROKER_READY]:{}'.format(broker.pid), 'broker')
+                            except (OSError, RuntimeError, TimeoutError):
+                                if broker is not None:
+                                    stop_process(broker)
+                                broker = None
+                                print('브로커 재시작 실패: 작업은 대기 상태로 유지됩니다.', flush=True)
                         time.sleep(0.2)
                 finally:
                     try:

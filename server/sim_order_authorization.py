@@ -50,14 +50,16 @@ class SimOrderAuthorizer:
                         try:
                             gate._active(db)
                             progress._check_database(db)
-                            parsed, canonical, _digest = _decode(payload, self.robot_id, progress._map_id)
+                            parsed, canonical, digest = _decode(payload, self.robot_id, progress._map_id)
                             task = parsed['order_id']
                             mapping = runtime._tasks.get(task)
                             if (not isinstance(mapping, tuple) or len(mapping) != 2 or mapping[0] != self.robot_id
                                     or receiver.robot_sessions.get(self.robot_id, {}).get(task) != mapping[1]):
                                 raise ValueError('order is not mapped to this simulated session')
                             with gate._state_lock:
-                                if task in gate._blocked:
+                                permit = (gate._generations.get(task, 0), self.robot_id,
+                                          parsed['seq'], digest, id(self))
+                                if task in gate._blocked and gate._moving_permits.get(task) != permit:
                                     raise ValueError('simulated recovery is blocked')
                             robot, path, stop = progress._job(db, task, self.robot_id)
                             seq, _stored_payload, state, stored = progress._latest(db, task, robot, path, stop)

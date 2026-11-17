@@ -74,6 +74,33 @@ class PickupWorkflow:
         self._finished_evidence = None
         self._deadline = None
         self._last_position = None
+        self._paused_at = None
+
+    def pause_for_reconnect(self):
+        with self.lock:
+            if self._paused_at is not None:
+                return True
+            # Pending event delivery and unallocated handoffs need explicit
+            # reconciliation; they cannot be safely guessed from transport state.
+            if self._status not in ('moving', 'awaiting_order', 'pickup_reached') or self._waiting:
+                return False
+            now = self.clock()
+            if self._deadline is not None and now >= self._deadline:
+                return False
+            self._paused_at = now
+            return True
+
+    def resume_after_reconnect(self):
+        with self.lock:
+            if self._paused_at is None:
+                return False
+            elapsed = max(0.0, self.clock() - self._paused_at)
+            if self._deadline is not None:
+                self._deadline += elapsed
+            if self._next_retry is not None:
+                self._next_retry += elapsed
+            self._paused_at = None
+            return True
 
     def _reset_deadline(self):
         self._deadline = self.clock() + self.timeout_seconds
@@ -129,7 +156,7 @@ class PickupWorkflow:
             # From the first mutating call onward, failures are uncertain;
             # only a classified, rolled-back reservation conflict is retried.
             try:
-                self.runtime.create_task(self.task_id)
+                self.runtime.create_task(self.task_id, reset_unallocated=True)
                 self._reset_deadline()
                 self._prepare_once()
             except Exception:

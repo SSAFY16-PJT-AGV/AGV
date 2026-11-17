@@ -284,6 +284,63 @@ Unreal이 실제로 읽는 맵과 같은 파일을 지정해야 한다. C드라�
 플레이한다. 앱에는 `AGV_ORDER_FLEET`을 활성화하지 않은 기존 단일 로봇 예약
 모드도 남아 있지만, 위 실행기는 두 로봇 모드를 기본으로 설정한다.
 
+### 두 가상 AGV의 통신 단절과 재연결
+
+격리된 두 로봇 웹 시연에서 통신이 끊기면 기존 프로세스의 가상 로봇,
+명령 수신 기록, 진행 위치와 예약 DB를 유지하며 이동과 신규 주문을 보류한다.
+MQTT 수신기와 로봇이 다시 준비된 후에도 같은 가상 실행 객체, 현재 명령과
+작업 소유권, 예약 구간 및 연결 세대를 확인한 경우에만 **이미 예약된 구간의
+나머지**를 계속한다. 종점에서는 실제로 생성된 가상 완료 receipt를 사용하여
+기존 복구 확인과 후속 예약·명령 절차를 진행한다. 실행기는 자신이 띄운
+브로커가 종료되면 서버와 DB를 유지하면서 재시작을 시도한다.
+
+명령 수신·이벤트 발행의 결과가 불확실하거나 Unreal 집기·적재 요청의 적용
+여부를 확인할 수 없으면 자동으로 재발행하거나 완료 처리하지 않는다. 현재
+자동 재개는 동일 프로세스에서 살아 있는 가상 실행 상태와 예약을 증명할 수
+있는 경우에 한하며, 구간 끝·명령 수신 전·예약 대기 등의 모든 상태에서
+자동 재개를 보장하지 않는다. Unreal 연결이 끊기면 진행 중인 가상 위치
+갱신이 끝난 뒤 새 이동은 막고 미확정 작업은 결과 불명으로 유지한다. 새
+Unreal 연결만으로 결과 불명 작업을 자동 재개하지 않는다.
+
+시험은 별도의 루프백 브로커와 임시 DB, Unreal을 대신하는 WebSocket
+클라이언트만 사용한다. 루프백 포트나 프로세스 생성 사실만으로 브로커의
+신원을 암호학적으로 인증하지 못하므로 신뢰되지 않은 로컬 프로세스가 포트를
+선점할 수 있는 환경이나 실물·공유 브로커에서는 이 시연을 사용하지 않는다.
+실물 로봇의 물리적 정지·충돌 안전, 감지 전 동작, 무응답 네트워크 및 서버
+프로세스 재시작 후 복구는 검증하지 않았다.
+
+```powershell
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
+.\.venv\Scripts\python -m unittest server.tests.test_fleet_reconnect_web_integration server.tests.test_fleet_partial_disconnect_integration server.tests.test_fleet_unreal_disconnect_integration server.tests.test_sim_runtime_reconnect_integration -v
+```
+
+### 자동 복구를 끈 단절 시험과 별도 복구 증명 시험
+
+별도 루프백 aMQTT 브로커와 임시 DB에서 두 가상 AGV가 MQTT 주문을 받아
+이동 중일 때 브로커를 종료하는 시험을 추가했다. 단절 **감지 후** 두 작업이
+결과 불명으로 전환됐고, 2초 동안 가상 좌표·기존 노드와 간선 점유 및
+명령 수신 기록이 유지됐다. 같은 테스트 브로커를 재기동한 뒤에도 기존
+자동 복구를 끈 시험 객체는 자동으로 재연결하거나 주행을 재개하지 않았다. 서버 상태는
+이전 값이 `stale`로 표시될 수 있으므로 최신 위치나 정지 증거가 아니다.
+
+별도 저수준 시험에서는 단절 전에 두 가상 로봇이 승인된 구간 끝점에 도착해
+기록한 완료 receipt를 사용했다. 기존 DB로 새 `SimRuntime`을 시작한 뒤 새
+증명 없는 진행은 거부됐고, 각 로봇의 새 challenge·합성 정지 확인과 명시적
+재처리·발행 요청을 거친 뒤에만 다음 구간 MQTT 명령이 발행됐다. 이는 명령
+발행까지의 시험이다. 이전 가상 로봇 인스턴스의 재접속·명령 수신·주행이나
+웹·Unreal 주문의 자동 복구를 검증한 것은 아니다. 웹 시연을 다시 시작하면
+새 임시 DB가 생성되므로 이전 작업을 복구하는 절차로 취급하지 않는다.
+
+두 시험은 별도 임시 포트와 브로커만 사용한다. 실제 로봇의 물리적 정지,
+연결 끊김 감지 전 동작, 무응답 네트워크 및 실제 창고의 충돌 안전은 미검증이다.
+서버 루트에서 테스트용 aMQTT를 준비한 뒤 다음 명령으로 재실행한다.
+
+```powershell
+$env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
+.\.venv\Scripts\python -m unittest server.tests.test_fleet_disconnect_integration server.tests.test_fleet_recovery_integration -v
+```
+
 ## 트윈 로컬 관측 연결 제안
 
 현식님 트윈의 WebSocket 클라이언트와 연결하기 위한 기본 비활성화된

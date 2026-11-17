@@ -1,4 +1,5 @@
 """Correlate simulated actions with one authenticated Unreal connection."""
+from contextlib import contextmanager
 import threading
 import time
 
@@ -9,7 +10,7 @@ class DemoActionSession:
     The caller passes the same reentrant lock used by the demo engine.
     """
     def __init__(self, engine, lock, settle_seconds=1.5, timeout_seconds=10, can_dispatch=None,
-                 on_change=None):
+                 on_change=None, pause_on_unavailable=False):
         self.engine = engine
         self.lock = lock
         self.settle_seconds = settle_seconds
@@ -18,8 +19,13 @@ class DemoActionSession:
         if on_change is not None and not callable(on_change):
             raise ValueError('action change callback must be callable')
         self.on_change = on_change
+        self.pause_on_unavailable = pause_on_unavailable
         self._owner_available = threading.Event()
         self._owner_fast_lock = threading.Lock()
+        # Orders and robot ticks use a common fence with owner invalidation.
+        # An already-started in-process operation finishes before invalidation
+        # returns; no later operation may begin with the invalidated owner.
+        self._motion_fence = threading.RLock()
         self._fast_owner = None
         self.owner = None
         self.action_id = None
@@ -53,13 +59,22 @@ class DemoActionSession:
         """Nonblocking observation only; authorization still uses available()."""
         return self._owner_available.is_set()
 
+    @contextmanager
+    def motion_guard(self):
+        with self._motion_fence:
+            yield self._owner_available.is_set()
+
     def invalidate_owner(self, client):
-        """Immediately fail closed for this owner without the action lock."""
+        """Signal immediately, then fence any already-running simulated tick."""
         with self._owner_fast_lock:
             if client is not self._fast_owner:
                 return
             self._owner_available.clear()
         self._changed()
+        # Never wait for the shared action lock; this fence only waits for a
+        # tick which had already acquired authorization before the signal.
+        with self._motion_fence:
+            pass
 
     def detach(self, client):
         # Clear before waiting for the shared lock so a disconnected owner is
@@ -81,7 +96,10 @@ class DemoActionSession:
             if client is not self.owner:
                 return None
             if not self._owner_available.is_set() or not self.can_dispatch():
-                self.engine.action_unknown()
+                if self.pause_on_unavailable and self._owner_available.is_set():
+                    self.engine.suspend(self.action_id if self.sent_at is not None else None)
+                else:
+                    self.engine.action_unknown()
                 self.action_id = self.observed_at = self.sent_at = None
                 self._changed()
                 return None
@@ -127,7 +145,11 @@ class DemoActionSession:
             now = time.monotonic() if now is None else now
             if (not self._owner_available.is_set() or not self.can_dispatch()
                     or now - self.sent_at >= self.timeout_seconds):
-                self.engine.action_unknown()
+                if (self.pause_on_unavailable and self._owner_available.is_set()
+                        and not self.can_dispatch()):
+                    self.engine.suspend(self.action_id)
+                else:
+                    self.engine.action_unknown()
                 self.action_id = self.observed_at = self.sent_at = None
                 self._changed()
                 return False

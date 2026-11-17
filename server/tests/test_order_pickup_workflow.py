@@ -41,7 +41,8 @@ class Runtime:
         self.fail = None
     def status(self):
         return {'ready': self.is_ready}
-    def create_task(self, task):
+    def create_task(self, task, *, reset_unallocated=False):
+        self.reset_unallocated_requested = reset_unallocated
         self.calls.append(('create', task))
     def prepare(self, task, pickup, candidates, action):
         self.calls.append(('prepare', task, pickup, copy.deepcopy(candidates), action))
@@ -89,6 +90,10 @@ class PickupWorkflowTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 PickupWorkflow(self.runtime, self.robot, self.map,
                                {'red': {'pickup_node': 'C'}}, **options)
+
+    def test_new_task_explicitly_checks_unallocated_recovery_after_disconnect(self):
+        self.assertEqual(self.workflow.submit('red')['status'], 'awaiting_order')
+        self.assertTrue(self.runtime.reset_unallocated_requested)
 
     def test_second_simulated_robot_is_explicitly_mapped(self):
         class SecondRuntime(Runtime):

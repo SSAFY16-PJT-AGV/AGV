@@ -4,6 +4,7 @@ The local endpoint and simulated identities are not authentication or network
 isolation. Never use this runtime for a physical robot or a shared broker.
 """
 import copy
+import json
 import math
 import os
 import sqlite3
@@ -23,6 +24,7 @@ from server.segment_progress import SegmentProgress
 from sim.event_inbox import SimEventInbox
 from sim.event_receiver import SimEventReceiver
 from sim.workflow import SimProgressWorkflow
+from sim.order_inbox import _decode
 
 
 class _DatabaseOwner:
@@ -194,11 +196,136 @@ class SimRuntime:
         if not self._started or self._stopped or self.receiver is None or not self.receiver.ready:
             raise RuntimeError('simulation runtime is not ready')
 
+    def reconnect(self):
+        """Reconnect a failed receiver without replacing the recovery epoch.
+
+        Only the isolated MQTT transport and workflow are recreated. Existing
+        tasks remain blocked until separately reconciled; this does not itself
+        authorize motion or release any reserved resource.
+        """
+        with self._lock:
+            if not self._started or self._stopped:
+                raise RuntimeError('simulation runtime is not started')
+            if self.receiver is not None and self.receiver.ready:
+                raise RuntimeError('simulation receiver is already connected')
+            if self.receiver is not None and not self.receiver._closed:
+                raise RuntimeError('previous simulation receiver is still closing')
+            old_workflow, old_client = self.workflow, self._client
+            self.workflow = self.receiver = self._client = None
+            if old_workflow is not None:
+                old_workflow.stop()
+            self._close_client(old_client)
+            for _coordinator, client, _generation in self._prepared.values():
+                self._close_client(client)
+            self._prepared.clear()
+
+            mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
+            client = self._new_client(client_id=self.client_id, persistent=True)
+            receiver = SimEventReceiver(client, self.progress, inbox=self.inbox,
+                recovery_gate=self.gate, robot_tasks=mapping, robot_sessions=self._sessions,
+                simulation_enabled=True)
+            workflow = SimProgressWorkflow(receiver, robot_sessions=self._sessions,
+                publisher_factory=self._publisher_factory, simulation_enabled=True)
+            self._client, self.receiver, self.workflow = client, receiver, workflow
+            try:
+                workflow.start()
+                if client.connect(self.host, self.port, keepalive=15) != mqtt.MQTT_ERR_SUCCESS:
+                    raise RuntimeError('simulation receiver reconnection failed')
+                if client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
+                    raise RuntimeError('simulation receiver loop failed')
+                deadline = time.monotonic() + self.connect_timeout
+                while not receiver.ready:
+                    if receiver._closed or time.monotonic() >= deadline:
+                        raise RuntimeError('simulation receiver was not ready')
+                    time.sleep(.01)
+            except BaseException:
+                receiver._close_and_invalidate(RuntimeError('simulation receiver reconnection failed'))
+                workflow.stop()
+                self._close_client(client)
+                raise
+            return self.status()
+
     def status(self):
         with self._lock:
             return {'ready': bool(self._started and not self._stopped and self.receiver and self.receiver.ready),
                     'simulation_only': True,
                     'last_workflow_error': self.workflow.last_error if self.workflow else None}
+
+    def reconcile_moving(self, robot_id, task_id, session, robot, checkpoint):
+        """Permit only the frozen simulated executor's current reserved segment.
+
+        This is an in-process continuity check, not a stop proof, a clearance
+        event, or an authorization for physical hardware or a new segment.
+        """
+        from sim.mqtt_order_robot import SimMqttOrderRobot
+        from server.sim_handoff_store import SimHandoffStore
+        from server.sim_order_authorization import SimOrderAuthorizer
+        if type(robot) is not SimMqttOrderRobot:
+            raise ValueError('the original simulated MQTT robot is required')
+        with robot._lock:
+            if not robot.ready or not robot.check_recovery_checkpoint(checkpoint):
+                raise ValueError('simulated executor continuity is not established')
+            guard = robot._authorization_guard
+            authorizer = getattr(guard, '__self__', None)
+            if (type(authorizer) is not SimOrderAuthorizer or authorizer.runtime is not self
+                    or authorizer.robot_id != robot_id
+                    or getattr(guard, '__func__', None) is not SimOrderAuthorizer.guard):
+                raise ValueError('the simulated robot requires its matching runtime guard')
+            executor, inbox = robot.executor, robot.executor._inbox
+            with self._lock, self.receiver._dispatch_lock, self.gate.serialized(), executor._lock, inbox._lock:
+                self._ready()
+                if self._identity(task_id, session) != robot_id or inbox.robot_id != robot_id:
+                    raise ValueError('simulated robot or session differs')
+                state = executor.snapshot()
+                order, receipt = state['order'], state['receipt']
+                if (state['status'] != 'moving' or not isinstance(order, dict)
+                        or not isinstance(receipt, dict) or receipt.get('new') is not True
+                        or receipt.get('state') != 'accepted'):
+                    raise ValueError('no active simulated moving order')
+                payload = json.dumps(order, ensure_ascii=False, allow_nan=False,
+                                     separators=(',', ':')).encode('utf-8')
+                parsed, canonical, digest = _decode(payload, robot_id, self.progress._map_id)
+                if (parsed['order_id'] != task_id or receipt.get('order_id') != task_id
+                        or receipt.get('seq') != parsed['seq'] or receipt.get('digest') != digest
+                        or (task_id, parsed['seq'], digest) not in inbox._owned):
+                    raise ValueError('simulated inbox receipt does not match')
+                with closing(sqlite3.connect(inbox.path, timeout=5, isolation_level=None)) as local:
+                    if (local.execute('SELECT robot_id,map_id FROM sim_inbox_identity WHERE singleton=1').fetchone()
+                            != (robot_id, self.progress._map_id)
+                            or local.execute('SELECT digest,payload,state FROM sim_inbox_orders WHERE order_id=? AND seq=?',
+                                             (task_id, parsed['seq'])).fetchone() != (digest, canonical, 'accepted')):
+                        raise ValueError('durable simulated inbox differs')
+                with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as db:
+                    db.execute('BEGIN')
+                    try:
+                        self.gate._active(db)
+                        self.progress._check_database(db)
+                        owner, path, stop = self.progress._job(db, task_id, robot_id)
+                        seq, _raw, status, stored = self.progress._latest(db, task_id, owner, path, stop)
+                        encoded = json.dumps(stored, sort_keys=True, ensure_ascii=True,
+                                             allow_nan=False, separators=(',', ':'))
+                        if (status not in ('uncertain', 'acked') or seq != parsed['seq']
+                                or encoded != canonical or self.progress._occupancy(db, task_id)
+                                != set(self.progress._segment(path, stop).resources)):
+                            raise ValueError('current command or reservation differs')
+                        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_active_robots'").fetchone()
+                        if (type(self.store) is SimHandoffStore and table is None) or (table is not None and
+                                db.execute('SELECT task_id FROM sim_active_robots WHERE robot_id=?',
+                                           (robot_id,)).fetchone() != (task_id,)):
+                            raise ValueError('simulated robot ownership differs')
+                        if not robot.ready or not robot.check_recovery_checkpoint(checkpoint):
+                            raise ValueError('simulated executor changed during reconciliation')
+                        db.execute('COMMIT')
+                        with self.gate._state_lock:
+                            if task_id not in self.gate._blocked:
+                                raise ValueError('simulated task is not recovery blocked')
+                            generation = self.gate._generations.get(task_id, 0)
+                            self.gate._moving_permits[task_id] = (generation, robot_id, seq, digest, id(authorizer))
+                    except BaseException:
+                        if db.in_transaction:
+                            db.execute('ROLLBACK')
+                        raise
+            return {'task_id': task_id, 'seq': seq, 'resume_current_segment': True}
 
     def pending_events(self):
         """List bounded metadata even when the broker is disconnected."""
@@ -244,12 +371,22 @@ class SimRuntime:
                     'occupancy': [list(row) for row in resources[:500]],
                     'occupancy_truncated': len(resources) > 500}
 
-    def create_task(self, task_id):
+    def create_task(self, task_id, *, reset_unallocated=False):
         with self._lock:
             self._ready()
             if task_id not in self._tasks:
                 raise ValueError('task is not statically mapped')
-            self.store.create_task(task_id)
+            if type(reset_unallocated) is not bool:
+                raise ValueError('reset_unallocated must be boolean')
+            with self.receiver._dispatch_lock:
+                self._ready()
+                # A duplicate insert must fail before any recovery reset.
+                self.store.create_task(task_id)
+                if reset_unallocated:
+                    with self.gate._state_lock:
+                        blocked = task_id in self.gate._blocked
+                    if blocked:
+                        self.gate.reset_unallocated(task_id)
             return {'task_id': task_id, 'state': 'PENDING'}
 
     def prepare(self, task_id, destination, candidates, action, *, handoff_store=None):
@@ -319,6 +456,22 @@ class SimRuntime:
             self._identity(task_id, session)
             self.gate.reset_unallocated(task_id)
             return {'task_id': task_id, 'reset': True}
+
+    def invalidate_robot(self, robot_id):
+        """Revoke only one disconnected simulated robot's task proofs.
+
+        The fleet coordinator must first freeze its ticks, and is responsible
+        for validating and reconnecting that robot before any resumption.
+        This neither changes reservations nor proves a physical stop.
+        """
+        with self._lock:
+            self._ready()
+            if robot_id not in self._sessions:
+                raise ValueError('simulated robot is not configured')
+            with self.receiver._dispatch_lock:
+                self._ready()
+                self.gate.invalidate_many(tuple(self._sessions[robot_id]))
+            return {'robot_id': robot_id, 'invalidated': True}
 
     def begin(self, task_id, session):
         with self._lock, self.receiver._dispatch_lock:
