@@ -57,6 +57,95 @@ class OrderDemoUiTest(unittest.TestCase):
         self.assertIn('확인 중', self.html)
 
     @unittest.skipUnless(shutil.which('node'), 'requires Node to exercise browser JavaScript')
+    def test_fleet_tracks_multiple_pending_submissions_independently(self):
+        script = r'''
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const source = fs.readFileSync(0, 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
+const els = new Map();
+function element(id) {
+  if (!els.has(id)) els.set(id, {value:'', disabled:false, textContent:'', children:[], handlers:{},
+    classList:{toggle() {}}, addEventListener(t,f) {this.handlers[t]=f;},
+    replaceChildren() {this.children=[];}, appendChild(item) {this.children.push(item);}});
+  return els.get(id);
+}
+let timer, posts=0, uuid=0, releaseFirst, slowFirst=true, immediateFull=false;
+const status={mode:'fleet', accepting_orders:false, accepting_queued_orders:true, stale:false,
+  connected:true, unreal_connected:true, robots:[
+    {robot_id:'sim-r1', status:'moving', route:[]}, {robot_id:'sim-r2', status:'moving', route:[]}]};
+const answers={'id-1':{status:'pending',request_id:'id-1'}, 'id-2':{status:'pending',request_id:'id-2'}};
+const context={
+  crypto:{randomUUID:()=> 'key-' + (++uuid)},
+  document:{getElementById:element, createElement:()=>({})},
+  setInterval(f) {timer=f;},
+  fetch:async (url) => {
+    if (url.endsWith('/products')) return {ok:true,json:async()=>({products:[
+      {id:'red',label:'빨강',pickup_node:'D01',destination_node:'D04',shelf_id:'SHELF_RED'}]})};
+    if (url.endsWith('/nodes')) return {ok:true,json:async()=>({nodes:[{id:'D01'}]})};
+    if (url.endsWith('/status')) return {ok:true,json:async()=>status};
+    if (url.endsWith('/product-orders')) { posts++; const id='id-'+posts;
+      if (immediateFull) return {ok:false,status:409,json:async()=>({detail:'선반에 빈 슬롯이 없습니다'})};
+      return {ok:true,status:202,json:async()=>({status:'pending',request_id:id})}; }
+    const id=url.split('/').pop();
+    if (id === 'id-1' && slowFirst) return await new Promise(resolve => {
+      releaseFirst=()=>resolve({ok:true,json:async()=>answers[id]});
+    });
+    if (answers[id]) return {ok:true,json:async()=>answers[id]};
+    throw Error(url);
+  }
+};
+vm.runInNewContext(source,context);
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
+(async()=>{
+  await flush(); await flush();
+  element('product').value='red';
+  assert.strictEqual(element('submit-product').disabled,false);
+  status.robots[1].status='unknown'; await timer();
+  assert.strictEqual(element('submit-product').disabled,true);
+  status.robots[1].status='moving'; status.stale=true; await timer();
+  assert.strictEqual(element('submit-product').disabled,true);
+  status.stale=false; status.unreal_connected=false; await timer();
+  assert.strictEqual(element('submit-product').disabled,true);
+  status.unreal_connected=true; await timer();
+  assert.strictEqual(element('submit-product').disabled,false);
+  const firstSubmit=element('product-form').handlers.submit({preventDefault(){}});
+  await flush(); await flush();
+  assert.strictEqual(posts,1);
+  assert.strictEqual(element('submit-product').disabled,false);
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts,2);
+  assert.strictEqual(element('submission-list').children.length,2);
+  await flush(); await flush();
+  slowFirst=false; releaseFirst(); await firstSubmit;
+  await flush(); await flush();
+  answers['id-2']={status:'error',request_id:'id-2',error_type:'ShelfFull'};
+  await timer();
+  assert(element('submission-list').children[1].textContent.includes('선반에 빈 슬롯이 없습니다'));
+  assert(element('submission-list').children[0].textContent.includes('확인 중'));
+  assert.strictEqual(element('submit-product').disabled,false);
+  immediateFull=true;
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts,3);
+  assert(element('submission-list').children[2].textContent.includes('선반에 빈 슬롯이 없습니다'));
+  assert.strictEqual(element('submit-product').disabled,false);
+  immediateFull=false; answers['id-4']={status:'pending',request_id:'id-4'};
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts,4);
+  answers['id-4']={status:'completed',request_id:'id-4',result:{status:'queued',order_id:'order-4'}};
+  await timer();
+  assert(element('submission-list').children[3].textContent.includes('접수'));
+  answers['id-1']={status:'unknown',request_id:'id-1'};
+  await timer();
+  assert(element('submission-list').children[0].textContent.includes('확인할 수 없'));
+  assert.strictEqual(element('submit-product').disabled,true);
+  await element('product-form').handlers.submit({preventDefault(){}});
+  assert.strictEqual(posts,4);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires Node to exercise browser JavaScript')
     def test_unknown_submission_never_looks_like_a_success(self):
         script = r'''
 const fs = require('fs');

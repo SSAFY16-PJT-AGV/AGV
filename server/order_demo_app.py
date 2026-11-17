@@ -26,15 +26,19 @@ from server.twin_websocket import router as twin_router
 
 PRODUCTS = (
     {'id': 'red', 'label': '빨간 상품', 'product_type': 'Red', 'pickup_node': 'D01',
-     'destination_node': 'D04', 'shelf_id': 'SHELF_RED', 'slot_index': 0},
+     'destination_node': 'D04', 'shelf_id': 'SHELF_RED', 'slot_index': 0, 'slot_count': 6},
     {'id': 'blue', 'label': '파란 상품', 'product_type': 'Blue', 'pickup_node': 'D06',
-     'destination_node': 'D05', 'shelf_id': 'SHELF_BLUE', 'slot_index': 0},
+     'destination_node': 'D05', 'shelf_id': 'SHELF_BLUE', 'slot_index': 0, 'slot_count': 6},
 )
 
 # Labels for local simulated observations only; they do not authorize a real
 # robot to move or assert its physical state.
 SIMULATION_STATUS = {'moving': 'MOVING', 'waiting': 'WAITING', 'failed': 'ERROR',
                      'unknown': 'ERROR', 'idle': 'IDLE', 'completed': 'IDLE'}
+
+
+class ShelfFull(RuntimeError):
+    """No confirmed empty slot remains in the simulated shelf."""
 
 
 class DemoRuntime:
@@ -54,6 +58,7 @@ class DemoRuntime:
             self._cached_snapshot = copy.deepcopy(engine.snapshot())
         except Exception:
             self._cached_snapshot = {'status': 'unknown'}
+        self._fleet_mode = self._cached_snapshot.get('mode') == 'fleet'
         self._snapshot_at = self.clock()
         self._snapshot_valid = True
         self._cached_ready = False
@@ -63,7 +68,8 @@ class DemoRuntime:
         self._recovery_owner = None
         self.actions = DemoActionSession(engine, self.lock, can_dispatch=self._ready,
                                          on_change=self._invalidate_snapshot,
-                                         pause_on_unavailable=self.auto_recovery)
+                                         pause_on_unavailable=self.auto_recovery,
+                                         inventory=getattr(engine, 'inventory', None))
         self.admission = OrderAdmission()
         self.connected = threading.Event()
         self.stop_event = threading.Event()
@@ -178,6 +184,15 @@ class DemoRuntime:
         result['unreal_connected'] = not stale and self.actions.available_fast()
         if stale or not result['connected'] or not result['unreal_connected']:
             result['accepting_orders'] = False
+        if result.get('mode') == 'fleet':
+            robots = result.get('robots')
+            result['accepting_queued_orders'] = (
+                not stale and result['connected'] and result['unreal_connected']
+                and not self._recovering.is_set() and result.get('shelf_inventory_ready') is True
+                and isinstance(robots, list) and bool(robots)
+                and all(item.get('status') not in ('unknown', 'failed') for item in robots)
+                and any(item.get('orders_remaining', 0) > 0 for item in robots)
+                and getattr(self.admission, 'can_accept', False) is True)
         return result
 
     def create_order(self, pickup, destination):
@@ -228,8 +243,47 @@ class DemoRuntime:
     def submit_product_order(self, product_id, request_key=None):
         if not any(item['id'] == product_id for item in PRODUCTS):
             raise ValueError('unknown product')
-        return self._submit(lambda: self.create_product_order(product_id),
+        if self._fleet_mode:
+            # Capture the owner without waiting for the potentially slow
+            # control lock. The worker revalidates it under the lock before
+            # making any reservation or publishing any order.
+            with self.actions._owner_fast_lock:
+                owner = self.actions._fast_owner if self.actions.available_fast() else None
+            operation = lambda: self._wait_for_product_order(product_id, owner)
+        else:
+            operation = lambda: self.create_product_order(product_id)
+        return self._submit(operation,
                             'product:' + product_id, request_key)
+
+    def _wait_for_product_order(self, product_id, owner):
+        """Wait outside the control lock until an admitted fleet order can start."""
+        product = next(item for item in PRODUCTS if item['id'] == product_id)
+        while not self.stop_event.is_set():
+            with self.lock:
+                if (owner is None or self.actions.owner is not owner
+                        or not self.actions.available_fast()):
+                    raise ConnectionError('authenticated Unreal connection changed before dispatch')
+                state = self.engine.snapshot()
+                robots = state.get('robots')
+                if not isinstance(robots, list) or not robots:
+                    raise RuntimeError('simulated fleet state unavailable')
+                if any(item.get('status') in ('unknown', 'failed') for item in robots):
+                    raise RuntimeError('simulated fleet requires recovery')
+                if all(item.get('orders_remaining', 0) <= 0 for item in robots):
+                    raise RuntimeError('simulated fleet order limit reached')
+                inventory = getattr(self.engine, 'inventory', None)
+                if (inventory is not None and inventory.ready
+                        and not inventory.can_reserve(product['shelf_id'], product['product_type'])):
+                    raise ShelfFull('no confirmed empty simulated shelf slot')
+                destination_ready = getattr(self.engine, 'can_dispatch_destination', lambda _destination: True)
+                if (self._ready() and state.get('accepting_orders') is True
+                        and destination_ready(product['destination_node'])):
+                    # RLock holds readiness, the chosen owner and dispatch in
+                    # one serialized operation. The existing method applies
+                    # its own motion fence and repeats safety checks.
+                    return self.create_product_order(product_id)
+            self.stop_event.wait(.05)
+        raise AdmissionStopped('demo stopped before dispatch')
 
     def submit_order(self, pickup, destination, request_key=None):
         return self._submit(lambda: self.create_order(pickup, destination),
@@ -414,6 +468,7 @@ async def lifespan(app):
             from server.sim_order_authorization import SimOrderAuthorizer
             from server.order_product_control import ProductControlEngine
             from server.order_fleet import FleetProductControlEngine
+            from server.order_shelf_inventory import ShelfInventory
             from sim.order_inbox import SimOrderInbox
             from sim.order_executor import SimOrderExecutor
             from sim.mqtt_order_robot import SimMqttOrderRobot
@@ -461,7 +516,9 @@ async def lifespan(app):
                     twin_id={'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}[robot_id],
                     session=session_names[robot_id], task_prefix=prefixes[robot_id],
                     wait_for_reservation=fleet_enabled)
-            engine = FleetProductControlEngine(engines, sim_map) if fleet_enabled else engines['sim-r1']
+            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in PRODUCTS})
+                         if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
+            engine = FleetProductControlEngine(engines, sim_map, inventory=inventory) if fleet_enabled else engines['sim-r1']
         else:
             from server.order_demo_engine import OrderDemoEngine
             engine = OrderDemoEngine(map_data)
@@ -530,8 +587,10 @@ def status(request: Request):
 
 @app.get('/order-demo/api/products')
 def products(request: Request):
-    _demo(request)
-    return {'products': [dict(product) for product in PRODUCTS]}
+    demo = _demo(request)
+    automatic = getattr(getattr(demo, 'engine', None), 'inventory', None) is not None
+    return {'products': [{key: value for key, value in product.items()
+                          if not automatic or key != 'slot_index'} for product in PRODUCTS]}
 
 
 @app.get('/order-demo/api/submissions/{request_id}')
@@ -570,6 +629,8 @@ def product_order(body: ProductOrderRequest, request: Request):
         raise HTTPException(503, '가상 주문을 접수할 수 없습니다') from None
     except ValueError:
         raise HTTPException(422, '알 수 없는 상품입니다') from None
+    except ShelfFull:
+        raise HTTPException(409, '선반에 빈 슬롯이 없습니다') from None
     except RuntimeError:
         raise HTTPException(409, '가상 작업을 계속할 수 없습니다') from None
     except ConnectionError:

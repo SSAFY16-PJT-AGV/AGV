@@ -56,6 +56,7 @@ HTML_PAGE = r'''<!doctype html>
         <button id="submit-product" type="submit" disabled>가상 상품 주문</button>
       </form>
       <p id="product-feedback" class="feedback" role="status" aria-live="polite"></p>
+      <ul id="submission-list" aria-live="polite"></ul>
       <details id="direct-orders">
       <summary>노드 직접 선택</summary>
       <p class="help">가상 운반 지점을 직접 지정할 때 사용합니다.</p>
@@ -105,8 +106,7 @@ HTML_PAGE = r'''<!doctype html>
   let polling = false;
   let jobActive = true;
   let fleetMode = false;
-  let pendingSubmission = null;
-  let submissionPolling = false;
+  const pendingSubmissions = new Map();
   let submissionUnknown = false;
 
   function message(element, text, success = false) {
@@ -118,7 +118,7 @@ HTML_PAGE = r'''<!doctype html>
     return await response.json();
   }
   function updateButton() {
-    const awaiting = pendingSubmission !== null || submissionUnknown;
+    const awaiting = (!fleetMode && pendingSubmissions.size > 0) || submissionUnknown;
     submit.disabled = !nodesReady || submitting || jobActive || awaiting;
     productSubmit.disabled = !productsReady || submitting || jobActive || awaiting;
   }
@@ -128,39 +128,52 @@ HTML_PAGE = r'''<!doctype html>
     if (typeof crypto.getRandomValues !== 'function') throw new Error('secure randomness is unavailable');
     return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   }
-  function submissionFailed(element) {
+  function submissionFailed(element, entry = null) {
     submissionUnknown = true;
     message(element, '요청 결과를 확인할 수 없습니다. 재주문하지 말고 서버 상태를 확인해 주세요.');
+    if (entry) entry.row.textContent = `${entry.label} · 요청 결과를 확인할 수 없습니다.`;
     updateButton();
   }
-  async function refreshSubmission() {
-    if (!pendingSubmission || submissionPolling) return;
-    submissionPolling = true;
-    const entry = pendingSubmission;
+  async function refreshSubmission(entry) {
+    if (!pendingSubmissions.has(entry.id) || entry.polling) return;
+    entry.polling = true;
     try {
       const result = await readJson(await fetch('/order-demo/api/submissions/' + encodeURIComponent(entry.id), {cache: 'no-store'}));
       if (!result || result.request_id !== entry.id) throw new Error('invalid submission status');
       if (result.status === 'pending') {
         message(entry.feedback, '가상 주문 처리 결과를 확인 중입니다.');
+        entry.row.textContent = `${entry.label} · 접수 결과 확인 중 (${entry.id})`;
       } else if (result.status === 'completed' && result.result &&
                  !['unknown', 'failed', 'error'].includes(result.result.status)) {
-        pendingSubmission = null;
+        pendingSubmissions.delete(entry.id);
+        const slot = Number.isInteger(result.result.slot_index) ? ` · ${result.result.slot_index}번 슬롯` : '';
+        entry.row.textContent = `${entry.label} · 접수 완료${slot} (${entry.id})`;
         message(entry.feedback, entry.success, true);
         await refreshStatus();
-      } else if (['unknown', 'error'].includes(result.status) || result.status === 'completed') {
-        pendingSubmission = null;
-        submissionFailed(entry.feedback);
+      } else if (result.status === 'error' && typeof result.error_type === 'string' && result.error_type) {
+        pendingSubmissions.delete(entry.id);
+        const reason = result.error_type === 'ShelfFull' ? '선반에 빈 슬롯이 없습니다' : '주문이 접수되지 않았습니다';
+        entry.row.textContent = `${entry.label} · ${reason} (${entry.id})`;
+        message(entry.feedback, reason + '.');
+        await refreshStatus();
+      } else if (result.status === 'unknown' || result.status === 'completed') {
+        pendingSubmissions.delete(entry.id);
+        submissionFailed(entry.feedback, entry);
       } else {
         throw new Error('invalid submission status');
       }
     } catch (_) {
       message(entry.feedback, '주문 상태를 확인하지 못했습니다. 재주문하지 마세요. 자동으로 다시 확인합니다.');
+      entry.row.textContent = `${entry.label} · 상태 조회 실패, 다시 확인 중 (${entry.id})`;
     } finally {
-      submissionPolling = false;
+      entry.polling = false;
       updateButton();
     }
   }
-  async function submitRequest(url, body, element, success) {
+  async function refreshSubmissions() {
+    await Promise.all(Array.from(pendingSubmissions.values(), entry => refreshSubmission(entry)));
+  }
+  async function submitRequest(url, body, element, success, label) {
     let requestKey;
     try { requestKey = makeRequestKey(); }
     catch (_) { message(element, '주문 요청 식별자를 만들 수 없어 접수하지 않았습니다.'); return; }
@@ -173,17 +186,39 @@ HTML_PAGE = r'''<!doctype html>
         message(element, '현재 주문이 접수되지 않았습니다. 잠시 후 다시 시도해 주세요.');
         return;
       }
+      if (response.status === 409) {
+        const rejected = await response.json();
+        if (rejected && rejected.detail === '선반에 빈 슬롯이 없습니다') {
+          const row = document.createElement('li');
+          row.textContent = `${label} · 선반에 빈 슬롯이 없습니다`;
+          document.getElementById('submission-list').appendChild(row);
+          message(element, '선반에 빈 슬롯이 없습니다.');
+          await refreshStatus();
+          return;
+        }
+        submissionFailed(element);
+        return;
+      }
       const result = await readJson(response);
       if (result && result.status === 'pending' && typeof result.request_id === 'string' &&
           /^[A-Za-z0-9_-]{1,128}$/.test(result.request_id)) {
-        pendingSubmission = {id: result.request_id, feedback: element, success};
+        if (pendingSubmissions.has(result.request_id)) {
+          submissionFailed(element);
+          return;
+        }
+        const row = document.createElement('li');
+        const entry = {id: result.request_id, feedback: element, success, row, label, polling: false};
+        row.textContent = `${label} · 접수 결과 확인 중 (${entry.id})`;
+        document.getElementById('submission-list').appendChild(row);
+        pendingSubmissions.set(entry.id, entry);
         message(element, '가상 주문 처리 결과를 확인 중입니다.');
         updateButton();
-        await refreshSubmission();
+        if (fleetMode) void refreshSubmission(entry);
+        else await refreshSubmission(entry);
       } else if (!result || ['pending', 'unknown', 'failed', 'error'].includes(result.status)) {
         submissionFailed(element);
       } else {
-        jobActive = true;
+        if (!fleetMode) jobActive = true;
         message(element, success, true);
         await refreshStatus();
       }
@@ -194,7 +229,7 @@ HTML_PAGE = r'''<!doctype html>
   function showProductDetails() {
     const item = products.get(product.value);
     productDetails.textContent = item
-      ? `픽업 ${item.pickup_node} → 목적지 ${item.destination_node} · 선반 ${item.shelf_id} ${item.slot_index}번 슬롯`
+      ? `픽업 ${item.pickup_node} → 목적지 ${item.destination_node} · 선반 ${item.shelf_id} ${Number.isInteger(item.slot_index) ? `${item.slot_index}번 슬롯` : '빈 슬롯 자동 배정'}`
       : '상품을 선택하면 픽업·목적지와 선반을 표시합니다.';
   }
   async function loadProducts() {
@@ -202,8 +237,7 @@ HTML_PAGE = r'''<!doctype html>
       const data = await readJson(await fetch('/order-demo/api/products', {cache: 'no-store'}));
       if (!Array.isArray(data.products) || !data.products.length ||
           !data.products.every(item => item && ['id', 'label', 'pickup_node', 'destination_node', 'shelf_id']
-            .every(key => typeof item[key] === 'string' && item[key]) &&
-            Number.isInteger(item.slot_index) && item.slot_index >= 0) ||
+            .every(key => typeof item[key] === 'string' && item[key])) ||
           new Set(data.products.map(item => item.id)).size !== data.products.length) {
         throw new Error('invalid products');
       }
@@ -277,7 +311,9 @@ HTML_PAGE = r'''<!doctype html>
       document.getElementById('single-status').hidden = fleetMode;
       document.getElementById('fleet-status').hidden = !fleetMode;
       if (fleetMode) {
-        if (typeof data.accepting_orders !== 'boolean' || !Array.isArray(data.robots) ||
+        if (typeof data.accepting_orders !== 'boolean' ||
+            (data.accepting_queued_orders !== undefined && typeof data.accepting_queued_orders !== 'boolean') ||
+            !Array.isArray(data.robots) ||
             !data.robots.every(robot => robot && typeof robot.robot_id === 'string' && robot.robot_id)) {
           throw new Error('invalid fleet status');
         }
@@ -297,7 +333,9 @@ HTML_PAGE = r'''<!doctype html>
           row.textContent = `${robot.robot_id} · ${status}\n단계: ${phase}\n현재 노드: ${textValue(robot.current_node)}\n경로: ${route}`;
           fleet.appendChild(row);
         }
-        jobActive = stale || disconnected || !data.accepting_orders;
+        const canQueue = data.accepting_queued_orders === undefined ? data.accepting_orders : data.accepting_queued_orders;
+        const unresolved = data.robots.some(robot => ['unknown', 'failed'].includes(robot.status));
+        jobActive = stale || disconnected || unresolved || !canQueue;
         updateButton();
         message(statusFeedback, stale ? '표시된 내용은 최신 상태가 아닙니다. 새 주문은 잠시 기다려 주세요.'
           : (disconnected ? '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.'
@@ -328,7 +366,7 @@ HTML_PAGE = r'''<!doctype html>
   }
   document.getElementById('product-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!productsReady || submitting || jobActive || pendingSubmission || submissionUnknown) return;
+    if (!productsReady || submitting || jobActive || (!fleetMode && pendingSubmissions.size) || submissionUnknown) return;
     if (!products.has(product.value)) {
       message(productFeedback, '상품을 선택해 주세요.');
       return;
@@ -337,12 +375,12 @@ HTML_PAGE = r'''<!doctype html>
     updateButton();
     message(productFeedback, '');
     try { await submitRequest('/order-demo/api/product-orders', {product_id: product.value},
-                              productFeedback, '가상 상품 주문을 접수했습니다.'); }
+                              productFeedback, '가상 상품 주문을 접수했습니다.', products.get(product.value).label); }
     finally { submitting = false; updateButton(); }
   });
   document.getElementById('order-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!nodesReady || submitting || jobActive || pendingSubmission || submissionUnknown) return;
+    if (!nodesReady || submitting || jobActive || pendingSubmissions.size || submissionUnknown) return;
     if (!pickup.value || !destination.value) {
       message(feedback, '출발지와 도착지를 선택해 주세요.');
       return;
@@ -355,13 +393,13 @@ HTML_PAGE = r'''<!doctype html>
     updateButton();
     message(feedback, '');
     try { await submitRequest('/order-demo/api/orders', {pickup_node: pickup.value, destination_node: destination.value},
-                              feedback, '가상 운반 요청을 접수했습니다.'); }
+                              feedback, '가상 운반 요청을 접수했습니다.', `${pickup.value} → ${destination.value}`); }
     finally { submitting = false; updateButton(); }
   });
   loadNodes();
   loadProducts();
   refreshStatus();
-  setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmission()]); }, 800);
+  setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmissions()]); }, 800);
 })();
 </script>
 </body>

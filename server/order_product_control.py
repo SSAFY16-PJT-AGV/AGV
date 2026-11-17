@@ -83,7 +83,8 @@ class ProductControlEngine:
                     'orders_remaining': self.MAX_ORDERS - self._cycle,
                     'order_id': self._pickup_task if self._product else None,
                     'pickup_node': self._pickup, 'destination_node': self._destination,
-                    'product_type': self._product, 'route': list(self._route),
+                    'product_type': self._product, 'shelf_id': self._shelf, 'slot_index': self._slot,
+                    'route': list(self._route),
                     'current_node': current, 'pose': pose, 'battery': 0.8,
                     'pending_action': copy.deepcopy(self._pending)}
 
@@ -95,10 +96,13 @@ class ProductControlEngine:
             if self._status not in ('idle', 'completed') or self._cycle >= self.MAX_ORDERS:
                 raise RuntimeError('simulated product order unavailable')
             expected = self.products.get(product_type)
+            count = expected.get('slot_count') if isinstance(expected, dict) else None
+            valid_slot = (type(slot) is int and
+                          ((type(count) is int and 1 <= count <= 128 and 0 <= slot < count)
+                           or (count is None and expected.get('slot_index') == slot))) if isinstance(expected, dict) else False
             if (not isinstance(expected, dict) or expected.get('pickup_node') != pickup
                     or expected.get('destination_node') != destination
-                    or expected.get('shelf_id') != shelf or type(slot) is not int
-                    or expected.get('slot_index') != slot):
+                    or expected.get('shelf_id') != shelf or not valid_slot):
                 raise ValueError('product is not in the configured simulated catalog')
             if not self.control_ready:
                 raise RuntimeError('isolated workflow is not ready')

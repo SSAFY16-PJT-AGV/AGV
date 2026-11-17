@@ -1,0 +1,147 @@
+--- a/Source/agvSimulation/AGVDisplayShelf.h
++++ b/Source/agvSimulation/AGVDisplayShelf.h
+@@ -68,6 +68,10 @@
+         return ShelfProductType;
+     }
+ 
++    // A snapshot must never turn missing/invalid slots into "empty" slots.
++    int32 GetSlotCount() const { return Slots.Num(); }
++    bool IsSlotSnapshotValid() const;
++
+     UFUNCTION(BlueprintPure, Category = "Shelf")
+     FVector GetSlotWorldLocation(int32 SlotIndex) const;
+ 
+--- a/Source/agvSimulation/AGVDisplayShelf.cpp
++++ b/Source/agvSimulation/AGVDisplayShelf.cpp
+@@ -132,6 +132,22 @@
+     }
+ }
+ 
++bool AAGVDisplayShelf::IsSlotSnapshotValid() const
++{
++    if (Slots.Num() <= 0 || Slots.Num() > 128 || OccupiedSlots.Num() != Slots.Num())
++    {
++        return false;
++    }
++    for (const TObjectPtr<USceneComponent>& Slot : Slots)
++    {
++        if (!IsValid(Slot.Get()))
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
+ bool AAGVDisplayShelf::IsSlotOccupied(int32 SlotIndex) const
+ {
+     return OccupiedSlots.IsValidIndex(SlotIndex)
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -10,6 +10,8 @@
+ #include "Serialization/JsonReader.h"
+ #include "EngineUtils.h"
+ #include "TimerManager.h"
++#include "Async/Async.h"
++#include "Dom/JsonValue.h"
+ #include "Engine/World.h"
+ 
+ AAGVWebSocketClient::AAGVWebSocketClient()
+@@ -247,6 +249,97 @@
+     if (!RootObject->TryGetStringField(
+         TEXT("type"), MessageType))
+     {
++        return;
++    }
++
++    // Team proposal for the authenticated, local web-order demo only.
++    // The reply is tied to this exact connection and current game world.
++    if (MessageType == TEXT("shelf.snapshot.request"))
++    {
++        const TSharedPtr<FJsonObject>* Data = nullptr;
++        FString RequestId;
++        const TArray<TSharedPtr<FJsonValue>>* ShelfIds = nullptr;
++        if (!RootObject->TryGetObjectField(TEXT("data"), Data) ||
++            !Data || !Data->IsValid() ||
++            !(*Data)->TryGetStringField(TEXT("request_id"), RequestId) ||
++            RequestId.IsEmpty() || RequestId.Len() > 128 ||
++            !(*Data)->TryGetArrayField(TEXT("shelf_ids"), ShelfIds) ||
++            !ShelfIds || ShelfIds->IsEmpty() || ShelfIds->Num() > 32 || !Socket.IsValid())
++        {
++            return;
++        }
++
++        TSet<FString> RequestedShelves;
++        for (const TSharedPtr<FJsonValue>& Value : *ShelfIds)
++        {
++            FString ShelfId;
++            if (!Value.IsValid() || !Value->TryGetString(ShelfId) || ShelfId.IsEmpty() ||
++                ShelfId.Len() > 128 || RequestedShelves.Contains(ShelfId))
++            {
++                return;
++            }
++            RequestedShelves.Add(ShelfId);
++        }
++
++        TWeakObjectPtr<AAGVWebSocketClient> WeakSelf(this);
++        TWeakPtr<IWebSocket> RequestSocket(Socket);
++        AsyncTask(ENamedThreads::GameThread, [WeakSelf, RequestSocket, RequestId, RequestedShelves]()
++        {
++            AAGVWebSocketClient* Self = WeakSelf.Get();
++            TSharedPtr<IWebSocket> Connection = RequestSocket.Pin();
++            if (!IsValid(Self) || !Connection.IsValid() ||
++                Self->Socket != Connection || !Connection->IsConnected() || !Self->GetWorld())
++            {
++                return;
++            }
++
++            TArray<TSharedPtr<FJsonValue>> ShelfValues;
++            for (TActorIterator<AAGVDisplayShelf> It(Self->GetWorld()); It; ++It)
++            {
++                AAGVDisplayShelf* Shelf = *It;
++                if (!IsValid(Shelf) || !RequestedShelves.Contains(Shelf->GetShelfId()))
++                {
++                    continue;
++                }
++                if (!Shelf->IsSlotSnapshotValid())
++                {
++                    // Fail closed; the server must not treat unknown slots as empty.
++                    return;
++                }
++                FString ProductType = TEXT("Unknown");
++                switch (Shelf->GetShelfProductType())
++                {
++                    case EProductType::Red: ProductType = TEXT("Red"); break;
++                    case EProductType::Green: ProductType = TEXT("Green"); break;
++                    case EProductType::Blue: ProductType = TEXT("Blue"); break;
++                    default: break;
++                }
++                TSharedRef<FJsonObject> ShelfObject = MakeShared<FJsonObject>();
++                ShelfObject->SetStringField(TEXT("shelf_id"), Shelf->GetShelfId());
++                ShelfObject->SetStringField(TEXT("product_type"), ProductType);
++                TArray<TSharedPtr<FJsonValue>> Slots;
++                for (int32 Index = 0; Index < Shelf->GetSlotCount(); ++Index)
++                {
++                    Slots.Add(MakeShared<FJsonValueBoolean>(Shelf->IsSlotOccupied(Index)));
++                }
++                ShelfObject->SetArrayField(TEXT("slots"), Slots);
++                ShelfValues.Add(MakeShared<FJsonValueObject>(ShelfObject));
++            }
++
++            TSharedRef<FJsonObject> Data = MakeShared<FJsonObject>();
++            Data->SetStringField(TEXT("request_id"), RequestId);
++            Data->SetArrayField(TEXT("shelves"), ShelfValues);
++            TSharedRef<FJsonObject> Reply = MakeShared<FJsonObject>();
++            Reply->SetStringField(TEXT("type"), TEXT("shelf.snapshot"));
++            Reply->SetObjectField(TEXT("data"), Data);
++            FString Json;
++            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
++            if (FJsonSerializer::Serialize(Reply, Writer) && Self->Socket == Connection &&
++                Connection->IsConnected())
++            {
++                Connection->Send(Json);
++            }
++        });
+         return;
+     }
+ 

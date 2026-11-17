@@ -33,6 +33,7 @@ def make_server_environment(source, port, token, map_path):
     env['AGV_ORDER_DEMO_ENABLED'] = '1'
     env['AGV_ORDER_COORDINATED'] = '1'
     env['AGV_ORDER_FLEET'] = '1'
+    env['AGV_ORDER_SHELF_SYNC'] = '1'
     env['AGV_ORDER_DEMO_MAP'] = str(Path(map_path).resolve())
     return env
 

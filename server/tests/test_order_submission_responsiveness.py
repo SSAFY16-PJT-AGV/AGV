@@ -130,19 +130,29 @@ class OrderSubmissionResponsivenessTests(unittest.TestCase):
         self.assertEqual(result.get('result', {}).get('order_id'), 'synthetic-order')
         self.assertEqual(len(self.engine.calls), 1)
 
-    def test_second_order_is_rejected_before_side_effects_while_first_is_pending(self):
+    def test_second_order_is_queued_without_side_effects_while_first_is_pending(self):
         request_id = self._begin_slow_order()
         result, errors, finished = self._request_thread(
             'POST', '/order-demo/api/product-orders', {'product_id': 'blue'},
             'http://127.0.0.1:8000')
         self.assertTrue(finished.wait(.75), 'second request should not block')
         self.assertFalse(errors, repr(errors))
-        self.assertEqual(result[0][0], 503)
+        self.assertEqual(result[0][0], 202)
+        second = json.loads(result[0][1])
+        self.assertEqual(second['status'], 'pending')
+        self.assertNotEqual(second['request_id'], request_id)
         self.assertEqual(len(self.engine.calls), 1)
         self.assertEqual(json.loads(self._submission(request_id)[1]).get('status'), 'pending')
         self.engine.release.set()
-        self.assertTrue(self.engine.finished.wait(2))
-        self.assertEqual(len(self.engine.calls), 1)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = json.loads(self._submission(second['request_id'])[1])['status']
+            if state == 'completed':
+                break
+            time.sleep(.01)
+        self.assertEqual(state, 'completed')
+        self.assertEqual(len(self.engine.calls), 2)
+        self.assertEqual([args[0] for args in self.engine.calls], ['Red', 'Blue'])
 
     def test_same_key_returns_same_pending_id_and_conflicting_payload_is_rejected(self):
         key = 'stable-client-order-1'

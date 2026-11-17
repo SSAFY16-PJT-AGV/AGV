@@ -12,6 +12,18 @@ class AdmissionTests(unittest.TestCase):
         self.admission = OrderAdmission(wait_seconds=0.03, max_records=4)
         self.addCleanup(self.admission.shutdown)
 
+    def test_can_accept_reports_capacity_and_stopped_without_mutation(self):
+        limited = OrderAdmission(wait_seconds=.1, max_records=1)
+        self.addCleanup(limited.shutdown)
+        self.assertTrue(limited.can_accept)
+        self.assertTrue(limited.can_accept)
+        self.assertEqual(limited.submit(lambda: 1, 'one', request_key='a'), 1)
+        self.assertFalse(limited.can_accept)
+        # Existing keys remain usable even after the new-record bound is full.
+        self.assertEqual(limited.submit(lambda: 2, 'one', request_key='a'), 1)
+        limited.shutdown()
+        self.assertFalse(limited.can_accept)
+
     def test_slow_operation_returns_pending_then_result_without_duplicate(self):
         entered, release = threading.Event(), threading.Event()
         calls = []
@@ -40,7 +52,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.admission.submit(slow, 'red', request_key='key-1')['route'], ['a', 'b'])
         self.assertEqual(calls, ['run'])
 
-    def test_busy_and_conflicting_key_do_not_start_a_second_operation(self):
+    def test_different_requests_queue_in_order_and_conflicting_key_is_rejected(self):
         entered, release = threading.Event(), threading.Event()
         called = []
         def slow():
@@ -52,12 +64,57 @@ class AdmissionTests(unittest.TestCase):
         try:
             with self.assertRaises(AdmissionConflict):
                 self.admission.submit(lambda: called.append(1), 'blue', request_key='one')
-            with self.assertRaises(AdmissionBusy):
-                self.admission.submit(lambda: called.append(2), 'blue', request_key='two')
+            second = self.admission.submit(lambda: called.append(2), 'blue', request_key='two')
+            third = self.admission.submit(lambda: called.append(3), 'green', request_key='three')
+            self.assertEqual((second['status'], third['status']), ('pending', 'pending'))
+            self.assertNotEqual(first['request_id'], second['request_id'])
             self.assertEqual(called, [])
             self.assertEqual(self.admission.get(first['request_id'])['status'], 'pending')
         finally:
             release.set()
+        self.assertTrue(self.admission.join(2))
+        self.assertEqual(called, [2, 3])
+        self.assertEqual(self.admission.get(second['request_id'])['status'], 'completed')
+        self.assertEqual(self.admission.get(third['request_id'])['status'], 'completed')
+
+    def test_shutdown_never_executes_pending_queue(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def slow():
+            entered.set()
+            release.wait(3)
+            return 'done'
+        first = self.admission.submit(slow, 'one', request_key='one')
+        self.assertTrue(entered.wait(2))
+        second = self.admission.submit(lambda: calls.append('two'), 'two', request_key='two')
+        third = self.admission.submit(lambda: calls.append('three'), 'three', request_key='three')
+        try:
+            self.admission.shutdown()
+            self.assertEqual(self.admission.get(first['request_id'])['status'], 'unknown')
+            self.assertEqual(self.admission.get(second['request_id'])['status'], 'error')
+            self.assertEqual(self.admission.get(third['request_id'])['status'], 'error')
+            self.assertEqual(self.admission.get(second['request_id'])['error_type'], 'AdmissionStopped')
+        finally:
+            release.set()
+        self.assertTrue(self.admission.join(2))
+        self.assertEqual(calls, [])
+
+    def test_repeated_key_for_queued_request_never_executes_twice(self):
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        def slow():
+            started.set()
+            release.wait(3)
+        self.admission.submit(slow, 'first')
+        self.assertTrue(started.wait(1))
+        try:
+            first = self.admission.submit(lambda: calls.append(1), 'second', request_key='key')
+            again = self.admission.submit(lambda: calls.append(2), 'second', request_key='key')
+            self.assertEqual(first['request_id'], again['request_id'])
+        finally:
+            release.set()
+        self.assertTrue(self.admission.join(2))
+        self.assertEqual(calls, [1])
 
     def test_fast_operation_returns_value_and_error_is_not_reexecuted(self):
         self.assertEqual(self.admission.submit(lambda: {'ok': True}, 'ok'), {'ok': True})

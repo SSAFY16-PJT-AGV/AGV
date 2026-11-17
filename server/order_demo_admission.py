@@ -4,6 +4,7 @@ Admission is not a robot command, a reservation, or a durable order journal.
 The caller must revalidate all live authorization inside the submitted action.
 """
 import copy
+from collections import deque
 import math
 import threading
 import uuid
@@ -26,12 +27,13 @@ class AdmissionOutcomeUnknown(RuntimeError):
 
 
 class OrderAdmission:
-    """Run at most one operation; retain outcomes for safe local retries.
+    """Run operations in bounded FIFO order; retain outcomes for safe retries.
 
     A slow submit returns an opaque request ID. Records are bounded and never
     evicted during this process, so a retained key can never launch twice.
-    `shutdown` marks in-flight work unknown without attempting to cancel it;
-    `join` lets the owner wait before tearing down resources that work uses.
+    `shutdown` marks in-flight work unknown without attempting to cancel it,
+    and marks not-yet-started work stopped without executing it. `join` lets
+    the owner wait before tearing down resources that in-flight work uses.
     No restart or cross-process idempotency guarantee is made.
     """
 
@@ -47,6 +49,7 @@ class OrderAdmission:
         self._records = {}
         self._keys = {}
         self._active = None
+        self._queue = deque()
         self._worker = None
         self._stopped = False
 
@@ -55,6 +58,12 @@ class OrderAdmission:
         if (not isinstance(value, str) or not value or len(value) > limit
                 or any(ord(char) < 32 or ord(char) == 127 for char in value)):
             raise ValueError('{} must be a bounded nonempty string'.format(name))
+
+    @property
+    def can_accept(self):
+        """Observe whether a new request record can be accepted right now."""
+        with self._lock:
+            return not self._stopped and len(self._records) < self.max_records
 
     def submit(self, operation, fingerprint, request_key=None):
         if not callable(operation):
@@ -71,8 +80,8 @@ class OrderAdmission:
             else:
                 if self._stopped:
                     raise AdmissionStopped('admission is shut down')
-                if self._active is not None or len(self._records) >= self.max_records:
-                    raise AdmissionBusy('admission is busy or its record limit was reached')
+                if len(self._records) >= self.max_records:
+                    raise AdmissionBusy('admission record limit was reached')
                 request_id = uuid.uuid4().hex
                 job = {'request_id': request_id, 'fingerprint': fingerprint,
                        'state': 'pending', 'event': threading.Event(),
@@ -80,18 +89,19 @@ class OrderAdmission:
                 self._records[request_id] = job
                 if request_key is not None:
                     self._keys[request_key] = request_id
-                self._active = request_id
-                worker = threading.Thread(target=self._execute, args=(job, operation),
-                                          name='order-admission', daemon=True)
-                self._worker = worker
-                try:
-                    worker.start()
-                except BaseException:
-                    self._active = self._worker = None
-                    self._records.pop(request_id, None)
-                    if request_key is not None:
-                        self._keys.pop(request_key, None)
-                    raise
+                self._queue.append((job, operation))
+                if self._worker is None:
+                    worker = threading.Thread(target=self._drain, name='order-admission', daemon=True)
+                    self._worker = worker
+                    try:
+                        worker.start()
+                    except BaseException:
+                        self._worker = None
+                        self._queue.pop()
+                        self._records.pop(request_id, None)
+                        if request_key is not None:
+                            self._keys.pop(request_key, None)
+                        raise
         job['event'].wait(self.wait_seconds)
         with self._lock:
             state = job['state']
@@ -101,26 +111,33 @@ class OrderAdmission:
                 raise job['error'].with_traceback(None)
             return {'status': state, 'request_id': request_id}
 
-    def _execute(self, job, operation):
-        try:
-            result = copy.deepcopy(operation())
-        except BaseException as exc:
+    def _drain(self):
+        while True:
             with self._lock:
-                if job['state'] == 'pending':
-                    if isinstance(exc, AdmissionOutcomeUnknown):
-                        job['state'] = 'unknown'
-                    else:
-                        job['error'] = exc.with_traceback(None)
-                        job['state'] = 'error'
-                self._active = None
-                job['event'].set()
-            return
-        with self._lock:
-            if job['state'] == 'pending':
-                job['result'] = result
-                job['state'] = 'completed'
-            self._active = None
-            job['event'].set()
+                if self._stopped or not self._queue:
+                    self._worker = None
+                    return
+                job, operation = self._queue.popleft()
+                self._active = job['request_id']
+            try:
+                result = copy.deepcopy(operation())
+            except BaseException as exc:
+                with self._lock:
+                    if job['state'] == 'pending':
+                        if isinstance(exc, AdmissionOutcomeUnknown):
+                            job['state'] = 'unknown'
+                        else:
+                            job['error'] = exc.with_traceback(None)
+                            job['state'] = 'error'
+                    self._active = None
+                    job['event'].set()
+            else:
+                with self._lock:
+                    if job['state'] == 'pending':
+                        job['result'] = result
+                        job['state'] = 'completed'
+                    self._active = None
+                    job['event'].set()
 
     def get(self, request_id):
         self._identifier(request_id, 'request_id', 128)
@@ -143,6 +160,11 @@ class OrderAdmission:
                 if job['state'] == 'pending':
                     job['state'] = 'unknown'
                     job['event'].set()
+            while self._queue:
+                job, _operation = self._queue.popleft()
+                job['state'] = 'error'
+                job['error'] = AdmissionStopped('admission stopped before execution')
+                job['event'].set()
 
     def join(self, timeout=None):
         with self._lock:

@@ -10,7 +10,7 @@ class DemoActionSession:
     The caller passes the same reentrant lock used by the demo engine.
     """
     def __init__(self, engine, lock, settle_seconds=1.5, timeout_seconds=10, can_dispatch=None,
-                 on_change=None, pause_on_unavailable=False):
+                 on_change=None, pause_on_unavailable=False, inventory=None):
         self.engine = engine
         self.lock = lock
         self.settle_seconds = settle_seconds
@@ -20,6 +20,9 @@ class DemoActionSession:
             raise ValueError('action change callback must be callable')
         self.on_change = on_change
         self.pause_on_unavailable = pause_on_unavailable
+        self.inventory = inventory
+        self._shelf_request_id = None
+        self._shelf_request_sent = False
         self._owner_available = threading.Event()
         self._owner_fast_lock = threading.Lock()
         # Orders and robot ticks use a common fence with owner invalidation.
@@ -45,6 +48,9 @@ class DemoActionSession:
         with self.lock:
             if not authenticated or self.owner is not None:
                 return False
+            if self.inventory is not None:
+                self._shelf_request_id = self.inventory.begin_session(client)
+                self._shelf_request_sent = False
             with self._owner_fast_lock:
                 self.owner = self._fast_owner = client
                 self._owner_available.set()
@@ -87,6 +93,10 @@ class DemoActionSession:
                 self._owner_available.clear()
                 self._fast_owner = None
             self.engine.action_unknown()
+            if self.inventory is not None:
+                self.inventory.invalidate(client)
+                self._shelf_request_id = None
+                self._shelf_request_sent = False
             self.owner = None
             self.action_id = self.observed_at = self.sent_at = None
             self._changed()
@@ -94,6 +104,15 @@ class DemoActionSession:
     def poll(self, client, now=None):
         with self.lock:
             if client is not self.owner:
+                return None
+            if self.inventory is not None and not self.inventory.ready:
+                if not self._owner_available.is_set():
+                    return None
+                if not self._shelf_request_sent and self._shelf_request_id:
+                    self._shelf_request_sent = True
+                    return {'type': 'shelf.snapshot.request',
+                            'data': {'request_id': self._shelf_request_id,
+                                     'shelf_ids': list(self.inventory.shelf_ids)}}
                 return None
             if not self._owner_available.is_set() or not self.can_dispatch():
                 if self.pause_on_unavailable and self._owner_available.is_set():
@@ -139,7 +158,20 @@ class DemoActionSession:
 
     def receive(self, client, message, now=None):
         with self.lock:
-            if client is not self.owner or self.sent_at is None or not isinstance(message, dict):
+            if client is not self.owner or not isinstance(message, dict) or not self._owner_available.is_set():
+                return False
+            if self.inventory is not None and message.get('type') == 'shelf.snapshot':
+                data = message.get('data')
+                if (not self._shelf_request_sent or not isinstance(data, dict)
+                        or data.get('request_id') != self._shelf_request_id):
+                    return False
+                accepted = self.inventory.apply_snapshot(client, data)
+                if accepted:
+                    self._shelf_request_id = None
+                    self._shelf_request_sent = False
+                    self._changed()
+                return bool(accepted)
+            if self.sent_at is None:
                 return False
             live_clock = now is None
             now = time.monotonic() if now is None else now
@@ -174,5 +206,8 @@ class DemoActionSession:
             applied = self.engine.apply_action_result(*(data[key] for key in keys), data['applied'])
             if applied:
                 self.action_id = self.observed_at = self.sent_at = None
+                if self.inventory is not None:
+                    self._shelf_request_id = self.inventory.request_snapshot(client)
+                    self._shelf_request_sent = False
                 self._changed()
             return bool(applied)
