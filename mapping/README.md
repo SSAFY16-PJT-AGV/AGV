@@ -47,6 +47,16 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 - **엣지는 양방향이다.** 테이프 선은 어느 쪽으로든 따라갈 수 있고 차체는 제자리에서 돌 수 있어서, 탐색은 한 방향으로 돌았어도 맵에는 `bidirectional: true`로 넣는다. 트윈 경로 찾기도 엣지를 양방향으로 보므로 그대로 맞는다. 한쪽으로만 다니게 하려면 `build_map.py --one-way`.
 - 트윈 레벨에서 시뮬레이션 출발·도착 노드를 예시 맵 ID(`J01` 등)로 정해 두었다면 새 맵의 노드 ID(`P_orange`, `S1` 등)로 바꿔야 한다.
 
+### 통일 형식 필드 채우기 (서버 연동)
+
+서버(`server/routing.py`, `server/segments.py`)는 단위 mm, 노드 `pos`, 엣지 `shape`(양 끝이 노드 pos와 정확히 같음), `waiting` 구역의 `node`를 읽고, 같은 두 노드를 잇는 엣지가 둘 이상이면(렌즈) 맵을 거부한다. `unify_map.py`가 이 필드를 채우고 평행 엣지 두 번째 가지 가운데에 중간 노드 `V_<엣지>`(kind `via`)를 넣는다. 원래 필드(x, y, points, length_m)는 그대로라 트윈도 그대로 읽는다.
+
+```bash
+python3 mapping/unify_map.py maps/mat_ssafy_v2.json      # 그 자리에 고쳐 씀(다시 돌려도 같음)
+```
+
+`maps/mat_ssafy_v2.json`(실제 매트 맵, `feature/topo-mapping`의 `design_map.py`가 매트 도안으로 만든 것)을 이렇게 고쳐 넣었다(`V_E15`: S2-M2 오른쪽 가지, `V_E16`: S3-P_yellow 두 번째 가지). 나중에 `design_map.py`·`build_map.py`가 바로 이 형식을 내보내면 이 스크립트는 필요 없다.
+
 ## 뷰어
 
 `mapping/viewer/index.html`을 브라우저로 열고 맵 JSON을 끌어다 놓는다. 버튼으로 열거나 붙여넣어도 된다. 처음에는 시뮬레이션 예시 맵이 떠 있다. agv-map-v1, 트윈 맵(`warehouse_map.json`), 예전 topo-v0을 모두 연다.

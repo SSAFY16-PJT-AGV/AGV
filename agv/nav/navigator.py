@@ -222,6 +222,7 @@ class Navigator(object):
         if self.at_node is not None and self.m.kind(self.at_node) == "patch" and self.spur is None:
             # 패치 가운데에 서 있다가 새 목표: 되돌아가는 게 싸면 그 자리에서 유턴
             self._maybe_uturn(self.at_node, None)
+        self._via_stop()
         R = self._R()
         if R is not None and self._confident() and not any(h.edge in R for h in self._best()):
             self._note("nav_unreachable", target=self.target, edges=[h.edge for h in self._best()])
@@ -248,6 +249,22 @@ class Navigator(object):
         self.at_node = node
         if node == self.final and not hold:
             self.target = None
+
+    def _via_stop(self):
+        """해제 노드가 중간 노드(via)면 이벤트로 알아볼 수 없으니, via로 가는 엣지에 들어선 순간
+        (시작 노드를 지난 이동거리 s0) s0 + 엣지 길이에서 서도록 정지를 요청한다. 요청했으면 True."""
+        node = self.target
+        if node is None or self._stop is not None or self.at_node == node or self.m.kind(node) != "via":
+            return False
+        best = self._best()
+        if not best or any(h.s0 is None or self.m.edges[h.edge]["to"] != node for h in best):
+            return False
+        if self.route is not None and self._target_i is not None and self._route_pos < self._target_i - 1:
+            return False        # 경로에서 이 via를 지날 차례가 아직 아님(같은 via를 두 번 지나는 경로)
+        pos = max(h.s0 for h in best) + self.m.edges[best[0].edge]["len"]
+        self._note("nav_via_stop", node=node, at=round(pos, 1))
+        self._request_stop(pos, node)
+        return True
 
     def resumed(self):
         """runner가 대기를 풀 때 부른다."""
@@ -549,6 +566,8 @@ class Navigator(object):
         just = best and all(h.s0 == odo for h in best) and len(set(h.last for h in best)) == 1
         if just:
             self._route_advance(best[0].last)
+        if self._via_stop():
+            return
         if par != self.target:
             if self.spur is None and just and best[0].last == par and self._route_reached(par):
                 self._arm_spur(par, odo)
@@ -564,8 +583,9 @@ class Navigator(object):
         if kind == "patch" and just:
             if self._maybe_uturn(best[0].last, odo):
                 return
-        if self.allowed is not None and self._confident() and best:
-            # 정해진 경로를 벗어남: 예약 안 된 길로 더 가지 않게 바로 선다
+        if self.allowed is not None and self._confident() and best and self.at_node is None:
+            # 정해진 경로를 벗어남: 예약 안 된 길로 더 가지 않게 바로 선다.
+            # 노드에 서 있는 동안(at_node) 늦게 처리된 이벤트(교차 판정으로 보류됐던 스퍼 등)는 보지 않는다
             if all(h.edge not in self.allowed for h in best):
                 self._request_stop(None, best[0].last or self.target, reason="nav_off_route")
                 self._stop["hold"] = True
