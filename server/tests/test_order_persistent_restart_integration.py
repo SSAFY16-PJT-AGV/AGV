@@ -36,6 +36,46 @@ from server.tools.twin_multi_test import isolated_environment
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _start_test_server(python, port, env, log, cwd, flags):
+    """Start the isolated app normally; no asynchronous traceback watchdog."""
+    return subprocess.Popen([python, '-m', 'uvicorn', 'server.order_demo_app:app',
+                             '--host', '127.0.0.1', '--port', str(port), '--workers', '1',
+                             '--no-proxy-headers', '--no-access-log'], cwd=cwd, env=env,
+                            stdout=log, stderr=log, creationflags=flags)
+
+
+def _read_log_tail(path, limit=18000):
+    """Read bounded evidence even if a child's log is missing or unreadable."""
+    try:
+        with Path(path).open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - limit))
+            return stream.read(limit).decode('utf-8', errors='replace')
+    except OSError as exc:
+        return '<log unavailable: {}>'.format(exc)
+
+
+def _request_with_diagnostics(operation, diagnostics):
+    try:
+        return operation()
+    except Exception as exc:
+        try:
+            evidence = diagnostics()
+        except Exception as diagnostic_exc:
+            evidence = 'diagnostics unavailable: {!r}'.format(diagnostic_exc)
+        raise AssertionError('server request failed: {!r}; {}'.format(exc, evidence)) from exc
+
+
+def _wait_for_test_server(testcase, child, folder, port):
+    """Keep startup errors and the owned child's exit/log evidence together."""
+    logfile = Path(folder) / 'server.log'
+    try:
+        return wait_for_owned_server(testcase, child, str(logfile), port)
+    except Exception as exc:
+        raise AssertionError('server startup failed: {!r}; pid={!r}; exit={!r}; log={!r}'.format(
+            exc, child.pid, child.poll(), _read_log_tail(logfile))) from exc
+
+
 class PersistentFakeUnreal(FakeUnreal):
     """Keep the synthetic world's own pose, separate from restored server state."""
     def __init__(self, port, token, simulated_map, world=None):
@@ -403,13 +443,9 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                         'AGV_TWIN_POSE_MAP_ID': 'twin-validation-v1'})
 
             def start_server():
-                debug_main = ('import faulthandler; faulthandler.dump_traceback_later(20, repeat=True); '
-                              'import uvicorn; uvicorn.run("server.order_demo_app:app", host="127.0.0.1", '
-                              'port={}, workers=1, proxy_headers=False, access_log=False)'.format(server_port))
-                child = subprocess.Popen([python, '-c', debug_main], cwd=ROOT, env=env,
-                                         stdout=server_log, stderr=server_log, creationflags=flags)
+                child = _start_test_server(python, server_port, env, server_log, ROOT, flags)
                 cleanup.callback(stop, child)
-                wait_for_owned_server(self, child, str(folder / 'server.log'), server_port)
+                _wait_for_test_server(self, child, folder, server_port)
                 return child
 
             def start_unreal(world=None):
@@ -419,24 +455,27 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 return unreal
 
             def order(request_id):
-                return request(server_port, '/order-demo/api/orders/' + request_id)
+                return get('/order-demo/api/orders/' + request_id)
+
+            def child_evidence():
+                return ('server_exit={!r}; broker_exit={!r}; unreal_alive={!r}; unreal_errors={!r}; '
+                        'broker_log={!r}; server_log={!r}'.format(
+                            server.poll(), broker.poll(), unreal.thread.is_alive(), unreal.errors,
+                            _read_log_tail(folder / 'broker.log', 5000),
+                            _read_log_tail(folder / 'server.log', 18000)))
+
+            def get(path):
+                return _request_with_diagnostics(lambda: request(server_port, path), child_evidence)
+
+            def submit(key):
+                return _request_with_diagnostics(lambda: post_order(server_port, key), child_evidence)
 
             suspended_since = {}
             def terminal(request_id):
-                try:
-                    value = order(request_id)
-                except Exception as exc:
-                    server_log.flush()
-                    broker_log.flush()
-                    raise AssertionError(
-                        'server request failed: {!r}; server_exit={!r}; broker_exit={!r}; '
-                        'unreal_alive={!r}; unreal_errors={!r}; broker_log={!r}; server_log={!r}'.format(
-                            exc, server.poll(), broker.poll(), unreal.thread.is_alive(), unreal.errors,
-                            (folder / 'broker.log').read_text(encoding='utf-8', errors='replace')[-5000:],
-                            (folder / 'server.log').read_text(encoding='utf-8', errors='replace')[-18000:])) from exc
+                value = order(request_id)
                 if value.get('status') in ('completed', 'unknown', 'failed'):
                     return value
-                status = request(server_port, '/order-demo/api/status')
+                status = get('/order-demo/api/status')
                 if value.get('status') == 'active' and status.get('status') == 'suspended':
                     since = suspended_since.setdefault(request_id, time.monotonic())
                     if time.monotonic() - since >= 15:
@@ -446,22 +485,15 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 return None
 
             def diagnostics(request_id):
-                server_log.flush()
-                broker_log.flush()
-                return ('order={!r}, status={!r}, actions={!r}, errors={!r}, '
-                        'unreal_alive={!r}, broker_exit={!r}, server_exit={!r}, broker_log={!r}, server_log={!r}'
-                        .format(order(request_id), request(server_port, '/order-demo/api/status'),
-                                unreal.actions, unreal.errors, unreal.thread.is_alive(), broker.poll(), server.poll(),
-                                (folder / 'broker.log').read_text(encoding='utf-8', errors='replace')[-10000:],
-                                (folder / 'server.log').read_text(encoding='utf-8', errors='replace')[-12000:]))
+                return 'request_id={!r}; actions={!r}; {}'.format(request_id, unreal.actions, child_evidence())
 
             server = start_server()
             unreal = start_unreal()
-            self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('accepting_orders')))
+            self.assertTrue(wait_for(lambda: get('/order-demo/api/status').get('accepting_orders')))
             self.assertEqual(unreal.states_before_snapshot, [], 'poses must not precede the first world proof')
-            products_before = request(server_port, '/order-demo/api/products')
-            self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 3)
-            code, first = post_order(server_port, 'persist-running')
+            products_before = get('/order-demo/api/products')
+            self.assertEqual(get('/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 3)
+            code, first = submit('persist-running')
             self.assertIn(code, (200, 202))
             first_id = first.get('request_id')
             self.assertIsInstance(first_id, str, 'all accepted orders need an addressable durable ID')
@@ -472,8 +504,8 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 self.assertEqual(completed_order['status'], 'completed', diagnostics(first_id))
                 self.assertEqual(completed_order['product_id'], 'red')
                 self.assertEqual(completed_order['slot_index'], 1, 'initial red slot 0 was already occupied')
-                self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
-                before_status = request(server_port, '/order-demo/api/status')
+                self.assertEqual(get('/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
+                before_status = get('/order-demo/api/status')
                 robot_id = completed_order['assigned_robot']
                 before_robot = next(item for item in before_status['robots'] if item['robot_id'] == robot_id)
                 before_yaw = before_robot['pose']['th']
@@ -495,11 +527,11 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 world = unreal.capture_world()
                 server = start_server()
                 unreal = start_unreal(world)
-                self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('unreal_connected')))
+                self.assertTrue(wait_for(lambda: get('/order-demo/api/status').get('unreal_connected')))
                 self.assertTrue(wait_for(lambda: unreal.snapshots), 'world proof was not requested after restart')
                 self.assertEqual(unreal.states_before_snapshot, [], 'restart poses must not precede world proof')
-                restored_status = wait_for(lambda: (state if not (state := request(
-                    server_port, '/order-demo/api/status')).get('stale') and state.get('accepting_orders') else None))
+                restored_status = wait_for(lambda: (state if not (state := get(
+                    '/order-demo/api/status')).get('stale') and state.get('accepting_orders') else None))
                 self.assertIsNotNone(restored_status, 'matching same-world heading must permit safe continuation')
                 after_robot = next(item for item in restored_status['robots'] if item['robot_id'] == robot_id)
                 after_yaw = after_robot['pose']['th']
@@ -508,13 +540,13 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 time.sleep(.6)
                 self.assertTrue(actor_yaw_matches(before_yaw),
                                 'the Unreal actor must retain its heading after state publication')
-                self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
-                self.assertEqual(request(server_port, '/order-demo/api/products'), products_before)
+                self.assertEqual(get('/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
+                self.assertEqual(get('/order-demo/api/products'), products_before)
                 restored = order(first_id)
                 self.assertEqual(restored['request_id'], first_id)
                 self.assertEqual(restored['status'], 'completed')
                 self.assertEqual((restored['product_id'], restored['slot_index']), ('red', 1))
-                _code, replay = post_order(server_port, 'persist-running')
+                _code, replay = submit('persist-running')
                 self.assertEqual(replay['request_id'], first_id)
                 time.sleep(1)
                 with unreal.lock:
@@ -522,7 +554,7 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                     self.assertTrue(unreal.slots['SHELF_RED'][1])
                 # A terminal task has an actual completed receipt and place
                 # acknowledgement; the same simulated world may continue.
-                code, next_order = post_order(server_port, 'after-completed')
+                code, next_order = submit('after-completed')
                 self.assertIn(code, (200, 202))
                 next_id = next_order.get('request_id')
                 self.assertIsInstance(next_id, str)
@@ -531,7 +563,7 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 self.assertIsNotNone(next_done, diagnostics(next_id))
                 self.assertEqual(next_done['status'], 'completed', diagnostics(next_id))
                 self.assertEqual(next_done['slot_index'], 2)
-                self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 1)
+                self.assertEqual(get('/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 1)
                 with unreal.lock:
                     self.assertTrue(unreal.slots['SHELF_RED'][2])
                     self.assertEqual(len([a for a in unreal.actions if a['action'] == 'place']), 1)
@@ -539,7 +571,7 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 # Only one pickup remains. Concurrent web submissions must not
                 # invent a second product or send a second Unreal grab.
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    responses = list(pool.map(lambda key: post_order(server_port, key),
+                    responses = list(pool.map(submit,
                                               ('last-stock-a', 'last-stock-b')))
                 self.assertTrue(all(code in (200, 202) for code, _ in responses), responses)
                 last_ids = [response['request_id'] for _, response in responses]
@@ -548,18 +580,18 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                     result = wait_for(lambda: terminal(last_id), timeout=120)
                     self.assertIsNotNone(result, diagnostics(last_id))
                 self.assertEqual(sorted(order(last_id)['status'] for last_id in last_ids), ['completed', 'failed'])
-                self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 0)
+                self.assertEqual(get('/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 0)
                 with unreal.lock:
                     self.assertEqual(len([a for a in unreal.actions if a['action'] == 'grab']), grabs_before + 1)
                     self.assertTrue(unreal.slots['SHELF_RED'][4])
                 return
 
             def moving():
-                state = request(server_port, '/order-demo/api/status')
+                state = get('/order-demo/api/status')
                 return (not state.get('stale') and any(r.get('status') == 'moving'
                                                        for r in state.get('robots', [])))
             self.assertTrue(wait_for(moving), 'first simulated AGV should start before crash')
-            code, second = post_order(server_port, 'persist-queued')
+            code, second = submit('persist-queued')
             self.assertEqual(code, 202, 'same-destination second order must wait')
             second_id = second.get('request_id')
             self.assertIsInstance(second_id, str)
@@ -580,10 +612,10 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
             world = unreal.capture_world()
             server = start_server()
             unreal = start_unreal(world)
-            self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('unreal_connected')))
+            self.assertTrue(wait_for(lambda: get('/order-demo/api/status').get('unreal_connected')))
             self.assertTrue(wait_for(lambda: unreal.snapshots), 'world proof was not requested after restart')
             self.assertEqual(unreal.states_before_snapshot, [], 'restart poses must not precede world proof')
-            self.assertEqual(request(server_port, '/order-demo/api/products'), products_before)
+            self.assertEqual(get('/order-demo/api/products'), products_before)
             first_recovered, second_recovered = order(first_id), order(second_id)
             self.assertEqual((first_recovered['request_id'], second_recovered['request_id']),
                              (first_id, second_id))
@@ -597,7 +629,7 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
             # Identical idempotency keys may only resolve to their old records;
             # neither retry may start a new physical or simulated action.
             for key, expected in (('persist-running', first_id), ('persist-queued', second_id)):
-                _code, response = post_order(server_port, key)
+                _code, response = submit(key)
                 self.assertEqual(response['request_id'], expected)
             time.sleep(1)
             with unreal.lock:

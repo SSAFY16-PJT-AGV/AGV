@@ -297,6 +297,18 @@ Unreal 액터가 보고한 각도와 원형 각도 차이가 1도 이내일 때�
 기존 월드의 물품과 로봇 상태를 자동으로 복원하지 않으므로 작업을 차단한다.
 서버만 재시작하는 시험과 Unreal 월드 자체를 새로 만드는 상황을 구분해야 한다.
 
+재시작 통합 시험은 자체 루프백 브로커·임시 DB·Unreal 대역으로 실행한다.
+테스트 서버에는 주기적인 `faulthandler.dump_traceback_later()`를 강제하지
+않는다. Python 3.12의 시험 프로세스에서 비동기 스레드 덤프 중 접근 위반이
+재현되었기 때문이다. 실패 시 부모 테스트가 프로세스 종료 코드와 제한된 로그를
+출력한다. 유사한 Python 자체 오류는 [CPython 이슈 #140815](https://github.com/python/cpython/issues/140815)를 참고한다.
+
+```powershell
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
+.\.venv\Scripts\python -m unittest server.tests.test_order_persistent_restart_integration.PersistentRestartIntegrationTest -v
+```
+
 `/order-demo/api/status`의 응답은 지연 중 마지막으로 확인한 상태를 표시할 수
 있으며 이때 `stale: true`다. 화면은 오래된 상태를 안내하고 새 주문을 제한한다.
 상태 캐시는 관측용이며 작업 배정·구간 예약·로봇 동작을 허가하는 증거가 아니다.
