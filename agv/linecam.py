@@ -32,9 +32,13 @@ import numpy as np
 DEFAULT_CONFIG = {
     "frame": {"width": 320, "height": 240, "flip": 0},
     "line": {
-        "v_max": 80,            # 이보다 어두우면 라인 후보
+        "v_auto": True,         # 프레임마다 테이프·매트 밝기를 재서 그 사이에 문턱을 둔다. 조명이 바뀌어도 따라간다
+                                # (실물: 어두운 방 매트 108·테이프 20, 밝은 곳 매트 210·테이프 90). false면 v_max·v_dark 고정값
+        "v_split": 0.25,        # 문턱 = 테이프 밝기 + 이 비율 x (매트 - 테이프)
+        "v_dark_split": 0.13,   # 채도와 상관없이 라인으로 볼 밝기도 같은 식
+        "v_max": 80,            # (v_rel이 null일 때) 이보다 어두우면 라인 후보
         "s_max": 90,            # 이보다 채도가 높으면 색 패치로 보고 제외
-        "v_dark": 55,           # 이보다 어두우면 채도와 상관없이 라인(어두운 픽셀은 S가 노이즈로 튐)
+        "v_dark": 55,           # (v_rel이 null일 때) 이보다 어두우면 채도와 상관없이 라인(어두운 픽셀은 S가 노이즈로 튐)
         "blur": 5,              # 가우시안 블러 커널(0이면 끔)
         "roi_top": 0.30,        # 스캔 영역(화면 높이 비율)
         "roi_bottom": 0.96,
@@ -43,6 +47,8 @@ DEFAULT_CONFIG = {
         "min_w_frac": 0.02,     # 라인 조각 최소/최대 폭(화면 폭 비율)
         "max_w_frac": 0.60,
         "gap_close_px": 4,      # 이보다 좁은 끊김은 이어 붙임
+        "border_drop_frac": 0.6,  # 화면 왼/오른쪽 끝에 붙은 어두운 조각이 스캔 줄의 이 비율 이상에 있고 그 줄들에
+                                  # 다른 라인 조각도 보이면 매트 밖 바닥으로 보고 뺀다(0이면 끔)
     },
     "junction": {
         "confirm_frames": 3,    # 조각 수 변화가 이만큼 이어져야 인정
@@ -109,6 +115,15 @@ DEFAULT_CONFIG = {
         "slow_k": 0.5,          # 오차가 크면 감속
         "max_cmd": 0.6,
         "lost_timeout_s": 1.0,  # 라인을 이만큼 못 보면 정지
+        "jump_frac": 0.3,       # 화면 옆 끝에 붙은 조각이 마지막 라인 위치에서 화면 폭의 이 비율보다 멀면
+                                # 라인이 아니라 매트 밖 바닥·그림자로 보고 무시
+        "max_jump_frac": 0.5,   # 옆 끝에 안 붙은 조각도 이 비율보다 멀면 무시(먼 줄에 보이는 매트 밖 바닥)
+        "edge_frac": 0.3,       # 라인을 놓치기 직전 위치가 화면 왼/오른쪽 이 비율 안이면 급커브로 화면 밖에
+                                # 나간 것: 그쪽으로 제자리 회전하며 찾는다
+        "search_timeout_s": 4.0,  # 그렇게 찾는 최대 시간(그 뒤 정지)
+        "min_track": 0.0,       # 라인을 따라갈 때 안쪽 궤도 명령의 하한(0이면 끔). 0.2쯤 주면 양쪽이 같이 밀며 크게 돈다
+        "track_jump_frac": 0.2,   # 바로 앞 프레임에 라인을 봤으면, 화면 폭의 이 비율보다 먼 조각으로는 안 넘어감
+        "min_w_k": 0.3,           # 라인 폭(조향 줄)의 이 배보다 가는 조각은 라인이 아님(패치 가장자리의 가는 어두운 띠 등)
     },
 }
 
@@ -146,10 +161,52 @@ class Analysis(object):
         self.rows = []          # [(y, [xc, ...]), ...] 위(먼 곳)부터
         self.widths = []        # rows와 같은 순서의 조각 폭 [[w, ...], ...]
         self.raw = []           # rows와 같은 순서, 폭 필터 전 조각 [(x0, x1), ...] (스퍼 판정용)
+        self.raw_all = []       # raw와 같되 매트 밖 바닥으로 뺀 조각도 남김(라인 추종용: 바닥에 붙은 선도 따라감)
         self.ctrl_idx = 0
         self.patch_fracs = {}
         self.line_mask = None
         self.sat_rows = []      # 속도 보정용: 정해진 가로줄마다 채도 높은(패치) 픽셀 비율
+        self.dropped_sides = set()  # 매트 밖 바닥으로 보고 뺀 화면 쪽(left/right)
+        self.mat_v = None           # 이 프레임의 매트 밝기 추정
+        self.v_max = None           # 이 프레임에 쓴 라인 밝기 문턱
+        self.v_dark = None
+        self.line_v = None
+
+
+def line_thresholds(v, lc):
+    """(v_max, v_dark, mat_v, line_v). v_auto면 이 프레임의 스캔 영역 밝기에서 매트(70% 지점)와 테이프(3% 지점,
+    테이프는 화면 폭의 1할쯤이라 가장 어두운 쪽)를 재서 그 사이에 둔다. 테이프가 안 보여 둘 차이가 작으면
+    매트 밝기의 35%로 둔다(매트·패치를 라인으로 잡지 않게). 아니면 설정 고정값."""
+    if not lc.get("v_auto"):
+        return lc["v_max"], lc["v_dark"], None, None
+    h = v.shape[0]
+    sub = v[int(lc["roi_top"] * h):int(lc["roi_bottom"] * h):2, ::2]
+    line_v, mat_v = [float(x) for x in np.percentile(sub, [3, 70])]
+    if mat_v - line_v < 0.4 * mat_v:
+        return 0.35 * mat_v, 0.2 * mat_v, mat_v, None
+    k, kd = lc.get("v_split", 0.25), lc.get("v_dark_split", 0.13)
+    return line_v + k * (mat_v - line_v), line_v + kd * (mat_v - line_v), mat_v, line_v
+
+
+def _offmat_sides(per_row, w, frac):
+    """매트 가장자리 밖 바닥이 화면 옆에 보이는지. 그 쪽 끝에 붙은 어두운 조각이 스캔 줄의 frac 이상에 있고,
+    그 줄들의 절반 이상에 끝에 안 붙은 조각(진짜 라인)도 같이 보이면 그 쪽을 뺀다.
+    라인이 급히 휘어 화면 옆으로 나갈 때는 다른 조각이 없으므로 빼지 않는다. 반환: {"left", "right"} 부분집합."""
+    out = set()
+    if not frac or not per_row:
+        return out
+    for side in ("left", "right"):
+        touch = 0
+        with_other = 0
+        for runs in per_row:
+            at = [r for r in runs if (r[0] <= 1 if side == "left" else r[1] >= w - 2)]
+            if at:
+                touch += 1
+                if len(runs) > len(at):
+                    with_other += 1
+        if touch >= frac * len(per_row) and with_other >= 0.5 * touch:
+            out.add(side)
+    return out
 
 
 def analyze(bgr, cfg):
@@ -158,22 +215,32 @@ def analyze(bgr, cfg):
     src = cv2.GaussianBlur(bgr, (lc["blur"], lc["blur"]), 0) if lc.get("blur") else bgr
     hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
-    mask = ((v < lc["v_max"]) & ((s < lc["s_max"]) | (v < lc["v_dark"]))).astype(np.uint8)
+    v_max, v_dark, mat_v, line_v = line_thresholds(v, lc)
+    mask = ((v < v_max) & ((s < lc["s_max"]) | (v < v_dark))).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     an = Analysis()
     an.w, an.h = w, h
+    an.mat_v, an.v_max, an.v_dark, an.line_v = mat_v, v_max, v_dark, line_v
     an.line_mask = mask
     ys = np.linspace(lc["roi_top"] * h, lc["roi_bottom"] * h, lc["rows"]).astype(int)
     min_w, max_w = lc["min_w_frac"] * w, lc["max_w_frac"] * w
+    per_row = []
     for y in ys:
         y0, y1 = max(0, y - 1), min(h, y + 2)
         band = mask[y0:y1].mean(axis=0) > 0.5
-        allruns = [(a, b) for a, b in _runs(band, lc["gap_close_px"]) if (b - a + 1) >= min_w]
+        per_row.append([(a, b) for a, b in _runs(band, lc["gap_close_px"]) if (b - a + 1) >= min_w])
+    drop = _offmat_sides(per_row, w, lc.get("border_drop_frac", 0.0))
+    an.dropped_sides = drop
+    for y, allruns in zip(ys, per_row):
+        if drop:
+            allruns = [(a, b) for a, b in allruns
+                       if not (("left" in drop and a <= 1) or ("right" in drop and b >= w - 2))]
         runs = [(a, b) for a, b in allruns if (b - a + 1) <= max_w]
         an.rows.append((int(y), [(a + b) / 2.0 for a, b in runs]))
         an.widths.append([float(b - a + 1) for a, b in runs])
         an.raw.append(allruns)
+    an.raw_all = per_row
     an.ctrl_idx = int(np.argmin(np.abs(ys - lc["control_row"] * h)))
 
     pc = cfg["patch"]
@@ -486,40 +553,91 @@ class Follower(object):
         self.c = cfg["follow"]
         self.last_x = None
         self.prev_err = 0.0
+        self.rejected = 0       # 이번 프레임에 버린 조각 수(디버그용)
+        self.missed = 999       # 라인을 못 본 연속 프레임 수
 
-    def target(self, an, choice=None, lw=None):
+    def _ok(self, run, x, w):
+        """마지막 라인 위치에서 갑자기 멀리 있는 조각은 받지 않는다(화면 옆 끝에 붙은 조각은 더 엄하게).
+        급커브에서 라인이 화면 밖으로 나간 순간, 반대편 끝이나 먼 줄에 보이는 매트 밖 바닥(어두움)을
+        라인으로 잡아 계속 그쪽으로 도는 것을 막는다."""
+        a, b = run
+        lim = self.c.get("jump_frac", 0.3) if (a <= 1 or b >= w - 2) else self.c.get("max_jump_frac", 0.5)
+        if self.missed == 0:
+            lim = min(lim, self.c.get("track_jump_frac", 0.2))
+        return abs(x - self.last_x) <= lim * w
+
+    def edge_side(self, w):
+        """마지막으로 본 라인이 화면 옆 끝 근처였으면 그 쪽(left/right), 아니면 None."""
+        if self.last_x is None:
+            return None
+        f = self.c.get("edge_frac", 0.3)
+        if self.last_x < f * w:
+            return "left"
+        if self.last_x > (1.0 - f) * w:
+            return "right"
+        return None
+
+    def target(self, an, choice=None, lw=None, near_only=False):
         """조향 목표 x(px). choice가 left/right면 갈림길에서 그쪽 가지를 택한다.
-        lw(라인폭 px)를 주면 스퍼·교차로 넓어진 조각에서 내 선 쪽 가장자리를 쓴다."""
+        lw(라인폭 px)를 주면 스퍼·교차로 넓어진 조각에서 내 선 쪽 가장자리를 쓴다.
+        near_only: 조향 줄과 그보다 가까운 줄에서만 찾는다(라인을 찾아 회전하는 중. 먼 줄에는 매트 밖이 보일 수 있음)."""
         if self.last_x is None:
             self.last_x = an.w / 2.0
         ctrl_segs = an.rows[an.ctrl_idx][1]
+        wmin = self.c.get("min_w_k", 0.3) * lw if lw else 0.0
+        if wmin and an.widths:
+            ctrl_segs = [c for c, wd in zip(ctrl_segs, an.widths[an.ctrl_idx]) if wd >= wmin]
         x = None
         if choice in ("left", "right") and len(ctrl_segs) >= 2:
             x = ctrl_segs[0] if choice == "left" else ctrl_segs[-1]
         if x is None:
             # 조향 줄 -> 그보다 가까운 줄 -> 먼 줄 순서로 찾는다
-            order = [an.ctrl_idx] + list(range(an.ctrl_idx + 1, len(an.rows))) \
-                + list(range(an.ctrl_idx - 1, -1, -1))
+            order = [an.ctrl_idx] + list(range(an.ctrl_idx + 1, len(an.rows)))
+            if not near_only:
+                order += list(range(an.ctrl_idx - 1, -1, -1))
+            self.rejected = 0
+            runs_by_row = an.raw_all or an.raw
             for i in order:
-                cand = [_line_x(r, self.last_x, lw) for r in an.raw[i]] if an.raw else an.rows[i][1]
+                if runs_by_row:
+                    cand = []
+                    for r in runs_by_row[i]:
+                        cx = _line_x(r, self.last_x, lw)
+                        if (r[1] - r[0] + 1) >= wmin and self._ok(r, cx, an.w):
+                            cand.append(cx)
+                        else:
+                            self.rejected += 1
+                else:
+                    cand = an.rows[i][1]
                 if cand:
                     x = min(cand, key=lambda s: abs(s - self.last_x))
                     break
         if x is not None:
             self.last_x = float(x)
+            self.missed = 0
+        else:
+            self.missed += 1
         return x
 
     def command(self, x, w, dt):
         if x is None:
             return 0.0, 0.0
         err = (x - w / 2.0) / (w / 2.0)
+        if self.prev_err is None:       # 라인을 다시 잡은 첫 프레임: 미분항이 튀지 않게
+            self.prev_err = err
         d = (err - self.prev_err) / max(dt, 1e-3)
         self.prev_err = err
         turn = self.c["kp"] * err + self.c["kd"] * d
         base = self.c["base_speed"] * max(0.4, 1.0 - self.c["slow_k"] * abs(err))
         m = self.c["max_cmd"]
-        left = max(-m, min(m, base + turn))
-        right = max(-m, min(m, base - turn))
+        left, right = base + turn, base - turn
+        lo = self.c.get("min_track", 0.0)
+        if lo and min(left, right) < lo:
+            # 안쪽 궤도를 거의 세우면 바깥 궤도 혼자 차체를 비틀어야 해서 실물에서 멈췄다.
+            # 좌우 차이(회전 정도)는 그대로 두고 둘 다 올려 양쪽이 같이 밀며 돌게 한다
+            up = lo - min(left, right)
+            left, right = left + up, right + up
+        left = max(-m, min(m, left))
+        right = max(-m, min(m, right))
         return left, right
 
 

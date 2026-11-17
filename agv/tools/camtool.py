@@ -34,8 +34,8 @@ import cv2
 import numpy as np
 
 from ..camcalib import find_corners, guess_board
-from ..explore import HERE, ROOT, load_config
-from ..hw import JetbotMotors, open_camera
+from ..explore import HERE, ROOT, _offmat_text, _thr_text, load_config
+from ..hw import make_motors, open_camera
 from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
 
 
@@ -117,8 +117,7 @@ def cmd_ground(a, cfg):
     arm_res = _apply_arm(a, cfg)
     motors = None
     if a.enable_motors:
-        rob = cfg["robot"]
-        motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False), rob.get("trim", 0.0))
+        motors = make_motors(cfg)
     else:
         print(u"--enable-motors가 없어서 지금 자세 한 장만 찍어요(회전 사진 없음).")
     # 왼쪽 두 번, 오른쪽 네 번, 왼쪽 두 번: 0, +1, +2, +1, 0, -1, -2, -1, 0 위치
@@ -315,6 +314,8 @@ def _arm_interactive(a, cfg, A):
                                 (u"카메라 자세", A.fmt(pose)),
                                 (u"고른 서보", u"%s번 %s, %g도씩" % (sel, A.NAMES.get(sel, u""), step)),
                                 (u"선 하나로 보이는 줄", u"%d / %d" % (one, rows)),
+                                (u"라인 문턱", _thr_text(an)),
+                                (u"매트 밖 바닥", _offmat_text(an)),
                                 (u"조향 줄 선 위치", u"-" if off is None else u"가운데에서 %+.0fpx" % off),
                                 (u"상태", (u"힘 뺌(손으로 움직이는 중)" if free else u"고정") + (u", 저장 안 함" if dirty else u""))])
                         if n % 40 == 0 and a.camera != "none" and view is None:
@@ -395,8 +396,7 @@ def cmd_speed(a, cfg):
     if not a.enable_motors:
         print(u"로봇이 직진해요. 앞을 비우고 --enable-motors를 붙여 다시 실행하세요.")
         return 2
-    rob = cfg["robot"]
-    m = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False), rob.get("trim", 0.0))
+    m = make_motors(cfg)
     base = cfg["follow"]["base_speed"]
     print(u"%.1f초 동안 base_speed=%.2f로 직진합니다. 출발점을 표시해 두세요." % (a.seconds, base))
     time.sleep(2.0)
@@ -413,6 +413,29 @@ def cmd_speed(a, cfg):
     v = d / a.seconds
     print(u"속도 = %.0f mm/s. %s의 robot.speed_mm_s에 넣으세요." % (v, a.config))
     print(u"옆으로 쏠렸다면 robot.trim을 조금씩(±0.02) 바꿔 다시 재 보세요.")
+    return 0
+
+
+def cmd_turn(a, cfg):
+    """회전 힘 확인: 한쪽 궤도만(또는 제자리) 출력을 단계별로 올리며 1초씩 돈다. 언제부터 실제로 도는지 본다."""
+    if not a.enable_motors:
+        print(u"로봇이 제자리에서 돌아요. 주변을 비우고 --enable-motors를 붙여 다시 실행하세요.")
+        return 2
+    m = make_motors(cfg)
+    steps = [round(0.3 + 0.1 * i, 1) for i in range(6)]
+    print(u"%s: 출력 %s를 1초씩 차례로 냅니다. 실제로 돌기 시작한 값을 적어 두세요." % (
+        u"제자리 회전(좌 +, 우 -)" if a.pivot else u"오른쪽으로 꺾기(왼쪽 궤도만)", u", ".join("%.1f" % v for v in steps)))
+    time.sleep(2.0)
+    try:
+        for v in steps:
+            print(u"  출력 %.1f" % v)
+            m.set(v, -v if a.pivot else 0.0)
+            time.sleep(a.seconds)
+            m.stop()
+            time.sleep(1.0)
+    finally:
+        m.stop()
+    print(u"돌기 시작한 값이 0.6보다 크면 궤도가 바닥에 너무 비비는 것(배터리·궤도 장력·매트 표면 확인).")
     return 0
 
 
@@ -451,6 +474,10 @@ def main(argv=None):
     sp = sub.add_parser("speed")
     sp.add_argument("--seconds", type=float, default=4.0)
     sp.add_argument("--enable-motors", action="store_true")
+    tu = sub.add_parser("turn", help="회전에 필요한 모터 출력 확인")
+    tu.add_argument("--pivot", action="store_true", help="한쪽만 말고 제자리 회전(양쪽 반대로)")
+    tu.add_argument("--seconds", type=float, default=1.0)
+    tu.add_argument("--enable-motors", action="store_true")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.cmd == "snap":
@@ -465,6 +492,8 @@ def main(argv=None):
         return cmd_ground(a, cfg)
     if a.cmd == "speed":
         return cmd_speed(a, cfg)
+    if a.cmd == "turn":
+        return cmd_turn(a, cfg)
     ap.print_help()
     return 1
 

@@ -8,6 +8,7 @@
 --video면 run.mp4(카메라 시점 + 위에서 본 궤적).
 """
 import argparse
+import io
 import json
 import math
 import os
@@ -40,7 +41,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         mode="drive", speed_err=0.05, slip=0.03, vmax_mm_s=500.0, track_mm=140.0,
         cfg_override=None, quiet=True, max_laps=8, raw_video=False, start_pose=None,
         branch_order=("left", "right"), speed_scale=None, speed_drift=0.0, turn_slip=0.0, pivot_slip=None,
-        policy=None, on_step=None):
+        policy=None, on_step=None, speedcal=None, floor=None):
     """speed_scale: 실제 속도 / 설정 속도를 이 값으로 고정(기본: 1 ± speed_err 무작위).
     speed_drift: 1분마다 실제 속도가 이 비율만큼 줄어듦(배터리 소모 흉내).
     turn_slip: 궤도 미끄러짐으로 회전이 덜 되는 비율(0.3이면 좌우 속도 차이로 계산한 회전의 70%만 돎.
@@ -50,6 +51,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
     rnd = np.random.RandomState(seed)
     os.makedirs(out_dir, exist_ok=True)
     mat = Mat(mat_path)
+    if floor is not None:
+        mat.floor_bgr = (floor, floor, floor)
     cfg = merge_config(DEFAULT_CONFIG, cfg_override or {})
     clock = SimClock()
     ev_path = os.path.join(out_dir, "events.jsonl")
@@ -60,7 +63,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
     runner = ExploreRunner(cfg, logger, mode=mode,
                            explorer=policy or Explorer(max_laps=max_laps, branch_order=branch_order),
                            speed_mm_s=base * vmax_mm_s, robot_id="sim", map_hint=mat.d["name"],
-                           trace_path=os.path.join(out_dir, "trace.jsonl"))
+                           trace_path=os.path.join(out_dir, "trace.jsonl"), speedcal=speedcal)
     # 실제 속도는 설정값과 조금 다르다(속도 실측 오차 재현)
     true_scale = 1.0 + speed_err * (2 * rnd.rand() - 1)
     if speed_scale is not None:
@@ -83,6 +86,8 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         raw = cv2.VideoWriter(os.path.join(out_dir, "camera.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                               int(round(1 / dt)), (320, 240))
     t = 0.0
+    # 프레임마다 실제 자세(trace.jsonl 줄과 1:1). 도안으로 맵 좌표를 만들 때 씀(mapping/design_map.py)
+    truth = io.open(os.path.join(out_dir, "truth.jsonl"), "w", encoding="utf-8")
     while t < max_time_s and not runner.finished:
         frame = mat.camera_view((x, y, th), CAM)
         frame = np.clip(frame.astype(np.int16) + rnd.normal(0, 4, frame.shape), 0, 255).astype(np.uint8)
@@ -99,6 +104,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         th -= w * dt
         x += v * math.cos(th) * dt
         y += v * math.sin(th) * dt
+        truth.write(u'[%.1f,%.1f,%.5f]\n' % (x, y, th))    # trace.jsonl i번째 줄(이번 명령 뒤 odo)과 짝
         dist += abs(v) * dt
         t += dt
         clock.t += dt
@@ -124,6 +130,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
             vw.write(canvas)
     if not runner.finished:
         runner.stop("sim_timeout")
+    truth.close()
     logger.close()
     if vw is not None:
         vw.release()
@@ -149,6 +156,8 @@ def main():
     ap.add_argument("--mat", default=os.path.join(os.path.dirname(__file__), "mats", "ssafy_mat.json"))
     ap.add_argument("--out", default=os.path.join(ROOT, "data", "sim_run"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--floor", type=int, default=None, help="매트 밖 바닥 밝기(0~255, 기본 90). 실물처럼 어둡게: 55")
+    ap.add_argument("--mode", default="drive", choices=["drive", "lap"], help="lap: 색 보정 전 첫 바퀴(늘 왼쪽)")
     ap.add_argument("--max-time", type=float, default=420.0)
     ap.add_argument("--video", action="store_true", help="카메라 시점+궤적 디버그 영상(run.mp4)")
     ap.add_argument("--raw-video", action="store_true", help="원본 카메라 영상(camera.mp4) - explore.py 재생 시험용")
@@ -165,7 +174,7 @@ def main():
     start = [float(v) for v in a.start.split(",")] if a.start else None
     ev, gt = run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, video=a.video, quiet=not a.verbose,
                  raw_video=a.raw_video, start_pose=start, speed_scale=a.speed_scale, speed_drift=a.speed_drift,
-                 turn_slip=a.turn_slip,
+                 turn_slip=a.turn_slip, mode=a.mode, floor=a.floor,
                  cfg_override={"patch": {"length_mm": a.patch_length}} if a.patch_length else None,
                  branch_order=("right", "left") if a.right_first else ("left", "right"))
     print("events:", ev)

@@ -11,6 +11,10 @@
     # 3) 완전 자율 탐색(다 돌면 출발 패치에서 멈춤)
     python3 -m agv.explore --mode drive --enable-motors --record
 
+    # 색 보정 전 첫 바퀴: 갈림길은 늘 왼쪽(시계 방향이면 바깥 큰 고리), V자는 안 들어감,
+    # 한 바퀴 돌아온 것을 알아보면 스스로 멈춤. 녹화본으로 autocolor
+    python3 -m agv.explore --mode lap --enable-motors --record --view
+
     # 녹화 영상으로 검출만 다시 돌리기(노트북에서도 됨)
     python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4
 
@@ -44,7 +48,7 @@ import time
 
 import cv2
 
-from .hw import JetbotMotors, NullMotors, open_camera
+from .hw import NullMotors, make_motors, open_camera
 from .linecam import DEFAULT_CONFIG, draw_debug, merge_config
 from .runner import ExploreRunner
 from .nav import NavMap, Navigator
@@ -118,6 +122,44 @@ def _nav_rows(nav):
             (u"위치", here)]
 
 
+def _speedcal(a, cfg):
+    if a.speedcal != "auto":
+        return a.speedcal == "on"
+    if a.mode == "lap":
+        on = bool(cfg["patch"].get("autocolor_at"))
+        msg = (u"켬(색 보정 %s)" % cfg["patch"]["autocolor_at"]) if on else \
+            u"끔(아직 색을 안 잡아서. 색 보정 뒤 확인 바퀴에서 켜짐)"
+        print(u"속도 보정: " + msg)
+        return on
+    return None
+
+
+def _offmat_text(an):
+    sides = sorted(getattr(an, "dropped_sides", None) or [])
+    if not sides:
+        return u"-"
+    return u"화면 %s 끝의 어두운 바닥을 라인에서 뺌" % u"·".join({"left": u"왼쪽", "right": u"오른쪽"}[x] for x in sides)
+
+
+def _lost_text(runner):
+    if runner.lost_s <= 0:
+        return u"-"
+    side = getattr(runner, "search_side", None)
+    if side:
+        return u"%.1f초째, 라인이 나간 %s으로 돌며 찾는 중" % (runner.lost_s, {"left": u"왼쪽", "right": u"오른쪽"}[side])
+    return u"%.1f초째" % runner.lost_s
+
+
+def _thr_text(an):
+    if an is None or getattr(an, "v_max", None) is None:
+        return u"-"
+    if an.mat_v is None:
+        return u"%.0f보다 어두우면 (고정값)" % an.v_max
+    if an.line_v is None:
+        return u"%.0f (테이프가 안 보임, 매트 %.0f)" % (an.v_max, an.mat_v)
+    return u"%.0f보다 어두우면 (테이프 %.0f, 매트 %.0f)" % (an.v_max, an.line_v, an.mat_v)
+
+
 def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
     choice = runner.choice or u"-"
     return _nav_rows(nav) + [
@@ -127,9 +169,14 @@ def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
         (u"주행 상태", {"follow": u"라인 추종", "reverse": u"후진(막다른 길)",
                      "pivot": u"제자리 회전", "hold": u"대기",
                      "park": u"스퍼 끝 주차"}.get(runner.state, runner.state)),
-        (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)),
+        (u"갈림길 판정", u"%s / 고른 쪽 %s" % (runner.junc.state, choice)
+         + (u" (늘 %s)" % {"left": u"왼쪽", "right": u"오른쪽"}[runner.lap_side] if a.mode == "lap" else u"")),
         (u"패치", runner.patch.active or u"-"),
-        (u"모터 L / R", u"%.2f / %.2f" % (left, right)),
+        (u"라인 문턱", _thr_text(runner.last_an)),
+        (u"매트 밖 바닥", _offmat_text(runner.last_an)),
+        (u"라인 놓침", _lost_text(runner)),
+        (u"모터 L / R", u"%.2f / %.2f" % (left, right)
+         + (u" (회전 중 멈춤 -> 출력 x%.2f)" % runner.stall.boost if runner.stall.boost > 1.01 else u"")),
         (u"속도 보정", (u"%.0f mm/s (패치 %d번 보정)" % (runner.speed_mm_s, runner.cal.n)) if runner.cal.enabled
          else u"꺼짐 (%.0f mm/s 고정)" % runner.speed_mm_s),
         (u"처리 속도", u"%.1f fps" % fps if fps else u"-"),
@@ -138,7 +185,8 @@ def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["passive", "ask", "drive", "goto"], default="passive")
+    ap.add_argument("--mode", choices=["passive", "ask", "drive", "lap", "goto"], default="passive",
+                    help="lap: 색 보정 전 첫 바퀴(갈림길은 늘 --lap-side 쪽, 한 바퀴 돌면 멈춤)")
     ap.add_argument("--map", default=None, help="goto: 이동에 쓸 맵 JSON(build_map 결과). passive에 주면 위치 추적만")
     ap.add_argument("--to", default=None,
                     help="goto: 목표 노드. 패치 P_<색>이면 패치 가운데, 스퍼 끝 D_<노드>면 스퍼에 들어가 끝에 주차")
@@ -151,6 +199,10 @@ def main(argv=None):
                     help="goto: 탐색한 방향과 반대로 놓았음(--start/--route 첫 노드로 반대 방향에서 다가감)")
     ap.add_argument("--stop-offset", type=float, default=None,
                     help="goto: 목표 패치 앞 가장자리를 본 뒤 더 갈 거리(mm). 기본 patch.length_mm/2, 없으면 80")
+    ap.add_argument("--speedcal", choices=["auto", "on", "off"], default="auto",
+                    help="패치 속도 보정. auto: lap 모드는 색을 잡은 뒤(autocolor --write)에만 켬, 나머지 모드는 켬")
+    ap.add_argument("--lap-side", choices=["left", "right"], default="left",
+                    help="lap 모드에서 갈림길마다 고를 쪽. 매트를 시계 방향으로 돌면 left가 바깥 고리")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
@@ -158,7 +210,8 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="결과 폴더(기본 data/runs/<시각>)")
     ap.add_argument("--record", action="store_true", help="카메라 영상을 camera.mp4로 저장")
     ap.add_argument("--debug-every", type=int, default=20, help="N프레임마다 검출 그림 저장(0이면 끔)")
-    ap.add_argument("--max-time", type=float, default=600.0, help="최대 주행 시간(초)")
+    ap.add_argument("--max-time", type=float, default=None,
+                    help="최대 주행 시간(초). 기본 600, lap 모드는 240(한 바퀴를 못 알아봐도 멈추게)")
     ap.add_argument("--max-laps", type=int, default=6, help="출발 패치를 이만큼 지나면 강제 종료")
     ap.add_argument("--no-arm", action="store_true",
                     help="저장한 카메라 자세(arm.servo_angles)로 팔을 맞추지 않음(기본은 맞춤)")
@@ -172,6 +225,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
+    if a.max_time is None:
+        a.max_time = 240.0 if a.mode == "lap" else 600.0
     video_mode = a.camera.startswith("video:")
     if video_mode and a.mode != "passive":
         print(u"영상 재생은 passive 모드로만 돌려요.")
@@ -230,8 +285,13 @@ def main(argv=None):
     motors = NullMotors()
     run_mode = "drive" if a.mode == "goto" else a.mode
     if a.mode != "passive":
-        motors = JetbotMotors(rob.get("invert_left", False), rob.get("invert_right", False),
-                              rob.get("trim", 0.0))
+        try:
+            motors = make_motors(cfg)
+        except RuntimeError as e:
+            cam.close()
+            print(u"모터를 못 열었어요: %s" % e)
+            return 1
+        print(u"모터: %s" % motors.driver)
 
     # 영상 재생이면 영상 시간으로 기록
     clock = time.time
@@ -263,7 +323,8 @@ def main(argv=None):
                            ask_fn=make_ask_fn(motors, view), speed_mm_s=rob["speed_mm_s"],
                            robot_id=rob.get("id", "agv1"),
                            map_hint=(nav.m.map_id if nav is not None else None),
-                           trace_path=os.path.join(out, "trace.jsonl"))
+                           trace_path=os.path.join(out, "trace.jsonl"), lap_side=a.lap_side,
+                           speedcal=_speedcal(a, cfg))
     _note_camera_calib(cfg, logger, runner)
     if arm_res is not None:
         logger.log("note", runner._odo(), msg="arm_pose", saved=arm_res["saved"], pose=arm_res["pose"],
@@ -368,7 +429,13 @@ def main(argv=None):
         print(u"마지막 위치 추정: %s" % json.dumps(nav.where(), ensure_ascii=False))
         if a.mode == "goto":
             return 0 if runner.finish_reason == "nav_arrived" else 1
-    print(u"맵 만들기: python3 mapping/build_map.py %s -o maps/<이름>.json" % os.path.join(out, "events.jsonl"))
+    if a.mode == "lap":
+        if runner.lap_mm:
+            print(u"한 바퀴를 돌아왔어요(한 바퀴 %.1fm)." % (runner.lap_mm / 1000.0))
+        print(u"색 보정: python3 -m agv.tools.autocolor %s" % out)
+        print(u"이 주행은 색이 안 맞은 상태라 맵을 만들지 않아요.")
+    else:
+        print(u"맵 만들기: python3 mapping/build_map.py %s -o maps/<이름>.json" % os.path.join(out, "events.jsonl"))
     return 0
 
 

@@ -5,6 +5,7 @@
 """
 import os
 import shutil
+import json
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,8 @@ except ImportError:  # Jetson에 sim/mat/이 없으면 건너뜀
 
 from agv.linecam import DEFAULT_CONFIG, JunctionTracker, PatchTracker, analyze  # noqa: E402
 from agv.topo import build_map, read_events  # noqa: E402
+from agv.runner import STALL_DEFAULT  # noqa: E402
+STALL_MAX_OUT = STALL_DEFAULT["max_out"]
 
 MAT = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_mat.json")
 MAT_V2 = os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2_fix.json")
@@ -86,6 +89,177 @@ class TestPerception(unittest.TestCase):
 
 
 @unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestOffMatFloor(unittest.TestCase):
+    """매트 가장자리 밖 어두운 바닥이 화면 옆에 보이면 라인으로 치지 않는다(실물 화면에서 생긴 문제)."""
+
+    @staticmethod
+    def _frame(floor=True, curve=False):
+        import cv2
+        import numpy as np
+        im = np.full((240, 320, 3), (150, 150, 160), np.uint8)            # 매트(실물처럼 좀 어두움)
+        if floor:
+            cv2.fillPoly(im, [np.array([[0, 0], [25, 0], [45, 240], [0, 240]])], (60, 58, 62))   # 바닥
+        if curve:
+            cv2.ellipse(im, (330, 240), (150, 180), 0, 180, 270, (30, 30, 30), 20)  # 오른쪽으로 나가는 곡선
+        else:
+            cv2.line(im, (175, 0), (175, 240), (30, 30, 30), 22)              # 검은 테이프
+        return im
+
+    def test_floor_at_left_edge_is_ignored(self):
+        an = analyze(self._frame(), DEFAULT_CONFIG)
+        self.assertEqual(an.dropped_sides, {"left"})
+        self.assertTrue(all(len(xs) == 1 and abs(xs[0] - 175) < 3 for _, xs in an.rows))
+
+    def test_line_leaving_frame_is_kept(self):
+        an = analyze(self._frame(floor=False, curve=True), DEFAULT_CONFIG)
+        self.assertEqual(an.dropped_sides, set())
+        self.assertTrue(all(len(xs) == 1 for _, xs in an.rows))
+
+
+class TestLostLineAtCorner(unittest.TestCase):
+    """급커브에서 라인이 화면 옆으로 나가면, 먼 줄·반대편 끝에 보이는 매트 밖 바닥을 라인으로 잡지 않고
+    라인이 나간 쪽으로 제자리 회전해 다시 찾는다(실물 주행에서 바깥 코너마다 바닥 쪽으로 돌던 문제)."""
+
+    @staticmethod
+    def _frame(line_x=None, floor=True):
+        import cv2
+        import numpy as np
+        im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+        if floor:   # 매트 끝 너머 바닥이 화면 위쪽(먼 줄)에 오른쪽 끝까지 보임
+            cv2.fillPoly(im, [np.array([[110, 0], [320, 0], [320, 105], [150, 105]])], (60, 58, 62))
+        if line_x is not None:
+            cv2.line(im, (int(line_x), 240), (int(line_x) - 40, 110), (30, 30, 30), 22)
+        return im
+
+    def _cfg(self):
+        from agv.linecam import merge_config
+        return merge_config(DEFAULT_CONFIG, {"stall": {"enabled": False}})   # 그린 화면은 회전해도 안 바뀜
+
+    def test_follower_ignores_floor_after_line_leaves(self):
+        from agv.linecam import Follower
+        cfg = self._cfg()
+        f = Follower(cfg)
+        for x in (160, 120, 80, 50, 30):
+            self.assertIsNotNone(f.target(analyze(self._frame(x, floor=False), cfg)))
+        an = analyze(self._frame(None), cfg)
+        self.assertTrue(any(an.raw[i] for i in range(an.ctrl_idx)))     # 먼 줄에 바닥 조각이 보이지만
+        self.assertIsNone(f.target(an))                                  # 라인으로 치지 않음
+        self.assertEqual(f.edge_side(an.w), "left")
+        self.assertIsNotNone(f.target(analyze(self._frame(25), cfg), near_only=True))   # 왼쪽에서 다시 들어오면 잡음
+
+    def test_thin_patch_edge_is_not_the_line(self):
+        """어두운 조명에서 파란 패치 가장자리가 가는 어두운 띠로 잡히고, 라인이 옆 가지와 붙어 화면 끝까지 넓어져
+        매트 밖 바닥으로 빠지는 순간 그 띠로 넘어가 제자리에서 돌던 문제(실물 주행)."""
+        import cv2
+        import numpy as np
+        from agv.linecam import Follower
+        cfg = self._cfg()
+        f = Follower(cfg)
+
+        def frame(tape_top):
+            im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+            cv2.rectangle(im, (276, 0), (287, 239), (55, 55, 58), -1)            # 가는 띠(패치 가장자리)
+            cv2.rectangle(im, (148, tape_top), (184, 239), (25, 25, 25), -1)      # 테이프
+            return im
+        for _ in range(3):
+            an = analyze(frame(0), cfg)
+            x = f.target(an, lw=36.0)
+            self.assertAlmostEqual(x, 166, delta=3)
+        an = analyze(frame(205), cfg)                                            # 조향 줄에서 테이프가 안 보임
+        self.assertTrue(any(a > 260 for a, b in an.raw[an.ctrl_idx]), an.raw[an.ctrl_idx])
+        x = f.target(an, lw=36.0)
+        self.assertAlmostEqual(x, 166, delta=3)                                  # 아래 줄의 테이프를 계속 따라감
+
+    def _runner(self, tmp):
+        from agv.runner import ExploreRunner
+        from agv.topo import EventLogger, Explorer
+        ev = os.path.join(tmp, "events.jsonl")
+        return ExploreRunner(self._cfg(), EventLogger(ev, echo=False), mode="drive", explorer=Explorer()), ev
+
+    def test_runner_pivots_toward_last_side_then_rejoins(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for x in (160, 140, 110, 80, 50, 30):
+                r.step(self._frame(x, floor=False), 0.05)
+            w = r.rc["pivot_speed"]
+            cmds = [r.step(self._frame(None), 0.05) for _ in range(30)]          # 1.5초 못 봄(보통은 1초면 정지)
+            self.assertFalse(r.finished)
+            self.assertTrue(all(c == (-w, w) for c in cmds), cmds[:3])            # 왼쪽으로 제자리 회전
+            left, right = r.step(self._frame(40), 0.05)
+            self.assertGreater(left + right, 0.1)                                  # 다시 앞으로 따라감
+            r._finish("test")
+            msgs = [json.loads(l).get("msg") for l in open(ev)]
+            self.assertIn("line_search", msgs)
+            self.assertIn("line_search_done", msgs)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_runner_search_gives_up(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for x in (160, 120, 80, 50, 30):
+                r.step(self._frame(x, floor=False), 0.05)
+            for _ in range(int(r.cfg["follow"]["search_timeout_s"] / 0.05) + 2):
+                r.step(self._frame(None), 0.05)
+            self.assertTrue(r.finished)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_lost_in_middle_keeps_old_behavior(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            r, ev = self._runner(tmp)
+            for _ in range(5):
+                r.step(self._frame(185, floor=False), 0.05)
+            c = r.step(self._frame(None, floor=False), 0.05)
+            self.assertGreater(c[0] + c[1], 0)                                     # 관성으로 조금 더 감
+            for _ in range(21):
+                r.step(self._frame(None, floor=False), 0.05)
+            self.assertTrue(r.finished)                                            # 1초 뒤 정지
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestStallGuard(unittest.TestCase):
+    """도는 명령인데 화면이 그대로면(실물에서 회전 중 궤도가 멈춤) 출력을 올린다. 직진·움직이는 화면에서는 안 올림."""
+
+    def _frames(self, moving):
+        import numpy as np
+        rnd = np.random.RandomState(0)
+        base = rnd.randint(90, 160, (240, 320, 3)).astype(np.uint8)
+        for i in range(40):
+            yield np.roll(base, 6 * i, axis=1) if moving else base
+
+    def test_boost_only_when_turning_and_static(self):
+        from agv.runner import STALL_DEFAULT, StallGuard
+        for moving, cmd, expect in ((False, (0.45, -0.07), True), (True, (0.45, -0.07), False),
+                                    (False, (0.3, 0.3), False)):
+            g = StallGuard(dict(STALL_DEFAULT))
+            b = [g.update(f, cmd) for f in self._frames(moving)][-1]
+            self.assertEqual(b > 1.3, expect, (moving, cmd, b))
+
+    def test_runner_scales_output_but_not_odometry(self):
+        import numpy as np
+        from agv.runner import ExploreRunner
+        from agv.topo import EventLogger, Explorer
+        tmp = tempfile.mkdtemp()
+        try:
+            ev = os.path.join(tmp, "e.jsonl")
+            r = ExploreRunner(DEFAULT_CONFIG, EventLogger(ev, echo=False), mode="drive", explorer=Explorer())
+            im = np.full((240, 320, 3), (150, 150, 160), np.uint8)
+            import cv2
+            cv2.line(im, (300, 240), (300, 0), (25, 25, 25), 22)          # 선이 오른쪽 끝: 크게 오른쪽으로 꺾는 명령
+            outs = [r.step(im, 0.05) for _ in range(40)]
+            self.assertGreater(outs[-1][0], r.last_cmd[0] * 1.3)          # 실제로 낸 명령은 올라감
+            self.assertLessEqual(outs[-1][0], STALL_MAX_OUT)
+            r._finish("test")
+            self.assertIn("stall_boost", [json.loads(l).get("msg") for l in open(ev)])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestSimExploration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -232,7 +406,9 @@ class TestAutoColor(unittest.TestCase):
         Mat.camera_view = warm
         try:
             lap = os.path.join(self.tmp, "lap")
-            run_sim.run(MAT_V2, lap, seed=3, max_time_s=75, raw_video=True)
+            # 현장 순서 그대로: 색이 안 맞는 상태에서 lap 모드로 한 바퀴(늘 왼쪽, 스스로 멈춤)
+            _, gt_lap = run_sim.run(MAT_V2, lap, seed=3, max_time_s=240, raw_video=True, mode="lap")
+            self.assertEqual(gt_lap["finish_reason"], "lap_closed")
             cap = cv2.VideoCapture(os.path.join(lap, "camera.mp4"))
             frames = []
             while True:
@@ -255,6 +431,32 @@ class TestAutoColor(unittest.TestCase):
         m = build_map([read_events(ev)])
         self.assertEqual(len([n for n in m["nodes"] if n["type"] == "patch"]), 6)
         self.assertTrue(m["explore"]["complete"])
+
+    def test_lap_mode_passes_all_patches(self):
+        """lap 모드: 갈림길마다 왼쪽, V자는 안 들어감 -> 바깥 큰 고리로 패치 여섯 개를 다 지나고,
+        갈라짐·합류·교차 순서가 되풀이되는 것을 보고 한 바퀴 남짓에서 멈춘다."""
+        import numpy as np
+        out = os.path.join(self.tmp, "lap")
+        ev, gt = run_sim.run(MAT_V2, out, seed=1, max_time_s=240, mode="lap", turn_slip=0.3, speed_scale=0.9)
+        self.assertEqual(gt["finish_reason"], "lap_closed")
+        P = np.array(gt["trajectory"])
+        passed = [p["color"] for p in gt["patches"] if np.min(np.hypot(*(P - np.array(p["center"])).T)) < 60]
+        self.assertEqual(sorted(passed), sorted(p["color"] for p in gt["patches"]))
+        lap = [e for e in read_events(ev) if e.get("msg") == "lap_closed"][0]["lap_mm"]
+        odo_true = gt["odo_true"][-1][1]
+        self.assertLess(odo_true, 2.0 * lap * 0.9)          # 두 바퀴 전에 멈춤(속도 보정 없이 설정 속도가 10% 큼)
+        self.assertFalse(any(e["type"] == "split" and e.get("vee") and e.get("choice") == e["vee"].get("side")
+                             for e in read_events(ev)))        # V자로 들어가지 않음
+
+    def test_lap_mode_with_speedcal(self):
+        """색을 잡은 뒤 확인 바퀴: 속도 보정이 켜져 속도 추정이 중간에 20% 바뀌어도 한 바퀴를 알아본다."""
+        ev, gt = run_sim.run(MAT_V2, os.path.join(self.tmp, "lap2"), seed=2, max_time_s=240, mode="lap",
+                             speedcal=True, speed_scale=0.8, cfg_override={"patch": {"length_mm": 159.3}})
+        self.assertEqual(gt["finish_reason"], "lap_closed")
+        E = read_events(ev)
+        self.assertGreaterEqual(sum(e.get("msg") == "speed_cal" and e.get("ok", True) for e in E), 3)
+        lap = [e for e in E if e.get("msg") == "lap_closed"][0]["lap_mm"]
+        self.assertAlmostEqual(lap / 4250.0, 1.0, delta=0.08)   # ssafy_v2 바깥 고리 약 4.25m
 
     def test_names_follow_hue_order(self):
         from agv.tools.autocolor import _assign_names, _range_center
@@ -366,3 +568,32 @@ class TestShapeFromTrace(unittest.TestCase):
         self.assertLess(np.sqrt(np.mean(err ** 2)), 50.0, err)
         d = to_agv_map_v1(m, shape=res)
         self.assertEqual((d["pos_source"], twin_problems(d)), ("odometry", []))
+
+
+@unittest.skipIf(run_sim is None, "sim/mat/ 없음")
+class TestDesignMap(unittest.TestCase):
+    """도안(가상 매트)으로 실제 매트 맵 만들기: 위상은 시뮬레이터 탐색, 좌표·곡선은 도안 정답."""
+
+    def test_design_map(self):
+        import math
+        sys.path.insert(0, os.path.join(ROOT, "mapping"))
+        import design_map
+        from agv.topo import twin_problems
+        doc, m = design_map.build(MAT_V2, "mat_test", seeds=[0], quiet=True)
+        self.assertEqual(doc["pos_source"], "design")
+        self.assertEqual(twin_problems(doc), [])
+        self.assertTrue(m["explore"]["complete"])
+        with open(MAT_V2) as f:
+            design = json.load(f)
+        P = dict((n["id"], (n["x"], n["y"])) for n in doc["nodes"])
+        c0 = [p["center"] for p in design["patches"] if p["color"] == "orange"][0]
+        for p in design["patches"]:                       # 패치는 도안 가운데 그대로(원점 주황, y는 오른쪽 +)
+            x, y = P["P_" + p["color"]]
+            self.assertAlmostEqual(x * 1000, p["center"][0] - c0[0], delta=1.0)
+            self.assertAlmostEqual(-y * 1000, p["center"][1] - c0[1], delta=1.0)
+        # S자 선이 아래 선 밑으로 내려가는 곳(도안 최저점 y=124mm)을 곡선이 따라감
+        dip = min(c0[1] - q["y"] * 1000 for e in doc["edges"] if e["type"] == "main" for q in e["points"])
+        self.assertLess(dip, 150.0)
+        self.assertTrue(all(len(e["points"]) > 0 for e in doc["edges"]
+                            if e["type"] == "main" and e["length_m"] > 0.25))
+        self.assertTrue(all(not math.isnan(n["x"]) for n in doc["nodes"]))

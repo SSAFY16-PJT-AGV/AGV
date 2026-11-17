@@ -417,3 +417,65 @@ class TestShape(unittest.TestCase):
         res, why = estimate_shape(m, {"r": tr})
         self.assertIsNone(res)
         self.assertTrue(why)
+
+
+class TestLapWatch(unittest.TestCase):
+    """색 없이 한 바퀴 알아보기: 갈라짐·합류·교차의 순서와 간격이 되풀이되면 멈춘다."""
+
+    LAP = [("split", 300), ("merge", 650), ("split", 900), ("merge", 1000), ("split", 1800),
+           ("cross", 2100), ("cross", 2350), ("merge", 2700)]
+    PER = 4250.0
+
+    def _feed(self, w, laps, drop=(), noise=0.0, extra=()):
+        import random
+        rnd = random.Random(0)
+        for lap in range(laps):
+            for i, (t, d) in enumerate(self.LAP):
+                if (lap, i) in drop:
+                    continue
+                r = w.add(t, lap * self.PER + d + rnd.uniform(-noise, noise))
+                if r is not None:
+                    return r, lap, i
+                for lt, li, et, ed in extra:
+                    if (lt, li) == (lap, i):
+                        w.add(et, lap * self.PER + ed)
+        return None
+
+    def test_closes_after_one_lap(self):
+        from agv.runner import LapWatch
+        r = self._feed(LapWatch(), 3, noise=20.0)
+        self.assertIsNotNone(r)
+        lap, at_lap, at_i = r
+        self.assertAlmostEqual(lap, self.PER, delta=60)
+        self.assertEqual(at_lap, 1)
+
+    def test_missed_event_in_first_lap(self):
+        from agv.runner import LapWatch
+        r = self._feed(LapWatch(), 3, drop=[(0, 0)])            # 첫 갈라짐을 놓침
+        self.assertIsNotNone(r)
+        self.assertAlmostEqual(r[0], self.PER, delta=60)
+        self.assertEqual(r[1], 1)
+
+    def test_dead_end_split_removed_and_tee_ignored(self):
+        from agv.runner import LapWatch
+        w = LapWatch()
+        # 첫 바퀴에 스퍼(갈라짐)로 들어갔다 되돌아 나오고, 둘째 바퀴엔 tee로 보임
+        self.assertIsNone(w.add("split", 100))
+        self.assertIsNone(w.add("dead_end", 300))
+        r = None
+        for lap in range(3):
+            if lap > 0:
+                w.add("tee", lap * self.PER + 100)
+            for t, d in self.LAP:
+                r = w.add(t, lap * self.PER + d)
+                if r is not None:
+                    break
+            if r is not None:
+                break
+        self.assertAlmostEqual(r, self.PER, delta=1)
+
+    def test_no_false_close_within_lap(self):
+        from agv.runner import LapWatch
+        w = LapWatch()
+        for t, d in self.LAP:
+            self.assertIsNone(w.add(t, d))

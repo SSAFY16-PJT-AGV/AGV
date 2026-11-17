@@ -8,6 +8,11 @@
     ask      자율 주행하되 갈림길에서 멈추고 사람에게 방향을 묻는다(분기 선택이 불안할 때).
     passive  모터를 쓰지 않는다. 손으로 밀거나 다른 프로그램으로 조종하면서 검출·기록만 한다.
              이동거리를 모르므로 odo_mm은 null(빌더가 시간 x 속도로 대신 계산).
+    lap      색 보정 전 첫 바퀴용. 갈림길은 늘 lap_side(기본 왼쪽)로, 급한 가지(V자)는 들어가지 않는다.
+             매트를 시계 방향으로 돌면 바깥 큰 고리가 왼쪽이라 패치를 다 지난다. 막다른 길에 들어가면
+             되돌아 나온다. 패치 색을 아직 모르므로 패치로 끝을 판단하지 않고, 갈라짐·합류·교차가
+             나온 순서와 간격이 앞에서와 똑같이 되풀이되면(= 한 바퀴를 돌아옴) 멈춘다(LapWatch).
+             색을 잡은 뒤의 확인 바퀴에도 쓴다(speedcal=True로 속도 보정을 켬).
 
 X자 교차 처리
     merge가 나면 바로 기록하지 않고 잠시 보류한다(pending). 보류 중 나온 패치·스퍼 이벤트도
@@ -65,12 +70,120 @@ X자 교차 처리
 import collections
 import io
 import json
+import cv2
+import numpy as np
 
 from .linecam import Follower, JunctionTracker, PatchTracker, TeeTracker, analyze
 from .speedcal import SpeedCal
 from .topo import Explorer
 
-MODES = ("drive", "ask", "passive")
+MODES = ("drive", "ask", "passive", "lap")
+
+
+class LapWatch(object):
+    """색 없이 한 바퀴를 알아보기. 갈라짐(J)·합류(M)·교차(X) 이벤트의 종류와 간격이 앞에서 나온
+    어떤 구간과 k개 연속으로 똑같이 다시 나오고, 그 사이가 min_lap_mm 이상이면 한 바퀴를 돈 것으로 본다.
+    - 옆으로 짧게 나간 스퍼(tee)는 지날 때마다 보이기도 안 보이기도 해서 세지 않는다.
+    - 들어갔다 되돌아 나온 막다른 길의 갈라짐은 지운다(다음 바퀴엔 tee로 나옴).
+    - 앞부분에서 한두 개를 놓쳐도 되도록 처음 k개가 아니라 앞의 모든 구간과 비교한다.
+    반환: 한 바퀴 길이(mm) 또는 None."""
+
+    TOKENS = {"split": "J", "merge": "M", "cross": "X"}
+
+    def __init__(self, k=5, min_lap_mm=1500.0, tol_rel=0.15, tol_mm=80.0):
+        self.k, self.min_lap, self.tol_rel, self.tol_mm = k, min_lap_mm, tol_rel, tol_mm
+        self.seq = []
+
+    def add(self, type_, pos, fields=None):
+        if type_ == "dead_end":
+            if self.seq and self.seq[-1][0] == "J":
+                self.seq.pop()
+            return None
+        tok = self.TOKENS.get(type_)
+        if tok is None or pos is None:
+            return None
+        self.seq.append((tok, float(pos)))
+        k = self.k
+        n = len(self.seq)
+        if n < 2 * k:
+            return None
+        last = self.seq[-k:]
+        toks = [t for t, _ in last]
+        for i in range(0, n - 2 * k + 1):
+            win = self.seq[i:i + k]
+            lap = last[0][1] - win[0][1]
+            if lap < self.min_lap or [t for t, _ in win] != toks:
+                continue
+            ok = True
+            for j in range(k - 1):
+                g0 = win[j + 1][1] - win[j][1]
+                g1 = last[j + 1][1] - last[j][1]
+                if abs(g1 - g0) > max(self.tol_mm, self.tol_rel * abs(g0)):
+                    ok = False
+                    break
+            if ok:
+                return lap
+        return None
+
+
+class StallGuard(object):
+    """돌라고 명령하는데 화면이 그대로면(궤도가 미끄러지지 못하고 모터가 멈춤) 모터 출력을 조금씩 올린다.
+
+    실물 주행 세 번 모두, 바깥 궤도 0.4~0.6 / 안쪽 궤도 -0.2~0.1로 도는 명령에서 로봇이 멈춰 있었다
+    (화면 변화가 정지 상태 수준). 직진(0.3/0.3)은 잘 갔다. 궤도 차량은 제자리·급회전에서 바닥과 비벼야 해서
+    힘이 더 든다. 좌우 명령 차이가 클 때만 본다(곧은 선 위 직진은 화면이 거의 안 바뀌어도 정상)."""
+
+    def __init__(self, c):
+        self.c = c
+        self.prev = None
+        self.hist = []
+        self.boost = 1.0
+        self.stalled = False
+
+    def motion(self, frame):
+        g = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (80, 60), interpolation=cv2.INTER_AREA)
+        g = g.astype(np.float32)
+        d = None if self.prev is None else float(np.abs(g - self.prev).mean())
+        self.prev = g
+        return d
+
+    def update(self, frame, cmd):
+        """frame: 이번 프레임(직전 명령의 결과), cmd: 직전 명령. 반환: 이번 명령에 곱할 배율."""
+        c = self.c
+        d = self.motion(frame)
+        if not c.get("enabled", True) or d is None:
+            return self.boost
+        turning = abs(cmd[0] - cmd[1]) >= c["turn_diff"] and max(abs(cmd[0]), abs(cmd[1])) >= c["min_cmd"]
+        if not turning:
+            self.hist = []
+            self.stalled = False
+            self.boost = max(1.0, self.boost - c["down"])
+            return self.boost
+        self.hist = (self.hist + [d])[-c["frames"]:]
+        med = float(np.median(self.hist))
+        if len(self.hist) >= c["frames"] and med < c["motion_thr"]:
+            self.stalled = True
+            self.boost = min(c["max_boost"], self.boost + c["up"])
+        else:
+            self.stalled = False
+            if med >= 1.5 * c["motion_thr"]:
+                self.boost = max(1.0, self.boost - c["down"])
+        return self.boost
+
+
+STALL_DEFAULT = {
+    "enabled": True,
+    "turn_diff": 0.2,       # 좌우 명령 차이가 이 이상일 때만 멈춤을 본다
+    "min_cmd": 0.15,
+    "frames": 10,           # 이만큼(0.5초) 화면 변화 중앙값이
+    "motion_thr": 0.3,      # 이보다 작으면 멈춘 것(80x60 회색 평균 밝기 차. 멈춤 0.05~0.3, 움직임 0.5 이상)
+    "up": 0.05,             # 멈춰 있는 동안 프레임마다 배율을 이만큼 올림
+    "down": 0.01,           # 움직이면 프레임마다 이만큼 내림(필요한 힘 근처에 머물게 천천히)
+    "max_boost": 1.8,
+    "max_out": 0.95,        # 올린 뒤 모터 명령 최댓값
+}
+
+
 OPP = {"left": "right", "right": "left"}
 RECOVER_DEFAULT = {
     "window_mm": 600,        # 갈림길에서 고른 뒤 이 거리 안에서 선이 끝나면 막다른 길
@@ -90,8 +203,13 @@ RECOVER_DEFAULT = {
 
 class ExploreRunner(object):
     def __init__(self, cfg, logger, mode="drive", explorer=None, ask_fn=None,
-                 speed_mm_s=150.0, robot_id="agv1", map_hint=None, trace_path=None):
+                 speed_mm_s=150.0, robot_id="agv1", map_hint=None, trace_path=None, lap_side="left",
+                 speedcal=None):
         assert mode in MODES
+        assert lap_side in ("left", "right")
+        self.lap_side = lap_side
+        self.lap = LapWatch() if mode == "lap" else None
+        self.lap_mm = None
         self.cfg = cfg
         self.log = logger
         self.mode = mode
@@ -101,6 +219,11 @@ class ExploreRunner(object):
         self.cal = SpeedCal(cfg, speed_mm_s)
         if mode == "passive":
             self.cal.enabled = False          # 손으로 밀 때는 모터 명령이 없음
+        if mode == "lap" and speedcal is None:
+            self.cal.enabled = False          # 첫 바퀴는 패치 색이 안 맞아 패치 가장자리를 믿을 수 없음
+        if speedcal is not None and mode != "passive":
+            self.cal.enabled = bool(speedcal)
+        self.speed0 = float(speed_mm_s)       # 한 바퀴 알아보기(LapWatch)는 속도 보정과 상관없는 거리로
         self.u = 0.0                          # 적분한 모터 명령(기본 속도로 달린 초)
         self.yaw_mm = 0.0                     # 좌우 명령 차이 적분(mm). 회전각 = yaw_mm / 실효 궤도 폭
         self.pivot_yaw_mm = 0.0               # 그중 제자리 회전 몫
@@ -141,6 +264,12 @@ class ExploreRunner(object):
         self.suppress_until = -1e9  # 되돌아 나온 직후 같은 갈림길을 다시 잡지 않게
         self.lost_s = 0.0
         self.lost_logged = False
+        self.search_side = None     # 라인을 찾아 제자리 회전 중인 방향
+        sc = dict(STALL_DEFAULT)
+        sc.update(cfg.get("stall") or {})
+        self.stall = StallGuard(sc)
+        self._sent = (0.0, 0.0)     # 직전 프레임에 낸 명령(배율 적용 전)
+        self._stall_logged = False
         self.finished = False
         self.finish_reason = None
         self.last_an = None
@@ -184,9 +313,20 @@ class ExploreRunner(object):
         if ev.get("decision") is not None:
             ev["decision"]["seq"] = logged["seq"]
         p = ev["pos"]
+        if self.lap is not None:
+            # 모터 명령 적분(u) 기준 거리: 속도 보정으로 speed_mm_s가 바뀌어도 첫 바퀴와 간격이 같게
+            p_u = (self.u - (self.odo - p) / max(self.speed_mm_s, 1.0)) * self.speed0
+            lap = self.lap.add(ev["type"], p_u)
+            if lap is not None:
+                lap = lap * self.speed_mm_s / self.speed0     # 지금 속도 보정값으로 mm 환산
+                self.log.log("note", self._odo(), msg="lap_closed", lap_mm=round(lap, 1),
+                             tokens=u"".join(t for t, _ in self.lap.seq))
+                self.lap_mm = lap
+                self._finish("lap_closed")
+                return
         if ev["type"] == "patch":
             self.ex.on_patch(ev["fields"]["color"], p)
-            if self.ex.done and self.mode != "passive":
+            if self.ex.done and self.mode not in ("passive", "lap"):   # lap은 색을 아직 몰라 패치로 끝내지 않음
                 self._finish("explore_" + str(self.ex.done_reason))
         elif ev["type"] == "merge":
             self.ex.on_merge(p)
@@ -376,14 +516,26 @@ class ExploreRunner(object):
         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
         if self.finished:
             return 0.0, 0.0
-        pivot = self.state == "pivot"
+        was_pivot = self.state == "pivot"
+        boost = self.stall.update(frame, self._sent) if self.mode != "passive" else 1.0
+        if self.stall.stalled and not self._stall_logged and boost >= 1.2:
+            self._stall_logged = True
+            self.log.log("note", self._odo(), msg="stall_boost", boost=round(boost, 2), cmd=[round(v, 2) for v in self._sent])
+        elif not self.stall.stalled:
+            self._stall_logged = False
         left, right = self._step(frame, dt)
+        # 이번 명령이 제자리 회전인지(막다른 길 복귀 회전, 라인 찾기 회전): 회전 궤도폭을 따로 추정함
+        pivot = was_pivot or (self.search_side is not None and self.lost_s > 0)
         if self.mode != "passive":
             dy = self.speed_mm_s * (left - right) / self.cfg["follow"]["base_speed"] * dt
             self.yaw_mm += dy
             if pivot:
                 self.pivot_yaw_mm += dy
         self._write_trace()
+        self._sent = (left, right)
+        if boost > 1.0 and (left or right):
+            m = self.stall.c["max_out"]
+            return max(-m, min(m, left * boost)), max(-m, min(m, right * boost))
         return left, right
 
     def _write_trace(self):
@@ -567,6 +719,8 @@ class ExploreRunner(object):
             self.choice = suggestion
         elif self.mode == "ask" and self.ask_fn is not None:
             self.choice = self.ask_fn(suggestion) or suggestion
+        elif self.mode == "lap":
+            self.choice = self.lap_side
         else:
             self.choice = suggestion
         self.choice_t = self.t
@@ -599,6 +753,8 @@ class ExploreRunner(object):
                     u"오른쪽" if side == "right" else u"왼쪽")) or suggestion
             except TypeError:
                 choice = self.ask_fn(suggestion) or suggestion
+        elif self.mode == "lap":
+            choice = "left" if side == "right" else "right"     # 급한 가지는 들어가지 않음
         else:
             choice = suggestion
         self.vee_mute_until = j_pos + 120.0
@@ -614,10 +770,18 @@ class ExploreRunner(object):
 
     def _drive(self, an, dt):
         self.t += dt
-        x = self.follow.target(an, self.choice, self.junc.lw)
+        x = self.follow.target(an, self.choice, self.junc.lw, near_only=bool(self.search_side))
+        fc = self.cfg["follow"]
         if x is None:
+            if self.lost_s == 0.0 and self.mode != "passive":
+                # 급커브로 라인이 화면 옆으로 나갔으면 그쪽으로 제자리 회전하며 찾는다
+                self.search_side = self.follow.edge_side(an.w)
+                if self.search_side:
+                    self.log.log("note", self._odo(), msg="line_search", dir=self.search_side,
+                                 last_x=round(self.follow.last_x, 1))
             self.lost_s += dt
-            if self.lost_s >= self.cfg["follow"]["lost_timeout_s"] and not self.lost_logged:
+            limit = fc.get("search_timeout_s", 4.0) if self.search_side else fc["lost_timeout_s"]
+            if self.lost_s >= limit and not self.lost_logged:
                 self.lost_logged = True
                 self._flush_pending()
                 self.log.log("gap", self._odo(), reason="line_lost")
@@ -626,6 +790,11 @@ class ExploreRunner(object):
                     self._finish("line_lost")
                     return 0.0, 0.0
         else:
+            if self.search_side:
+                self.log.log("note", self._odo(), msg="line_search_done", dir=self.search_side,
+                             s=round(self.lost_s, 2))
+                self._reset_tracking()
+                self.search_side = None
             self.lost_s = 0.0
             self.lost_logged = False
 
@@ -634,7 +803,10 @@ class ExploreRunner(object):
             # 명목 속도만큼 늘린다.
             self.odo += self.speed_mm_s * dt
             return 0.0, 0.0
-        if x is None and self.lost_s > 0:
+        if x is None and self.search_side:
+            w = self.rc["pivot_speed"]
+            left, right = (-w, w) if self.search_side == "left" else (w, -w)
+        elif x is None and self.lost_s > 0:
             left, right = self.last_cmd[0] * 0.8, self.last_cmd[1] * 0.8  # 잠깐 놓치면 관성 유지
         else:
             left, right = self.follow.command(x, an.w, dt)
@@ -676,11 +848,13 @@ class ExploreRunner(object):
         rows = an.raw
         far_empty = all(len(rows[i]) == 0 for i in range(an.ctrl_idx + 1))
         near = [r for i in range(an.ctrl_idx + 1, len(rows)) for r in rows[i]]
-        ended = far_empty and len(near) > 0
+        # 선이 화면 옆으로 나가며 사라지면(급커브) 선 끝이 아니다: 라인 찾기 회전이 맡는다
+        sideways = self.follow.edge_side(an.w) is not None
+        ended = far_empty and len(near) > 0 and not sideways
         empty = all(len(r) == 0 for r in rows)
         # 선 끝이 아래쪽 줄을 다 지나 화면에서 사라져도, 끝이 지나가는 중이었으면 이어서 센다
         ended = ended or (empty and self._end_n > 0 and not self._end_lost)
-        lost = empty and self.lost_s + dt >= 0.3
+        lost = empty and self.lost_s + dt >= 0.3 and not sideways
         if ended or lost:
             if self._end_n == 0:
                 self._end_odo = self.odo       # 선 끝이 조향 줄을 처음 지난 순간(확정은 몇 프레임 뒤)
@@ -736,6 +910,7 @@ class ExploreRunner(object):
         turn = 0.0
         if x0 is not None:
             self.follow.last_x = x0
+            self.follow.missed = 0
             k = 3
             x1 = self._line_at(an, max(0, an.ctrl_idx - k), x0)
             e = (x0 - an.w / 2.0) / (an.w / 2.0)
@@ -796,9 +971,22 @@ class ExploreRunner(object):
             return w, -w
         return -w, w
 
+    def _reset_tracking(self):
+        """제자리 회전 뒤 라인을 다시 잡았을 때: 회전 중 본 모양으로 갈림길·스퍼를 잘못 내지 않게 판정 상태를 비운다."""
+        self.follow.prev_err = None
+        self.junc.state = "one"
+        self.junc.in_split = False
+        self.junc._pend = 0
+        self.junc._gaps = []
+        self.junc._pair_slopes = []
+        self.tee.armed = False
+        self.tee._off = 0
+        self.suppress_until = self.odo + self.rc["suppress_mm"]
+
     def _rejoin(self, an, x):
         self.state = "follow"
         self.follow.last_x = float(x)
+        self.follow.missed = 0
         self.follow.prev_err = 0.0
         self.junc.state = "one"
         self.junc.in_split = False
@@ -813,6 +1001,7 @@ class ExploreRunner(object):
             self.patch.active = best
         self.suppress_until = self.odo + self.rc["suppress_mm"]
         self.lost_s = 0.0
+        self.search_side = None
         kind = self._piv.get("kind", "recover")
         self.choice = None
         self.split_onset = None

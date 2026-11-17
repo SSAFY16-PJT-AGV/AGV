@@ -708,6 +708,7 @@ class TestExploreCliGoto(unittest.TestCase):
 
         class Motors(object):
             l = r = 0.0
+            driver = "fake"
 
             def __init__(self, *a, **k):
                 pass
@@ -737,16 +738,16 @@ class TestExploreCliGoto(unittest.TestCase):
             def close(self):
                 pass
 
-        saved = (ex.open_camera, ex.JetbotMotors, ex.time.time, ex.time.sleep)
+        saved = (ex.open_camera, ex.make_motors, ex.time.time, ex.time.sleep)
         ex.open_camera = lambda *a, **k: Cam()
-        ex.JetbotMotors = Motors
+        ex.make_motors = Motors
         ex.time.time = lambda: clock["t"]
         ex.time.sleep = lambda s: None
         try:
             rc = ex.main(args + ["--map", SIM_MAP, "--out", os.path.join(self.tmp, "run"), "--no-arm",
                                  "--debug-every", "0", "--max-time", "120", "--enable-motors"])
         finally:
-            ex.open_camera, ex.JetbotMotors, ex.time.time, ex.time.sleep = saved
+            ex.open_camera, ex.make_motors, ex.time.time, ex.time.sleep = saved
         with io.open(os.path.join(self.tmp, "run", "events.jsonl"), encoding="utf-8") as f:
             evs = [json.loads(l) for l in f]
         return rc, evs, pose
