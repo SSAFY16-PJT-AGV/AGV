@@ -243,6 +243,44 @@ WebSocket 연결과 `AGV_01`, `AGV_02` 수신 로그를 확인한다.
 Unreal이 실제로 읽는 맵과 같은 파일을 지정해야 한다. C드라이브 공간이
 부족하다면 `--ddc-path`로 존재하는 D드라이브의 Unreal 캐시 폴더를 지정한다.
 
+### 실제 Unreal 화면에서 가상 AGV 통신 단절 시험
+
+위에서 설명한 6개 패치를 적용해 빌드한 별도 Unreal 프로젝트로 두 가상
+AGV의 주문 처리 중 단절과 복구를 시험한다. 창에 단절·정지 관찰·복구
+단계를 표시하며, 표시창은 Unreal UI가 아닌 별도 시험용 창이다. Windows의
+Python Tkinter와 위에 설치한 별도 `amqtt==0.11.3`이 필요하다.
+
+Unreal 프로젝트에 `AGV_01`, `AGV_02`와 `Content/AGV/NewMap`이 있어야
+한다. 프로젝트가 사용하는 `Content/Data/warehouse_map.json`을 서버도
+읽는다. 다른 시연 서버가 8000 포트를 사용 중이면 종료하지 않고 시험을
+시작하지 않는다. 다음 예의 경로를 자신의 PC에 맞춰 저장소 루트에서 실행한다.
+
+```powershell
+$editor = 'C:\경로\UnrealEditor.exe'
+$project = 'C:\경로\agvSimulation.uproject'
+# 격리 브로커 전체 중단 후 재시작
+.\.venv\Scripts\python server\tools\outage_test\test_rendered_fleet_broker_outage.py --unreal-editor $editor --uproject $project
+# sim-r2 MQTT 연결만 강제로 끊고 시험용 게이트로 재접속을 잠시 보류
+.\.venv\Scripts\python server\tools\outage_test\test_rendered_fleet_single_outage.py --unreal-editor $editor --uproject $project
+```
+
+두 스크립트는 같은 8000 포트를 쓰므로 순서대로 실행한다. 선택 인자
+`--ddc`는 Unreal 캐시 폴더, `--broker-deps`는 aMQTT 의존성 폴더,
+`--output-dir`은 시험 결과의 상위 폴더다. 기본 의존성 경로는
+`.venv/broker-deps`, 기본 결과 경로는 `.venv/outage-test`다. 시험마다
+새 폴더에 `result.json`, 이벤트, 로그와 별도 SQLite DB를 남기며 이 로컬
+결과물은 Git에 포함하지 않는다. 결과에는 주문과 상태 정보가 있으므로
+공유 전에 내용을 확인한다.
+
+시험은 자체 루프백 브로커와 서버·Unreal 게임·표시창을 기동하고 본인이
+시작한 프로세스만 종료한다. 브로커는 익명 로컬 시험용이므로 신뢰할 수 없는
+로컬 프로세스가 포트를 선점하거나 접근할 수 있는 환경에서는 사용하지 않는다.
+상태 관찰 API는 시험용 프로세스에만 있고 임의 토큰 및 루프백 접속으로 제한한다.
+한 대 단절은 동일 MQTT client ID로 연결을 끊고 재접속을 인위적으로 보류하는
+방식이다. 시험 속도는 관찰을 위해 400 mm/s로 설정한다. 위치는 로봇별로
+순차 표본을 읽으므로 원자적인 전체 스냅샷이나 실물 정지·충돌 안전의 증거는
+아니다. 시험용 표시창·하네스는 실물 장치나 팀 브로커에 연결하지 않는다.
+
 ### 웹 주문 접수와 상태 조회
 
 로컬 시연의 `POST /order-demo/api/product-orders`는 접수 처리가 짧게 끝나면
