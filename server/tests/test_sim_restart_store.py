@@ -206,6 +206,54 @@ class CompletedExecutorRestartTests(unittest.TestCase):
         self.assertFalse(pickup._is_preceding_stop(state))
 
 
+class CurvedCompletedExecutorRestartTests(CompletedExecutorRestartTests):
+    def setUp(self):
+        curved = map_data()
+        curved['nodes'][2]['pos'] = [30, -10]
+        # Last repeated point tests that a zero-length final waypoint does
+        # not erase the last real direction of movement.
+        curved['edges'][1]['shape'] = [[20, 0], [30, -10], [30, -10]]
+        curved['edges'][2]['shape'] = [[30, -10], [40, 0]]
+        with patch.object(test_sim_handoff_store, 'map_data', return_value=curved):
+            super().setUp()
+
+    def test_verified_finished_order_restores_previous_nonzero_heading(self):
+        self.restore()
+        self.assertAlmostEqual(self.executor.snapshot()['pose']['th'], -45.0)
+
+
+class CompletedExecutorHeadingGeometryTests(unittest.TestCase):
+    def test_restored_heading_matches_actual_terminal_tangent_and_reverse_route(self):
+        scenarios = [
+            ('north', [[0, 0], [0, 20]], False, 90.0),
+            ('curve_and_duplicate', [[0, 0], [20, 0], [20, -20], [20, -20]], False, -90.0),
+            ('reverse_curve', [[0, 0], [20, 0], [20, 20], [20, 20]], True, 180.0),
+            ('west', [[0, 0], [20, 0]], True, 180.0),
+        ]
+        for name, shape, reverse, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:
+                map_value = {'map_id': 'yaw-map', 'version': 1, 'unit': 'mm',
+                             'nodes': [{'id': 'A', 'pos': shape[0]}, {'id': 'B', 'pos': shape[-1]}],
+                             'edges': [{'from': 'A', 'to': 'B', 'shape': shape,
+                                        'bidirectional': True}]}
+                inbox = SimOrderInbox(Path(folder) / 'robot.sqlite3', 'sim-r1', 'yaw-map@v1')
+                inbox.initialize()
+                nodes = ['B', 'A'] if reverse else ['A', 'B']
+                payload = json.dumps({'order_id': 'delivery', 'seq': 1, 'map_id': 'yaw-map@v1',
+                                      'nodes': nodes, 'released_until': nodes[-1],
+                                      'action_at_end': {'type': 'unload'}}).encode('utf-8')
+                original = SimOrderExecutor(inbox, map_value, nodes[0])
+                original.accept(payload)
+                previous = original.tick(1)
+                self.assertEqual(previous['status'], 'stopped')
+                self.assertAlmostEqual(previous['pose']['th'], expected)
+                restored = SimOrderExecutor(inbox, map_value, nodes[0])
+                restored._restore_completed(previous['order'], previous['receipt']['digest'], {'proof': name})
+                after = restored.snapshot()
+                self.assertAlmostEqual(after['pose']['th'], previous['pose']['th'])
+                self.assertEqual(after['current_node'], previous['current_node'])
+
+
 
 if __name__ == '__main__':
     unittest.main()

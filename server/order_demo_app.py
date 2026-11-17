@@ -184,10 +184,16 @@ class DemoRuntime:
             for engine in self.engine.engines.values():
                 seen, state = observed[engine.TWIN], engine.snapshot()
                 pose = state.get('pose')
-                if seen['carrying'] or not isinstance(pose, dict):
+                if (seen['carrying'] or not isinstance(pose, dict)
+                        or any(type(pose.get(key)) not in (int, float)
+                               or not math.isfinite(pose[key]) for key in ('x', 'y', 'th'))):
                     raise ValueError('Unreal robot does not match the saved stopped position')
+                # Unreal normalizes rotations to [-180, 180]; compare on a
+                # circle so +180 and -180 describe the same direction.
+                yaw_difference = abs((seen['yaw'] - pose['th'] + 180.0) % 360.0 - 180.0)
                 mismatch |= (seen['interpolating'] or
-                             math.hypot(seen['x'] - pose['x'] / 1000, seen['y'] - pose['y'] / 1000) > .25)
+                             math.hypot(seen['x'] - pose['x'] / 1000, seen['y'] - pose['y'] / 1000) > .25 or
+                             yaw_difference > 1.0)
             if mismatch:
                 # A pristine synthetic world needs an initial placement: the
                 # UE map's editor positions differ from the demo start nodes.

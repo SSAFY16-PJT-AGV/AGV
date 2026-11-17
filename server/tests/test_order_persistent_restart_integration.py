@@ -7,6 +7,7 @@ test-owned broker, ports and database directory prevent interference.
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, nullcontext
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -141,8 +142,8 @@ class RestoredWorldProofTest(unittest.TestCase):
                                   list_orders=lambda: [{'state': 'completed'}],
                                   load_shelves=lambda: {'reservations': []})
         robots = {
-            'r1': SimpleNamespace(TWIN='AGV_01', snapshot=lambda: {'pose': {'x': 1500, 'y': 2000}}),
-            'r2': SimpleNamespace(TWIN='AGV_02', snapshot=lambda: {'pose': {'x': 14500, 'y': 7000}}),
+            'r1': SimpleNamespace(TWIN='AGV_01', snapshot=lambda: {'status': 'completed', 'pose': {'x': 1500, 'y': 2000, 'th': 0.0}}),
+            'r2': SimpleNamespace(TWIN='AGV_02', snapshot=lambda: {'status': 'idle', 'pose': {'x': 14500, 'y': 7000, 'th': 0.0}}),
         }
         runtime = self.runtime = DemoRuntime.__new__(DemoRuntime)
         runtime.journal, runtime._world_ready = journal, threading.Event()
@@ -200,6 +201,42 @@ class RestoredWorldProofTest(unittest.TestCase):
             self.assertFalse(self.runtime._may_send_state())
             self.assertEqual(self.bound, [])
 
+    def test_restored_completed_robot_yaw_mismatch_blocks_world_proof(self):
+        self.proof['robots'][0]['yaw'] = 90.0
+        with self.assertRaises(ValueError):
+            self.runtime._validate_world(self.proof)
+        self.assertFalse(self.runtime._world_ready.is_set())
+        self.assertFalse(self.runtime._ready())
+        self.assertFalse(self.runtime._may_send_state())
+        self.assertEqual(self.bound, [])
+
+    def test_restored_robot_invalid_yaw_never_opens_gate(self):
+        for value in (float('nan'), float('inf'), float('-inf'), True, '0'):
+            with self.subTest(value=value):
+                self.proof['robots'][0]['yaw'] = value
+                with self.assertRaises(ValueError):
+                    self.runtime._validate_world(self.proof)
+                self.assertFalse(self.runtime._ready())
+                self.assertFalse(self.runtime._may_send_state())
+
+    def test_invalid_saved_heading_never_opens_gate(self):
+        for value in (None, float('nan'), float('inf'), True, '0'):
+            with self.subTest(value=value):
+                self.runtime.engine.engines['r1'].snapshot = lambda: {
+                    'status': 'completed', 'pose': {'x': 1500, 'y': 2000, 'th': value}}
+                with self.assertRaises(ValueError):
+                    self.runtime._validate_world(self.proof)
+                self.assertFalse(self.runtime._ready())
+                self.assertFalse(self.runtime._may_send_state())
+
+    def test_restored_robot_wraparound_yaws_are_equivalent(self):
+        self.runtime.engine.engines['r1'].snapshot = lambda: {
+            'status': 'completed', 'pose': {'x': 1500, 'y': 2000, 'th': 180.0}}
+        self.proof['robots'][0]['yaw'] = -180.0
+        self.runtime._validate_world(self.proof)
+        self.runtime._accept_world()
+        self.assertTrue(self.runtime._ready())
+
     def test_pristine_world_needs_confirmed_bootstrap_before_opening_gate(self):
         self.runtime.journal.list_orders = lambda: []
         for engine in self.runtime.engine.engines.values():
@@ -214,6 +251,22 @@ class RestoredWorldProofTest(unittest.TestCase):
         self.assertTrue(self.runtime._may_send_state())
         self.assertFalse(self.runtime._ready())
         self.proof['robots'][0]['x'] -= 1
+        self.runtime._validate_world(self.proof)
+        self.runtime._accept_world()
+        self.assertFalse(self.runtime._bootstrap_pending)
+        self.assertTrue(self.runtime._ready())
+
+    def test_pristine_yaw_mismatch_is_initialized_then_verified(self):
+        self.runtime.journal.list_orders = lambda: []
+        for engine in self.runtime.engine.engines.values():
+            old_snapshot = engine.snapshot
+            engine.snapshot = lambda old=old_snapshot: dict(old(), status='idle')
+        self.proof['robots'][0]['yaw'] = 90.0
+        self.runtime._validate_world(self.proof)
+        self.runtime._accept_world()
+        self.assertTrue(self.runtime._bootstrap_pending)
+        self.assertFalse(self.runtime._ready())
+        self.proof['robots'][0]['yaw'] = 0.0
         self.runtime._validate_world(self.proof)
         self.runtime._accept_world()
         self.assertFalse(self.runtime._bootstrap_pending)
@@ -420,6 +473,20 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 self.assertEqual(completed_order['product_id'], 'red')
                 self.assertEqual(completed_order['slot_index'], 1, 'initial red slot 0 was already occupied')
                 self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
+                before_status = request(server_port, '/order-demo/api/status')
+                robot_id = completed_order['assigned_robot']
+                before_robot = next(item for item in before_status['robots'] if item['robot_id'] == robot_id)
+                before_yaw = before_robot['pose']['th']
+                self.assertTrue(math.isfinite(before_yaw))
+                self.assertGreater(abs((before_yaw + 180) % 360 - 180), 1,
+                                   'the test must finish at a nonzero orientation')
+                twin_id = {'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}[robot_id]
+                def actor_yaw_matches(expected):
+                    with unreal.lock:
+                        actual = unreal.robots[twin_id]['yaw']
+                    return abs((actual - expected + 180) % 360 - 180) < 1e-4
+                self.assertTrue(wait_for(lambda: actor_yaw_matches(before_yaw)),
+                                'Unreal must have observed the final heading before restart')
                 with unreal.lock:
                     self.assertTrue(unreal.slots['SHELF_RED'][1])
                     self.assertEqual(len([a for a in unreal.actions if a['action'] == 'place']), 1)
@@ -431,6 +498,16 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('unreal_connected')))
                 self.assertTrue(wait_for(lambda: unreal.snapshots), 'world proof was not requested after restart')
                 self.assertEqual(unreal.states_before_snapshot, [], 'restart poses must not precede world proof')
+                restored_status = wait_for(lambda: (state if not (state := request(
+                    server_port, '/order-demo/api/status')).get('stale') and state.get('accepting_orders') else None))
+                self.assertIsNotNone(restored_status, 'matching same-world heading must permit safe continuation')
+                after_robot = next(item for item in restored_status['robots'] if item['robot_id'] == robot_id)
+                after_yaw = after_robot['pose']['th']
+                self.assertLess(abs((after_yaw - before_yaw + 180) % 360 - 180), 1e-4,
+                                'restored server heading must match the last completed heading')
+                time.sleep(.6)
+                self.assertTrue(actor_yaw_matches(before_yaw),
+                                'the Unreal actor must retain its heading after state publication')
                 self.assertEqual(request(server_port, '/order-demo/api/inventory')['pickup']['sources']['D01']['available'], 2)
                 self.assertEqual(request(server_port, '/order-demo/api/products'), products_before)
                 restored = order(first_id)

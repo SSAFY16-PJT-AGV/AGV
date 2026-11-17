@@ -157,9 +157,28 @@ class SimOrderExecutor:
                 raise OrderRejected('only a finished route can be restored')
             if node not in self._positions:
                 raise OrderRejected('finished node geometry is unavailable')
+            # The validated final order and map preserve the exact oriented
+            # polyline used by tick(). Its last nonzero segment determines the
+            # last heading even when the shape ends with duplicate points.
+            nodes = order.get('nodes')
+            if not isinstance(nodes, list) or len(nodes) < 2:
+                raise OrderRejected('finished route geometry is unavailable')
+            points = self._shapes.get((nodes[-2], nodes[-1]))
+            if not points or len(points) < 2:
+                raise OrderRejected('finished edge geometry is unavailable')
+            yaw = None
+            for start, end in reversed(tuple(zip(points, points[1:]))):
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                if not math.isfinite(dx) or not math.isfinite(dy):
+                    raise OrderRejected('finished direction is not finite')
+                if dx or dy:
+                    yaw = math.degrees(math.atan2(dy, dx))
+                    break
+            if yaw is None or not math.isfinite(yaw):
+                raise OrderRejected('finished direction is unavailable')
             self._current_node = node
             self._x, self._y = self._positions[node]
-            self._yaw = 0.0
+            self._yaw = yaw
             self._order = copy.deepcopy(order)
             self._receipt = Receipt(False, order['order_id'], order['seq'], digest, 'completed')
             self._recovery_evidence = copy.deepcopy(evidence)
