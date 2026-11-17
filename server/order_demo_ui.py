@@ -86,6 +86,12 @@ HTML_PAGE = r'''<!doctype html>
       <p class="notice">이 화면은 가상 시연입니다. 실제 상품이나 로봇 운행 결과는 아닙니다.</p>
     </section>
   </div>
+  <section class="card" id="saved-orders" hidden style="margin-top:18px">
+    <h2>저장된 주문과 선반</h2>
+    <p class="help">서버를 다시 시작해도 주문 내역을 확인할 수 있습니다.</p>
+    <p id="saved-inventory" class="help"></p>
+    <ul id="saved-order-list" aria-live="polite"></ul>
+  </section>
 </main>
 <script>
 (() => {
@@ -152,7 +158,8 @@ HTML_PAGE = r'''<!doctype html>
         await refreshStatus();
       } else if (result.status === 'error' && typeof result.error_type === 'string' && result.error_type) {
         pendingSubmissions.delete(entry.id);
-        const reason = result.error_type === 'ShelfFull' ? '선반에 빈 슬롯이 없습니다' : '주문이 접수되지 않았습니다';
+        const reason = result.error_type === 'ShelfFull' ? '선반에 빈 슬롯이 없습니다'
+          : (result.error_type === 'PickupUnavailable' ? '픽업 재고가 없거나 확인되지 않았습니다' : '주문이 접수되지 않았습니다');
         entry.row.textContent = `${entry.label} · ${reason} (${entry.id})`;
         message(entry.feedback, reason + '.');
         await refreshStatus();
@@ -299,6 +306,36 @@ HTML_PAGE = r'''<!doctype html>
     waiting_grab: '집기 확인 중', waiting_place: '적재 확인 중', unknown: '결과 확인 불가',
     arrived: '가상 도착', failed: '처리 실패'};
   function textValue(value) { return typeof value === 'string' && value ? value : '—'; }
+  async function refreshSavedOrders() {
+    try {
+      const response = await fetch('/order-demo/api/orders', {cache: 'no-store'});
+      if (response.status === 404) return;
+      const data = await readJson(response);
+      if (!Array.isArray(data.orders)) throw new Error('invalid saved orders');
+      const list = document.getElementById('saved-order-list');
+      list.replaceChildren();
+      const labels = {queued: '대기', dispatching: '배정 중', active: '진행 중',
+                      completed: '적재 완료', failed: '실패', unknown: '결과 확인 필요'};
+      for (const order of data.orders) {
+        const row = document.createElement('li');
+        const item = products.get(order.product_id);
+        const slot = Number.isInteger(order.slot_index) ? ` · ${order.shelf_id} ${order.slot_index}번 슬롯` : '';
+        row.textContent = `${item ? item.label : order.product_id} · ${labels[order.status] || order.status}${slot} (${order.request_id})`;
+        list.appendChild(row);
+      }
+      const inventory = await readJson(await fetch('/order-demo/api/inventory', {cache: 'no-store'}));
+      const parts = Object.entries(inventory.shelves || {}).map(([name, shelf]) =>
+        `${name}: ${shelf.slots.filter(value => value === true).length}/${shelf.slots.length}칸 적재`);
+      if (inventory.pickup && inventory.pickup.sources) {
+        for (const [name, source] of Object.entries(inventory.pickup.sources)) {
+          const count = Number.isInteger(source.available) ? `${source.available}개` : '확인 전';
+          parts.push(`${name} 픽업: ${count} (예약 ${source.reserved}개)${inventory.pickup.fresh ? '' : ' [저장값]'}`);
+        }
+      }
+      document.getElementById('saved-inventory').textContent = `${parts.join(' · ')}${inventory.fresh ? '' : ' (마지막 저장값)'}`;
+      document.getElementById('saved-orders').hidden = false;
+    } catch (_) { /* Keep the last readable state until the next refresh. */ }
+  }
   async function refreshStatus() {
     if (polling) return;
     polling = true;
@@ -339,7 +376,8 @@ HTML_PAGE = r'''<!doctype html>
         updateButton();
         message(statusFeedback, stale ? '표시된 내용은 최신 상태가 아닙니다. 새 주문은 잠시 기다려 주세요.'
           : (disconnected ? '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.'
-            : (jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : '')));
+            : (data.recovery_required ? '이전 작업 또는 Unreal 상태를 확인해야 합니다. 새 주문은 대기합니다.'
+            : (jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : ''))));
         return;
       }
       const terminalIssue = ['unknown', 'failed'].includes(data.status) ? data.status : null;
@@ -399,6 +437,8 @@ HTML_PAGE = r'''<!doctype html>
   loadNodes();
   loadProducts();
   refreshStatus();
+  refreshSavedOrders();
+  setInterval(refreshSavedOrders, 3000);
   setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmissions()]); }, 800);
 })();
 </script>

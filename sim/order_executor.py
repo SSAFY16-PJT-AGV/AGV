@@ -8,7 +8,7 @@ import math
 import threading
 
 from server.routing import MapGraph
-from sim.order_inbox import OrderRejected, SimOrderInbox, _decode
+from sim.order_inbox import OrderRejected, SimOrderInbox, Receipt, _decode
 
 
 SPEED_MM_PER_SECOND = 1000.0
@@ -34,12 +34,13 @@ class SimOrderExecutor:
             shapes[(source, destination)] = points
             if edge['bidirectional']:
                 shapes[(destination, source)] = tuple(reversed(points))
-        self._inbox, self._shapes = inbox, shapes
+        self._inbox, self._shapes, self._positions = inbox, shapes, positions
         self._current_node = start_node
         self._x, self._y = positions[start_node]
         self._yaw = 0.0
         self._status = 'idle'
         self._order = self._receipt = None
+        self._recovery_evidence = None
         self._waypoints = ()
         self._next_waypoint = 0
         self._lock = threading.RLock()
@@ -91,6 +92,7 @@ class SimOrderExecutor:
                 return receipt
             self._order = copy.deepcopy(order)
             self._receipt = receipt
+            self._recovery_evidence = None
             self._waypoints = tuple(waypoints)
             self._next_waypoint = 0
             self._status = 'moving'
@@ -137,7 +139,43 @@ class SimOrderExecutor:
 
     def snapshot(self):
         with self._lock:
-            return {'status': self._status, 'current_node': self._current_node,
+            result = {'status': self._status, 'current_node': self._current_node,
                     'pose': {'x': self._x, 'y': self._y, 'th': self._yaw},
                     'order': copy.deepcopy(self._order),
                     'receipt': self._receipt._asdict() if self._receipt else None}
+            if self._recovery_evidence is not None:
+                result['recovered'] = True
+            return result
+
+    def _restore_completed(self, order, digest, evidence):
+        """Install already validated historical stop; never execute an order."""
+        with self._lock:
+            if self._status != 'idle' or self._order is not None or self._receipt is not None:
+                raise OrderRejected('executor is not fresh and idle')
+            node = order['released_until']
+            if node != order['nodes'][-1]:
+                raise OrderRejected('only a finished route can be restored')
+            if node not in self._positions:
+                raise OrderRejected('finished node geometry is unavailable')
+            self._current_node = node
+            self._x, self._y = self._positions[node]
+            self._yaw = 0.0
+            self._order = copy.deepcopy(order)
+            self._receipt = Receipt(False, order['order_id'], order['seq'], digest, 'completed')
+            self._recovery_evidence = copy.deepcopy(evidence)
+            self._status = 'stopped'
+
+    def matches_recovered(self, evidence):
+        """Accept only this executor's validated, still-current historical stop."""
+        with self._lock:
+            return (self._status == 'stopped' and self._recovery_evidence is not None
+                    and evidence == self._recovery_evidence)
+
+    def matches_recovered_stop(self, task, node, receipt):
+        with self._lock:
+            evidence = self._recovery_evidence
+            return (self._status == 'stopped' and evidence is not None
+                    and evidence['task_id'] == task and evidence['stopped_at'] == node
+                    and self._receipt is not None and receipt == self._receipt._asdict()
+                    and receipt['new'] is False and receipt['state'] == 'completed'
+                    and receipt['seq'] == evidence['seq'] and receipt['digest'] == evidence['digest'])

@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing, contextmanager
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
@@ -163,8 +164,30 @@ class SimRuntime:
             self._owner.acquire()
             try:
                 self.store = self._simulation_store or AllocationStore(self.path)
+                if self._simulation_store is not None:
+                    # Repeat after the process-wide lock: a validated file may
+                    # have been replaced or modified while ownership was pending.
+                    self.store.validate_bound(self.path, check_schema=True)
+                if self._simulation_store is not None and self.store.reopened:
+                    expected = SegmentProgress(self.store, self.map_data, simulation_enabled=True)
+                    with closing(sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
+                        tasks = {row[0] for row in db.execute('SELECT task_id FROM tasks')}
+                        jobs = db.execute('SELECT task_id,robot_id,map_id FROM allocation_jobs').fetchall()
+                        meta = dict(db.execute("SELECT key,value FROM allocation_meta WHERE key IN ('active_map','map_fingerprint')"))
+                    if not tasks.issubset(self._tasks):
+                        raise ValueError('existing simulation tasks are not fully mapped')
+                    if any(self._tasks.get(task, (None,))[0] != robot or map_id != expected._map_id
+                           for task, robot, map_id in jobs):
+                        raise ValueError('existing simulation allocation mapping changed')
+                    if (jobs or meta) and meta != {'active_map': expected._map_id,
+                                                  'map_fingerprint': expected._fingerprint}:
+                        raise ValueError('existing simulation map differs from stored map')
                 self.store.initialize()
                 self.gate = RecoveryGate(self.path); self.gate.initialize()
+                if self._simulation_store is not None and self.store.reopened:
+                    # Never let a queued event or a stale publisher move a
+                    # restored task before a separately verified reconciliation.
+                    self.gate.invalidate_many(tuple(self._tasks))
                 self.progress = SegmentProgress(self.store, self.map_data, simulation_enabled=True, recovery_gate=self.gate)
                 self.progress.initialize()
                 mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
@@ -250,6 +273,84 @@ class SimRuntime:
             return {'ready': bool(self._started and not self._stopped and self.receiver and self.receiver.ready),
                     'simulation_only': True,
                     'last_workflow_error': self.workflow.last_error if self.workflow else None}
+
+    def restore_completed_executor(self, executor, *, task_id, session, event_id,
+                                   action_ack, expected_twin_id):
+        """Reconstruct a historical completed *simulator* stop from durable records.
+
+        The ACK must independently come from the caller's durable order journal.
+        This method provides no current Unreal world, pose, or carrying proof and
+        does not unblock recovery or authorize motion. A fresh external world
+        check is mandatory before any simulation can use the returned evidence.
+        """
+        from sim.order_executor import SimOrderExecutor
+        from sim.event_inbox import _event
+        from server.segment_progress import _resources
+        if type(executor) is not SimOrderExecutor:
+            raise ValueError('a fresh simulation executor is required')
+        for value, name in ((task_id, 'task_id'), (session, 'session'),
+                            (event_id, 'event_id'), (expected_twin_id, 'twin_id')):
+            _id(value, name)
+        if (not isinstance(action_ack, dict)
+                or set(action_ack) != {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
+                or action_ack.get('order_id') != task_id or action_ack.get('agv_id') != expected_twin_id
+                or action_ack.get('action') != 'place' or action_ack.get('applied') is not True):
+            raise ValueError('durable successful simulated place acknowledgement required')
+        _id(action_ack['action_id'], 'action_id')
+        robot = executor._inbox.robot_id
+        if self._tasks.get(task_id) != (robot, session):
+            raise ValueError('recovery task identity differs from static simulation mapping')
+        with self._lock, self.receiver._dispatch_lock, executor._lock, executor._inbox._lock:
+            self._ready()
+            if self._simulation_store is None or not self.store.reopened:
+                raise ValueError('reopened isolated simulation required')
+            if executor.snapshot()['status'] != 'idle':
+                raise ValueError('a fresh idle simulation executor is required')
+            with self.gate.transaction() as db:
+                self.progress._check_database(db)
+                robot_id, route, stopped = self.progress._job(db, task_id, robot)
+                seq, payload, state, order = self.progress._latest(db, task_id, robot_id, route, stopped)
+                parsed, canonical, digest = _decode(payload.encode('utf-8'), robot, self.progress._map_id)
+                if (parsed != order or state != 'acked' or stopped != route[-1]
+                        or order['released_until'] != stopped
+                        or order['action_at_end'].get('type') != 'unload'
+                        or self.progress._occupancy(db, task_id) != {('node', stopped)}
+                        or db.execute('SELECT task_id FROM sim_active_robots WHERE robot_id=?', (robot,)).fetchone() != (task_id,)
+                        or db.execute('SELECT 1 FROM sim_handoff_transfers WHERE source_task_id=? OR action_id=?',
+                                      (task_id, action_ack['action_id'])).fetchone()):
+                    raise ValueError('latest completed allocation is not an active terminal stop')
+                row = db.execute('SELECT i.payload,i.digest,i.robot_session,i.task_id,i.seq,i.state,i.result, '
+                                 'p.digest,p.task_id,p.seq,p.next_seq,p.result FROM sim_event_inbox i '
+                                 'JOIN progress_events p ON p.robot_id=i.robot_id AND p.event_id=i.event_id '
+                                 'WHERE i.robot_id=? AND i.event_id=?', (robot, event_id)).fetchone()
+                if row is None:
+                    raise ValueError('completed final event unavailable')
+                event, event_json, event_digest = _event(row[0].encode('ascii'))
+                result = json.loads(row[6]) if row[6] else None
+                cleared = set(self.progress._segment(route, stopped).resources) - {('node', stopped)}
+                if (event_json != row[0] or event_digest != row[1] or row[1] != row[7]
+                        or row[2:6] != (session, task_id, seq, 'applied')
+                        or row[8:12] != (task_id, seq, None, 'finished')
+                        or event['event_id'] != event_id or event['robot_session'] != session
+                        or event['order_id'] != task_id or event['seq'] != seq
+                        or event['map_id'] != self.progress._map_id or event['stopped_at'] != stopped
+                        or _resources(event['cleared_resources']) != cleared
+                        or not isinstance(result, dict) or result.get('status') != 'finished'
+                        or result.get('task_id') != task_id or result.get('next_seq') is not None):
+                    raise ValueError('completed final event differs from allocation')
+                uri = Path(executor._inbox.path).resolve().as_uri() + '?mode=ro'
+                with closing(sqlite3.connect(uri, uri=True)) as inbox:
+                    identity = inbox.execute('SELECT robot_id,map_id FROM sim_inbox_identity WHERE singleton=1').fetchone()
+                    latest = inbox.execute('SELECT order_id,seq,digest,payload,state FROM sim_inbox_orders '
+                                           'ORDER BY rowid DESC LIMIT 1').fetchone()
+                if (identity != (robot, self.progress._map_id)
+                        or latest != (task_id, seq, digest, canonical, 'completed')):
+                    raise ValueError('completed robot inbox differs from final allocation')
+                evidence = {'task_id': task_id, 'session': session, 'robot_id': robot, 'seq': seq,
+                            'stopped_at': stopped, 'event_id': event_id,
+                            'map_id': self.progress._map_id, 'digest': digest}
+                executor._restore_completed(order, digest, evidence)
+                return copy.deepcopy(evidence)
 
     def reconcile_moving(self, robot_id, task_id, session, robot, checkpoint):
         """Permit only the frozen simulated executor's current reserved segment.

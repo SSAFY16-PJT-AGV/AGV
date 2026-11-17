@@ -11,7 +11,7 @@ import uuid
 class ShelfInventory:
     """Track observed occupied slots and preserve unresolved reservations."""
 
-    def __init__(self, shelves, *, slot_count=6):
+    def __init__(self, shelves, *, slot_count=6, store=None):
         if (not isinstance(shelves, dict) or not shelves or len(shelves) > 64
                 or type(slot_count) is not int or not 1 <= slot_count <= 128):
             raise ValueError('explicit bounded simulated shelves are required')
@@ -28,6 +28,30 @@ class ShelfInventory:
         self._pending = None
         self._observed = None
         self._reservations = {}
+        self._store = store
+        self._store_revision = None
+        if store is not None:
+            saved = store.load_shelves()
+            if not isinstance(saved, dict) or type(saved.get('revision')) is not int:
+                raise ValueError('invalid durable simulated shelf state')
+            rows = saved.get('reservations')
+            if not isinstance(rows, list):
+                raise ValueError('invalid durable simulated reservations')
+            self._store_revision = saved['revision']
+            for item in rows:
+                if (not isinstance(item, dict) or item.get('shelf_id') not in self._shelves
+                        or type(item.get('slot_index')) is not int
+                        or not 0 <= item['slot_index'] < self._slot_count
+                        or item.get('state') not in ('reserved', 'confirmed')
+                        or not isinstance(item.get('reservation_id'), str)
+                        or not item['reservation_id']
+                        or item['reservation_id'] in self._reservations):
+                    raise ValueError('invalid durable simulated reservation')
+                self._reservations[item['reservation_id']] = {
+                    'shelf_id': item['shelf_id'], 'slot_index': item['slot_index'],
+                    # Prior session acknowledgements can never confirm an
+                    # unresolved reservation in a new connection generation.
+                    'generation': None, 'state': item['state']}
 
     @property
     def shelf_ids(self):
@@ -93,6 +117,10 @@ class ShelfInventory:
                 observed[shelf] = tuple(slots)
             if set(observed) != set(self._shelves):
                 raise ValueError('missing simulated shelf')
+            if self._store is not None:
+                # DB validation is authoritative and preserves unresolved
+                # reservations; no observed empty slot may clear them.
+                self._store_revision = self._store.sync_shelves(shelves)
             self._observed = observed
             self._pending = None
             return True
@@ -113,12 +141,26 @@ class ShelfInventory:
         with self._lock:
             return self._free_index(shelf_id, product_type) is not None
 
-    def reserve(self, shelf_id, product_type):
+    def reserve(self, shelf_id, product_type, *, request_id=None):
         with self._lock:
             index = self._free_index(shelf_id, product_type)
             if index is None:
                 raise RuntimeError('no confirmed empty simulated shelf slot')
-            reservation_id = uuid.uuid4().hex
+            if self._store is None:
+                reservation_id = uuid.uuid4().hex
+            else:
+                stored = self._store.reserve_slot(shelf_id, product_type,
+                                                   self._store_revision, request_id=request_id)
+                if (not isinstance(stored, dict) or stored.get('shelf_id') != shelf_id
+                        or not isinstance(stored.get('reservation_id'), str)
+                        or not stored['reservation_id']
+                        or type(stored.get('slot_index')) is not int
+                        or not 0 <= stored['slot_index'] < self._slot_count
+                        or self._observed[shelf_id][stored['slot_index']]
+                        or stored['slot_index'] in {item['slot_index'] for item in self._reservations.values()
+                                                    if item['shelf_id'] == shelf_id and item['state'] == 'reserved'}):
+                    raise RuntimeError('invalid durable simulated slot reservation')
+                index, reservation_id = stored['slot_index'], stored['reservation_id']
             self._reservations[reservation_id] = {'shelf_id': shelf_id, 'slot_index': index,
                                                    'generation': self._generation, 'state': 'reserved'}
             return {'reservation_id': reservation_id, 'shelf_id': shelf_id, 'slot_index': index}
@@ -129,6 +171,8 @@ class ShelfInventory:
             if (self._owner is None or self._observed is None or not isinstance(item, dict)
                     or item['generation'] != self._generation or item['state'] != 'reserved'):
                 raise ValueError('unknown, stale, or already confirmed reservation')
+            if self._store is not None:
+                self._store.confirm_slot(reservation_id)
             slots = list(self._observed[item['shelf_id']])
             slots[item['slot_index']] = True
             self._observed[item['shelf_id']] = tuple(slots)

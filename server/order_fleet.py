@@ -67,7 +67,7 @@ class FleetProductControlEngine:
                            and state.get('status') in ('moving', 'waiting', 'suspended')
                            for state in self._snapshots().values())
 
-    def create_product_order(self, product_type, pickup, destination, shelf, slot):
+    def create_product_order(self, product_type, pickup, destination, shelf, slot, *, request_id=None):
         with self.lock:
             states = self._snapshots()
             if any(state.get('status') in ('unknown', 'failed') for state in states.values()):
@@ -94,14 +94,17 @@ class FleetProductControlEngine:
             robot_id = min(candidates)[2]
             reservation = None
             if self.inventory is not None:
-                reservation = self.inventory.reserve(shelf, product_type)
+                reservation = self.inventory.reserve(shelf, product_type, request_id=request_id)
                 slot = reservation['slot_index']
                 self._slot_reservations[robot_id] = reservation
             result = self.engines[robot_id].create_product_order(product_type, pickup, destination, shelf, slot)
             if self.inventory is None:
                 self._used_slots.add((shelf, slot))
             self._last_robot = robot_id
-            return dict(result, assigned_robot=robot_id, slot_index=slot)
+            result = dict(result, assigned_robot=robot_id, slot_index=slot)
+            if reservation is not None:
+                result.update(shelf_id=shelf, reservation_id=reservation['reservation_id'])
+            return result
 
     def tick(self, dt):
         with self.lock:

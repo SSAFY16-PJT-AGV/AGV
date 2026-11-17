@@ -10,7 +10,9 @@ class DemoActionSession:
     The caller passes the same reentrant lock used by the demo engine.
     """
     def __init__(self, engine, lock, settle_seconds=1.5, timeout_seconds=10, can_dispatch=None,
-                 on_change=None, pause_on_unavailable=False, inventory=None):
+                 on_change=None, pause_on_unavailable=False, inventory=None,
+                 validate_snapshot=None, on_snapshot=None, on_invalidate=None, can_send_state=None,
+                 on_snapshot_request=None, on_prepare_action=None, on_action_result=None, on_detach=None):
         self.engine = engine
         self.lock = lock
         self.settle_seconds = settle_seconds
@@ -21,6 +23,14 @@ class DemoActionSession:
         self.on_change = on_change
         self.pause_on_unavailable = pause_on_unavailable
         self.inventory = inventory
+        self.validate_snapshot = validate_snapshot
+        self.on_snapshot = on_snapshot
+        self.on_invalidate = on_invalidate
+        self.can_send_state = can_send_state
+        self.on_snapshot_request = on_snapshot_request
+        self.on_prepare_action = on_prepare_action
+        self.on_action_result = on_action_result
+        self.on_detach = on_detach
         self._shelf_request_id = None
         self._shelf_request_sent = False
         self._owner_available = threading.Event()
@@ -76,6 +86,8 @@ class DemoActionSession:
             if client is not self._fast_owner:
                 return
             self._owner_available.clear()
+            if self.on_invalidate is not None:
+                self.on_invalidate()
         self._changed()
         # Never wait for the shared action lock; this fence only waits for a
         # tick which had already acquired authorization before the signal.
@@ -93,6 +105,8 @@ class DemoActionSession:
                 self._owner_available.clear()
                 self._fast_owner = None
             self.engine.action_unknown()
+            if self.on_detach is not None:
+                self.on_detach()
             if self.inventory is not None:
                 self.inventory.invalidate(client)
                 self._shelf_request_id = None
@@ -102,13 +116,15 @@ class DemoActionSession:
             self._changed()
 
     def poll(self, client, now=None):
-        with self.lock:
+        with self.lock, self._motion_fence:
             if client is not self.owner:
                 return None
             if self.inventory is not None and not self.inventory.ready:
                 if not self._owner_available.is_set():
                     return None
                 if not self._shelf_request_sent and self._shelf_request_id:
+                    if self.on_snapshot_request is not None:
+                        self.on_snapshot_request()
                     self._shelf_request_sent = True
                     return {'type': 'shelf.snapshot.request',
                             'data': {'request_id': self._shelf_request_id,
@@ -146,18 +162,29 @@ class DemoActionSession:
                 self.action_id = self.observed_at = self.sent_at = None
                 self._changed()
                 return None
-            self.sent_at = now
             pose = snapshot.get('pose')
             if not pose or type(pose.get('x')) not in (int, float) or type(pose.get('y')) not in (int, float):
                 self.engine.action_unknown()
                 self._changed()
                 return None
+            if self.on_prepare_action is not None:
+                try:
+                    self.on_prepare_action(action)
+                except Exception:
+                    self.engine.action_unknown()
+                    self._changed()
+                    return None
+            if not self._owner_available.is_set():
+                self.engine.action_unknown()
+                self._changed()
+                return None
+            self.sent_at = now
             return {'type': 'robot.action', 'data': dict(action, result='success',
                                                           expected_x=pose['x'] / 1000,
                                                           expected_y=pose['y'] / 1000)}
 
     def receive(self, client, message, now=None):
-        with self.lock:
+        with self.lock, self._motion_fence:
             if client is not self.owner or not isinstance(message, dict) or not self._owner_available.is_set():
                 return False
             if self.inventory is not None and message.get('type') == 'shelf.snapshot':
@@ -165,10 +192,15 @@ class DemoActionSession:
                 if (not self._shelf_request_sent or not isinstance(data, dict)
                         or data.get('request_id') != self._shelf_request_id):
                     return False
+                if self.validate_snapshot is not None:
+                    self.validate_snapshot(data)
+                    data = {'request_id': data['request_id'], 'shelves': data['shelves']}
                 accepted = self.inventory.apply_snapshot(client, data)
                 if accepted:
                     self._shelf_request_id = None
                     self._shelf_request_sent = False
+                    if self.on_snapshot is not None:
+                        self.on_snapshot()
                     self._changed()
                 return bool(accepted)
             if self.sent_at is None:
@@ -196,6 +228,21 @@ class DemoActionSession:
                 return False
             # Readiness and the selected-engine snapshot can block. Never apply
             # an acknowledgement that expired while either one was waiting.
+            applied_at = time.monotonic() if live_clock else now
+            if (not self._owner_available.is_set()
+                    or applied_at - self.sent_at >= self.timeout_seconds):
+                self.engine.action_unknown()
+                self.action_id = self.observed_at = self.sent_at = None
+                self._changed()
+                return False
+            if self.on_action_result is not None:
+                try:
+                    self.on_action_result(data)
+                except Exception:
+                    self.engine.action_unknown()
+                    self.action_id = self.observed_at = self.sent_at = None
+                    self._changed()
+                    return False
             applied_at = time.monotonic() if live_clock else now
             if (not self._owner_available.is_set()
                     or applied_at - self.sent_at >= self.timeout_seconds):

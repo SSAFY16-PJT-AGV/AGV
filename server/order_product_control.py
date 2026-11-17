@@ -88,6 +88,93 @@ class ProductControlEngine:
                     'current_node': current, 'pose': pose, 'battery': 0.8,
                     'pending_action': copy.deepcopy(self._pending)}
 
+    def export_completed_checkpoint(self):
+        """Return a completed simulation checkpoint for an independent journal.
+
+        Intermediate and uncertain actions cannot be exported for automatic
+        resumption. This observation is not a live Unreal-world proof.
+        """
+        with self.lock:
+            if self._status != 'completed' or self._phase != 'done' or self._pending is not None:
+                raise ValueError('only a confirmed completed simulation may be checkpointed')
+            evidence = self._validate_finished(self._delivery_evidence, self._delivery_task, self._destination)
+            ack = copy.deepcopy(self._last_place_ack)
+            if (not isinstance(ack, dict) or set(ack) != {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
+                    or ack['order_id'] != self._delivery_task or ack['agv_id'] != self.TWIN
+                    or ack['action'] != 'place' or ack['applied'] is not True):
+                raise ValueError('confirmed simulated place acknowledgement required')
+            _id(ack['action_id'], 'action_id')
+            return {'version': 1, 'robot_id': self.ROBOT, 'twin_id': self.TWIN,
+                    'session': self.SESSION, 'task_prefix': self.task_prefix, 'cycle': self._cycle,
+                    'pickup_task': self._pickup_task, 'delivery_task': self._delivery_task,
+                    'product': self._product, 'pickup': self._pickup, 'destination': self._destination,
+                    'shelf': self._shelf, 'slot': self._slot, 'route': copy.deepcopy(self._route),
+                    'evidence': evidence, 'action_ack': ack}
+
+    def restore_completed_checkpoint(self, checkpoint):
+        """Rebuild only a finished simulated delivery after durable DB checks.
+
+        Callers must separately verify the current Unreal world, actor pose and
+        carried item before enabling ticks, new orders or action publication.
+        """
+        with self.lock:
+            if (self._status != 'idle' or self._cycle != 0 or self._pending is not None
+                    or not isinstance(checkpoint, dict)):
+                raise ValueError('fresh idle controller and completed checkpoint required')
+            keys = {'version', 'robot_id', 'twin_id', 'session', 'task_prefix', 'cycle',
+                    'pickup_task', 'delivery_task', 'product', 'pickup', 'destination',
+                    'shelf', 'slot', 'route', 'evidence', 'action_ack'}
+            if (set(checkpoint) != keys or type(checkpoint['version']) is not int or checkpoint['version'] != 1
+                    or checkpoint['robot_id'] != self.ROBOT or checkpoint['twin_id'] != self.TWIN
+                    or checkpoint['session'] != self.SESSION or checkpoint['task_prefix'] != self.task_prefix
+                    or type(checkpoint['cycle']) is not int or not 1 <= checkpoint['cycle'] <= self.MAX_ORDERS):
+                raise ValueError('simulation checkpoint identity differs')
+            cycle = checkpoint['cycle']
+            prefix = self.task_prefix if cycle == 1 else '{}-{}'.format(self.task_prefix, cycle)
+            if (checkpoint['pickup_task'] != prefix + '-pickup'
+                    or checkpoint['delivery_task'] != prefix + '-delivery'):
+                raise ValueError('simulation checkpoint cycle differs from task identity')
+            if not isinstance(checkpoint['product'], str):
+                raise ValueError('simulation checkpoint product is invalid')
+            product = self.products.get(checkpoint['product'])
+            slot = checkpoint['slot']
+            if (not isinstance(product, dict) or product.get('pickup_node') != checkpoint['pickup']
+                    or product.get('destination_node') != checkpoint['destination']
+                    or product.get('shelf_id') != checkpoint['shelf'] or type(slot) is not int
+                    or not ((type(product.get('slot_count')) is int and 0 <= slot < product['slot_count'])
+                            or (product.get('slot_count') is None and product.get('slot_index') == slot))):
+                raise ValueError('simulation checkpoint product differs from catalog')
+            route, evidence, ack = checkpoint['route'], checkpoint['evidence'], checkpoint['action_ack']
+            if (not isinstance(route, list) or not route or route[-1] != checkpoint['destination']
+                    or any(not isinstance(node, str) or node not in self.positions for node in route)
+                    or not isinstance(evidence, dict) or not isinstance(ack, dict)
+                    or set(evidence) != {'task_id', 'session', 'robot_id', 'seq', 'stopped_at',
+                                         'event_id', 'map_id', 'digest'}
+                    or set(ack) != {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
+                    or evidence.get('task_id') != checkpoint['delivery_task']
+                    or evidence.get('stopped_at') != checkpoint['destination']
+                    or evidence.get('session') != self.SESSION or evidence.get('robot_id') != self.ROBOT
+                    or type(evidence.get('seq')) is not int or evidence['seq'] < 1
+                    or evidence.get('map_id') != '{}@v{}'.format(self.graph.map_id, self.graph.version)
+                    or not isinstance(evidence.get('event_id'), str) or not evidence['event_id']
+                    or not isinstance(evidence.get('digest'), str) or not evidence['digest']
+                    or ack.get('order_id') != checkpoint['delivery_task'] or ack.get('agv_id') != self.TWIN
+                    or not isinstance(ack.get('action_id'), str) or not ack['action_id']
+                    or ack.get('action') != 'place' or ack.get('applied') is not True):
+                raise ValueError('simulation checkpoint completion evidence differs')
+            restored = self.runtime.restore_completed_executor(
+                self.robot.executor, task_id=checkpoint['delivery_task'], session=self.SESSION,
+                event_id=evidence.get('event_id'), action_ack=ack, expected_twin_id=self.TWIN)
+            if restored != evidence:
+                raise ValueError('checkpoint differs from verified database evidence')
+            self._validate_finished(restored, checkpoint['delivery_task'], checkpoint['destination'])
+            self._cycle, self._status, self._phase = cycle, 'completed', 'done'
+            self._pickup_task, self._delivery_task = checkpoint['pickup_task'], checkpoint['delivery_task']
+            self._product, self._pickup, self._destination = checkpoint['product'], checkpoint['pickup'], checkpoint['destination']
+            self._shelf, self._slot, self._route = checkpoint['shelf'], slot, copy.deepcopy(route)
+            self._delivery_evidence, self._last_place_ack = copy.deepcopy(evidence), copy.deepcopy(ack)
+            return self.snapshot()
+
     def create_order(self, pickup_node, destination_node):
         raise RuntimeError('direct node orders are not supported in reservation mode')
 
@@ -228,12 +315,15 @@ class ProductControlEngine:
             raise ValueError('simulated final event evidence mismatch')
         state = self._robot_snapshot()
         order, receipt = state.get('order'), state.get('receipt')
+        executor = getattr(self.robot, 'executor', None)
+        recovered = (state.get('recovered') is True and callable(getattr(executor, 'matches_recovered', None))
+                     and executor.matches_recovered(evidence))
         if (state.get('status') != 'stopped' or state['current_node'] != node
                 or not isinstance(order, dict) or not isinstance(receipt, dict)
                 or order.get('order_id') != task or order.get('map_id') != evidence['map_id']
                 or order.get('seq') != evidence['seq'] or order.get('released_until') != node
                 or not isinstance(order.get('nodes'), list) or not order['nodes'] or order['nodes'][-1] != node
-                or receipt.get('new') is not True or receipt.get('state') != 'completed'
+                or (receipt.get('new') is not True and not recovered) or receipt.get('state') != 'completed'
                 or receipt.get('order_id') != task or receipt.get('seq') != evidence['seq']
                 or receipt.get('digest') != evidence['digest']):
             raise ValueError('simulated stop and final event evidence mismatch')

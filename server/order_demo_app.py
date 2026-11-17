@@ -5,8 +5,10 @@ Launch it via the isolated demo launcher, not the production server.
 """
 from contextlib import asynccontextmanager, ExitStack, nullcontext
 import copy
+import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -43,7 +45,7 @@ class ShelfFull(RuntimeError):
 
 class DemoRuntime:
     def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic,
-                 auto_recovery=False):
+                 auto_recovery=False, journal=None, recovery_blocked=False, pickup_store=None):
         self.engine = engine
         self.port = port
         self._nodes = nodes
@@ -63,16 +65,37 @@ class DemoRuntime:
         self._snapshot_valid = True
         self._cached_ready = False
         self.auto_recovery = auto_recovery is True
+        self.journal = journal
+        self.pickup_store = pickup_store
+        self._pickup_token = None
+        self._pickup_fence = None
+        self._restart_blocked = recovery_blocked
+        self._world_ready = threading.Event()
+        self._bootstrap_pending = False
+        self._bootstrap_checked_at = 0.0
+        self._last_persisted_observation = {}
         self._recovering = threading.Event()
         self._recovery_checkpoints = None
         self._recovery_owner = None
         self.actions = DemoActionSession(engine, self.lock, can_dispatch=self._ready,
                                          on_change=self._invalidate_snapshot,
                                          pause_on_unavailable=self.auto_recovery,
-                                         inventory=getattr(engine, 'inventory', None))
-        self.admission = OrderAdmission()
+                                         inventory=getattr(engine, 'inventory', None),
+                                         validate_snapshot=self._validate_world if journal else None,
+                                         on_snapshot=self._accept_world if journal else None,
+                                         on_invalidate=self._invalidate_world if journal else None,
+                                         can_send_state=self._may_send_state if journal else None,
+                                         on_snapshot_request=self._pickup_snapshot_request if pickup_store else None,
+                                         on_prepare_action=self._pickup_action_prepare if pickup_store else None,
+                                         on_action_result=self._pickup_action_result if pickup_store else None,
+                                         on_detach=self._pickup_detach if pickup_store else None)
         self.connected = threading.Event()
         self.stop_event = threading.Event()
+        if journal is None:
+            self.admission = OrderAdmission()
+        else:
+            from server.order_persistent_admission import PersistentAdmission
+            self.admission = PersistentAdmission(journal, self._dispatch_persistent, self.stop_event)
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
@@ -94,6 +117,8 @@ class DemoRuntime:
             raise RuntimeError('isolated demo publisher failed to connect')
         self.thread = threading.Thread(target=self._run, name='order-demo', daemon=True)
         self.thread.start()
+        if self.journal is not None:
+            self.admission.resume()
 
     def stop(self):
         self.stop_event.set()
@@ -112,7 +137,201 @@ class DemoRuntime:
 
     def _ready(self):
         return (self._transport_ready()
-                and (not self.auto_recovery or self.actions.available_fast()))
+                and (not self.auto_recovery or self.actions.available_fast())
+                and (self.journal is None or (self._world_ready.is_set()
+                     and not self._restart_blocked and self.engine.inventory.ready)))
+
+    def _may_send_state(self):
+        # Nonblocking outbound fence. No restored server pose may reach the UE
+        # actor before its same-world position has been independently checked.
+        return (not self._restart_blocked and self.actions.available_fast()
+                and (self._world_ready.is_set() or self._bootstrap_pending))
+
+    def _invalidate_world(self):
+        self._world_ready.clear()
+        self._bootstrap_pending = False
+
+    def _validate_world(self, data):
+        """Validate an authenticated Unreal snapshot before allowing any tick."""
+        expected_keys = {'request_id', 'shelves', 'world_id', 'robots'}
+        if self.pickup_store is not None:
+            expected_keys.add('pickups')
+        if not isinstance(data, dict) or set(data) != expected_keys:
+            raise ValueError('simulated world proof required')
+        world_id = data['world_id']
+        if not isinstance(world_id, str) or len(world_id) != 32 or any(c not in '0123456789abcdefABCDEF' for c in world_id):
+            raise ValueError('invalid simulated world identity')
+        previous = self.journal.world_id
+        if previous is not None and previous != world_id.lower():
+            raise ValueError('Unreal world changed since the saved simulation')
+        robots = data['robots']
+        if not isinstance(robots, list) or len(robots) != 2:
+            raise ValueError('two simulated robot observations required')
+        observed = {}
+        for robot in robots:
+            if (not isinstance(robot, dict) or set(robot) != {'agv_id', 'x', 'y', 'yaw', 'carrying', 'interpolating'}
+                    or robot['agv_id'] not in ('AGV_01', 'AGV_02') or robot['agv_id'] in observed
+                    or any(type(robot[k]) not in (int, float) or not math.isfinite(robot[k]) for k in ('x', 'y', 'yaw'))
+                    or type(robot['carrying']) is not bool or type(robot['interpolating']) is not bool):
+                raise ValueError('invalid simulated robot observation')
+            observed[robot['agv_id']] = robot
+        # During a running session later inventory refreshes are allowed while
+        # robots are moving. After a restart, compare actual actors to the
+        # independently restored terminal positions before the first tick.
+        self._validated_bootstrap = False
+        if not self._world_ready.is_set() and not self._restart_blocked:
+            mismatch = False
+            for engine in self.engine.engines.values():
+                seen, state = observed[engine.TWIN], engine.snapshot()
+                pose = state.get('pose')
+                if seen['carrying'] or not isinstance(pose, dict):
+                    raise ValueError('Unreal robot does not match the saved stopped position')
+                mismatch |= (seen['interpolating'] or
+                             math.hypot(seen['x'] - pose['x'] / 1000, seen['y'] - pose['y'] / 1000) > .25)
+            if mismatch:
+                # A pristine synthetic world needs an initial placement: the
+                # UE map's editor positions differ from the demo start nodes.
+                # Once any task or reservation exists this is never permitted.
+                pristine = (all(row['state'] == 'queued' for row in self.journal.list_orders())
+                            and not self.journal.load_shelves()['reservations']
+                            and all(item.snapshot()['status'] == 'idle' for item in self.engine.engines.values()))
+                if not pristine:
+                    raise ValueError('Unreal robot does not match the saved stopped position')
+                self._validated_bootstrap = True
+        self._validated_world = world_id
+        if self.pickup_store is not None:
+            self._validated_pickups = data['pickups']
+
+    def _accept_world(self):
+        try:
+            self.journal.bind_world_id(self._validated_world)
+            if self.pickup_store is not None:
+                if self._pickup_token is None:
+                    self._pickup_token = self.pickup_store.begin_session(self._validated_world)
+                    self._pickup_fence = self.pickup_store.begin_snapshot(self._pickup_token)
+                if self._pickup_fence is None:
+                    raise ValueError('pickup snapshot request fence missing')
+                self.pickup_store.apply_snapshot(self._pickup_token, self._validated_pickups,
+                                                 snapshot_fence=self._pickup_fence)
+                self._pickup_fence = None
+        except Exception:
+            self._restart_blocked = True
+            self._invalidate_world()
+            self.engine.action_unknown()
+            raise
+        self._bootstrap_pending = self._validated_bootstrap
+        if not self._bootstrap_pending:
+            self._world_ready.set()
+        self._store_snapshot(self.engine.snapshot(), self._transport_ready())
+
+    def _pickup_snapshot_request(self):
+        if self._pickup_token is not None:
+            self._pickup_fence = self.pickup_store.begin_snapshot(self._pickup_token)
+
+    def _pickup_detach(self):
+        self._invalidate_world()
+        if self._pickup_token is not None:
+            self.pickup_store.end_session(self._pickup_token)
+            self._pickup_token = self._pickup_fence = None
+        self._record_orders(self.engine.snapshot())
+
+    def _pickup_order(self, action):
+        matches = [row for row in self.journal.list_orders()
+                   if row['state'] == 'active' and isinstance(row['result'], dict)
+                   and row['result'].get('order_id') == action.get('order_id')]
+        if len(matches) != 1:
+            raise ValueError('pickup action has no matching saved order')
+        reservation = matches[0]['result'].get('pickup_reservation_id')
+        if not isinstance(reservation, str):
+            raise ValueError('pickup reservation missing')
+        return reservation
+
+    def _pickup_action_prepare(self, action):
+        if action.get('action') == 'grab':
+            self.pickup_store.mark_dispatched(self._pickup_token, self._pickup_order(action),
+                                              action['order_id'], action['action_id'], action['agv_id'])
+
+    def _pickup_action_result(self, action):
+        if action.get('action') == 'grab':
+            self.pickup_store.confirm(self._pickup_token, self._pickup_order(action), action['order_id'],
+                                      action['action_id'], action['agv_id'], applied=action['applied'])
+
+    def _bootstrap_world(self):
+        """Only place a pristine, idle synthetic fleet; never advance a task."""
+        with self.lock:
+            if (not self._bootstrap_pending or self._restart_blocked or not self.actions.available_fast()
+                    or not self._transport_ready() or self.journal.load_shelves()['reservations']
+                    or any(row['state'] != 'queued' for row in self.journal.list_orders())):
+                return
+            with self.actions.motion_guard() as available:
+                if not available:
+                    return
+                for item in self.engine.snapshot()['robots']:
+                    if item['status'] != 'idle':
+                        self._restart_blocked = True
+                        return
+                    payload = {'map_id': 'twin-validation-v1', 'last_node': item['current_node'],
+                               'status': 'IDLE', 'battery': item['battery'], 'pose': item['pose']}
+                    self.client.publish('agv/{}/state'.format(item['robot_id']), json.dumps(payload), qos=0, retain=False)
+                now = self.clock()
+                if now - self._bootstrap_checked_at >= 1 and self.engine.inventory.ready:
+                    self.actions._shelf_request_id = self.engine.inventory.request_snapshot(self.actions.owner)
+                    self.actions._shelf_request_sent = False
+                    self._bootstrap_checked_at = now
+
+    def _dispatch_persistent(self, order):
+        product = self.journal.products[order['product_id']]
+        while not self.stop_event.is_set():
+            with self.lock:
+                state = self.engine.snapshot()
+                self._record_orders(state)
+                if self._ready() and self.actions.available_fast():
+                    inventory = self.engine.inventory
+                    if not inventory.can_reserve(product['shelf_id'], product['product_type']):
+                        raise ShelfFull('no confirmed empty simulated shelf slot')
+                    if (state.get('accepting_orders') is True
+                            and self.engine.can_dispatch_destination(product['destination_node'])):
+                        with self.actions.motion_guard() as owner_available:
+                            if not owner_available or not self._ready():
+                                continue
+                            pickup_reservation = None
+                            if self.pickup_store is not None:
+                                pickup_reservation = self.pickup_store.reserve(
+                                    self._pickup_token, order['request_id'], product['pickup_node'],
+                                    product['product_type'])
+                                if pickup_reservation.get('state') != 'reserved':
+                                    self._restart_blocked = True
+                                    raise RuntimeError('saved pickup reservation requires reconciliation')
+                            try:
+                                self.journal.claim(order['request_id'])
+                            except Exception:
+                                if pickup_reservation is not None:
+                                    try:
+                                        self.pickup_store.cancel_reserved(
+                                            self._pickup_token, pickup_reservation['reservation_id'])
+                                    except Exception:
+                                        self._restart_blocked = True
+                                raise
+                            try:
+                                result = self.engine.create_product_order(
+                                    product['product_type'], product['pickup_node'], product['destination_node'],
+                                    product['shelf_id'], product['slot_index'], request_id=order['request_id'])
+                                if result.get('status') in ('unknown', 'failed'):
+                                    raise RuntimeError('simulated dispatch outcome unavailable')
+                                if pickup_reservation is not None:
+                                    result['pickup_reservation_id'] = pickup_reservation['reservation_id']
+                                self.journal.mark_active(order['request_id'], result)
+                            except Exception:
+                                self._restart_blocked = True
+                                self.engine.action_unknown()
+                                current = self.journal.get_order(order['request_id'])
+                                if current['state'] in ('dispatching', 'active'):
+                                    self.journal.mark_unknown(order['request_id'], 'dispatch outcome unavailable')
+                                raise
+                            self._store_snapshot(self.engine.snapshot(), self._ready())
+                            return
+            self.stop_event.wait(.05)
+        raise AdmissionStopped('demo stopped before dispatch')
 
     def _transport_ready(self):
         if self.stop_event.is_set() or self._recovering.is_set() or not self.connected.is_set():
@@ -136,8 +355,9 @@ class DemoRuntime:
         with self.lock:
             state = self.engine.snapshot()
             states = state.get('robots', [state])
-            if (not self.actions.available_fast() and self._transport_ready()
-                    and all(item.get('status') in ('idle', 'completed') for item in states)):
+            if (self._transport_ready() and (self.journal is not None or
+                    (not self.actions.available_fast() and
+                     all(item.get('status') in ('idle', 'completed') for item in states)))):
                 self._store_snapshot(state, True)
 
     def _tick_if_ready(self, elapsed):
@@ -147,13 +367,47 @@ class DemoRuntime:
                     if not owner_available or not self._ready():
                         return None
                     state = self.engine.tick(elapsed)
+                    self._record_orders(state)
                     self._store_snapshot(state, self._ready())
                     return state
             if not self._ready():
                 return None
             state = self.engine.tick(elapsed)
+            self._record_orders(state)
             self._store_snapshot(state, self._ready())
             return state
+
+    def _record_orders(self, state):
+        if self.journal is None:
+            return
+        robots = {item['robot_id']: item for item in state.get('robots', [])}
+        for order in self.journal.list_orders():
+            if order['state'] != 'active' or not isinstance(order['result'], dict):
+                continue
+            result = order['result']
+            robot = robots.get(result.get('assigned_robot'), {})
+            if robot.get('order_id') != result.get('order_id'):
+                self.journal.mark_unknown(order['request_id'], 'simulated order identity changed')
+                self._restart_blocked = True
+            elif robot.get('status') == 'completed':
+                checkpoint = self.engine.engines[result['assigned_robot']].export_completed_checkpoint()
+                observation = {key: robot.get(key) for key in ('status', 'phase', 'current_node')}
+                self.journal.mark_completed(order['request_id'], {'checkpoint': checkpoint,
+                                                                    'last_observation': observation})
+            elif robot.get('status') in ('unknown', 'failed'):
+                if self.pickup_store is not None and self._pickup_token is not None:
+                    reservation_id = result.get('pickup_reservation_id')
+                    held = self.pickup_store.snapshot()['reservations']
+                    if any(item['reservation_id'] == reservation_id and item['state'] == 'inflight'
+                           for item in held):
+                        self.pickup_store.mark_unknown(self._pickup_token, reservation_id)
+                self.journal.mark_unknown(order['request_id'], 'simulated action outcome unavailable')
+                self._restart_blocked = True
+            else:
+                observation = {key: robot.get(key) for key in ('status', 'phase', 'current_node')}
+                if observation != self._last_persisted_observation.get(order['request_id']):
+                    self.journal.update_active(order['request_id'], {'last_observation': observation})
+                    self._last_persisted_observation[order['request_id']] = observation
     def _invalidate_snapshot(self):
         with self._snapshot_lock:
             self._snapshot_valid = False
@@ -182,6 +436,8 @@ class DemoRuntime:
         result['stale'] = stale
         result['connected'] = not stale and ready and self.connected.is_set() and not self.stop_event.is_set()
         result['unreal_connected'] = not stale and self.actions.available_fast()
+        if self.journal is not None:
+            result['recovery_required'] = self._restart_blocked or not self._world_ready.is_set()
         if stale or not result['connected'] or not result['unreal_connected']:
             result['accepting_orders'] = False
         if result.get('mode') == 'fleet':
@@ -193,6 +449,8 @@ class DemoRuntime:
                 and all(item.get('status') not in ('unknown', 'failed') for item in robots)
                 and any(item.get('orders_remaining', 0) > 0 for item in robots)
                 and getattr(self.admission, 'can_accept', False) is True)
+            if self.journal is not None and result['recovery_required']:
+                result['accepting_orders'] = result['accepting_queued_orders'] = False
         return result
 
     def create_order(self, pickup, destination):
@@ -243,6 +501,8 @@ class DemoRuntime:
     def submit_product_order(self, product_id, request_key=None):
         if not any(item['id'] == product_id for item in PRODUCTS):
             raise ValueError('unknown product')
+        if self.journal is not None:
+            return self.admission.submit_product(product_id, request_key)
         if self._fleet_mode:
             # Capture the owner without waiting for the potentially slow
             # control lock. The worker revalidates it under the lock before
@@ -416,6 +676,20 @@ class DemoRuntime:
                                     self.engine.action_unknown()
                             break
                 else:
+                    if self.journal is not None and (not self._world_ready.is_set() or self._restart_blocked):
+                        self._bootstrap_world()
+                        self._refresh_waiting_snapshot()
+                        previous = now
+                        self.stop_event.wait(0.2)
+                        continue
+                    if (self.journal is not None and self.actions.available_fast()
+                            and self._transport_ready() and not self.engine.inventory.ready):
+                        # A fresh shelf snapshot is pending after an ACK; this
+                        # is an observation barrier, not a transport failure.
+                        self._refresh_waiting_snapshot()
+                        previous = now
+                        self.stop_event.wait(0.2)
+                        continue
                     if self.auto_recovery:
                         if not self.actions.available_fast():
                             self._refresh_waiting_snapshot()
@@ -459,12 +733,16 @@ async def lifespan(app):
     map_data = json.loads(raw.decode('utf-8'))
     nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in map_data['nodes']]
     with ExitStack() as cleanup:
+        journal = None
+        pickup_store = None
+        recovery_blocked = False
         if os.environ.get('AGV_ORDER_COORDINATED') == '1':
             # A fresh, disposable DB and dedicated robot are only for the
             # launcher-owned isolated broker; never share them with hardware.
             from server.order_sim_map import make_order_sim_map
             from server.sim_handoff_store import SimHandoffStore
             from server.sim_runtime import SimRuntime
+            from server.sim_runtime import _DatabaseOwner
             from server.sim_order_authorization import SimOrderAuthorizer
             from server.order_product_control import ProductControlEngine
             from server.order_fleet import FleetProductControlEngine
@@ -472,15 +750,66 @@ async def lifespan(app):
             from sim.order_inbox import SimOrderInbox
             from sim.order_executor import SimOrderExecutor
             from sim.mqtt_order_robot import SimMqttOrderRobot
-            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
             sim_map = make_order_sim_map(map_data)
-            db_path = folder / 'server.sqlite3'
             fleet_enabled = os.environ.get('AGV_ORDER_FLEET') == '1'
+            persistent_dir = os.environ.get('AGV_ORDER_PERSIST_DIR')
+            if persistent_dir:
+                if not fleet_enabled or os.environ.get('AGV_ORDER_SHELF_SYNC') != '1':
+                    raise ValueError('persistent demo requires fleet and shelf synchronization')
+                from server.order_persistence import PersistentOrderStore
+                folder = Path(persistent_dir).resolve()
+                folder.mkdir(parents=True, exist_ok=True)
+                owner = _DatabaseOwner(folder / 'orders.sqlite3')
+                owner.acquire()
+                cleanup.callback(owner.release)
+                fingerprint = hashlib.sha256(json.dumps(sim_map, sort_keys=True, separators=(',', ':'),
+                                                        allow_nan=False).encode('utf-8')).hexdigest()
+                journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, PRODUCTS)
+                from server.order_pickup_inventory import PickupInventory
+                pickup_path = folder / 'pickup-inventory.sqlite3'
+                pickup_sources = {item['pickup_node']: item['product_type'] for item in PRODUCTS}
+                if journal.pickup_id is not None:
+                    pickup_store = PickupInventory.open_existing(pickup_path, pickup_sources,
+                                                                 expected_creation_id=journal.pickup_id)
+                elif pickup_path.exists() or journal.simulation_id is not None:
+                    raise RuntimeError('unbound pickup inventory requires manual recovery')
+                else:
+                    pickup_store = PickupInventory.create_new(pickup_path, pickup_sources)
+                    journal.bind_pickup_id(pickup_store.creation_id)
+                journal.recover_interrupted()
+                saved_orders = journal.list_orders()
+                recovery_blocked = any(row['state'] == 'unknown' for row in saved_orders)
+                saved_pickups = pickup_store.snapshot()['reservations']
+                pickup_by_request = {item['request_id']: item for item in saved_pickups}
+                order_by_request = {item['request_id']: item for item in saved_orders}
+                for row in saved_orders:
+                    reservation = pickup_by_request.get(row['request_id'])
+                    if row['state'] == 'queued' and reservation and reservation['state'] != 'reserved':
+                        recovery_blocked = True
+                    if row['state'] == 'completed':
+                        result = row.get('result') or {}
+                        if (not reservation or reservation['state'] != 'consumed'
+                                or reservation['reservation_id'] != result.get('pickup_reservation_id')):
+                            recovery_blocked = True
+                if any(item['request_id'] not in order_by_request for item in saved_pickups):
+                    recovery_blocked = True
+                db_path = folder / 'simulation.sqlite3'
+            else:
+                folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
+                db_path = folder / 'server.sqlite3'
             if fleet_enabled:
                 starts = {'sim-r1': 'J01', 'sim-r2': 'J05'}
                 if not set(starts.values()).issubset({node['id'] for node in sim_map['nodes']}):
                     raise ValueError('fleet demo start nodes are absent from the map')
-                store = SimHandoffStore.create_new(db_path, simulation_enabled=True, idle_positions=starts)
+                if journal is not None and journal.simulation_id is not None:
+                    store = SimHandoffStore.open_existing(db_path, expected_creation_id=journal.simulation_id,
+                                                          expected_idle_enabled=True, simulation_enabled=True)
+                elif journal is not None and db_path.exists():
+                    raise RuntimeError('unbound simulation database requires manual recovery')
+                else:
+                    store = SimHandoffStore.create_new(db_path, simulation_enabled=True, idle_positions=starts)
+                    if journal is not None:
+                        journal.bind_simulation_id(store.creation_id)
             else:
                 starts = {'sim-r1': sim_map['nodes'][0]['id']}
                 store = SimHandoffStore.create_new(db_path, simulation_enabled=True)
@@ -509,14 +838,25 @@ async def lifespan(app):
                 authorizer = SimOrderAuthorizer(runtime, robot_id=robot_id)
                 robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, start),
                                           port, authorization_guard=authorizer.guard)
-                robot.start()
-                cleanup.callback(robot.stop)
                 engines[robot_id] = ProductControlEngine(
                     runtime, robot, sim_map, product_lookup, robot_id=robot_id,
                     twin_id={'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}[robot_id],
                     session=session_names[robot_id], task_prefix=prefixes[robot_id],
                     wait_for_reservation=fleet_enabled)
-            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in PRODUCTS})
+                if journal is not None:
+                    completed = [row for row in journal.list_orders() if row['state'] == 'completed'
+                                 and isinstance(row['result'], dict)
+                                 and row['result'].get('assigned_robot') == robot_id]
+                    if completed:
+                        checkpoint = completed[-1]['result'].get('checkpoint')
+                        try:
+                            engines[robot_id].restore_completed_checkpoint(checkpoint)
+                        except (ValueError, RuntimeError, KeyError, TypeError):
+                            recovery_blocked = True
+                            logging.getLogger(__name__).exception('saved simulated stop could not be verified')
+                robot.start()
+                cleanup.callback(robot.stop)
+            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in PRODUCTS}, store=journal)
                          if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
             engine = FleetProductControlEngine(engines, sim_map, inventory=inventory) if fleet_enabled else engines['sim-r1']
         else:
@@ -526,7 +866,8 @@ async def lifespan(app):
         cleanup.callback(stop_mqtt, service)
         demo = DemoRuntime(engine, port, nodes, service,
                            auto_recovery=(os.environ.get('AGV_ORDER_COORDINATED') == '1'
-                                          and os.environ.get('AGV_ORDER_FLEET') == '1'))
+                                          and os.environ.get('AGV_ORDER_FLEET') == '1'),
+                           journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store)
         app.state.mqtt_service = service
         try:
             demo.start()
@@ -589,8 +930,51 @@ def status(request: Request):
 def products(request: Request):
     demo = _demo(request)
     automatic = getattr(getattr(demo, 'engine', None), 'inventory', None) is not None
+    journal = getattr(demo, 'journal', None)
+    catalog = journal.products.values() if journal is not None else PRODUCTS
     return {'products': [{key: value for key, value in product.items()
-                          if not automatic or key != 'slot_index'} for product in PRODUCTS]}
+                          if not automatic or key != 'slot_index'} for product in catalog]}
+
+
+def _public_order(row):
+    result = row.get('result') or {}
+    return dict(request_id=row['request_id'], product_id=row['product_id'], status=row['state'],
+                assigned_robot=result.get('assigned_robot'), shelf_id=result.get('shelf_id'),
+                slot_index=result.get('slot_index'), last_observation=result.get('last_observation'),
+                error=row.get('error'))
+
+
+@app.get('/order-demo/api/orders')
+def order_history(request: Request):
+    journal = getattr(_demo(request), 'journal', None)
+    if journal is None:
+        raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
+    return {'orders': [_public_order(row) for row in journal.list_orders()]}
+
+
+@app.get('/order-demo/api/orders/{request_id}')
+def order_status(request_id: str, request: Request):
+    journal = getattr(_demo(request), 'journal', None)
+    if journal is None:
+        raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
+    try:
+        return _public_order(journal.get_order(request_id))
+    except (KeyError, ValueError):
+        raise HTTPException(404, '주문을 찾을 수 없습니다') from None
+
+
+@app.get('/order-demo/api/inventory')
+def inventory_status(request: Request):
+    demo = _demo(request)
+    journal = getattr(demo, 'journal', None)
+    if journal is None:
+        raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
+    result = journal.load_shelves()
+    result['fresh'] = bool(demo.actions.available_fast() and demo._world_ready.is_set()
+                           and demo.engine.inventory.ready)
+    if demo.pickup_store is not None:
+        result['pickup'] = demo.pickup_store.snapshot()
+    return result
 
 
 @app.get('/order-demo/api/submissions/{request_id}')

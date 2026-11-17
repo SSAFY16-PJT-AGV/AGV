@@ -196,6 +196,9 @@ async def digital_twin(websocket: WebSocket):
                 if current_revision == revisions[robot_id]:
                     continue
                 revisions[robot_id] = current_revision
+                state_gate = getattr(actions, 'can_send_state', None) if claimed else None
+                if state_gate is not None and not state_gate():
+                    continue
                 received_at = snapshot['received_at']
                 if (not snapshot['connected'] or not snapshot['ready'] or received_at is None
                         or not 0 <= time.monotonic() - received_at <= MAX_OBSERVATION_AGE_SECONDS):

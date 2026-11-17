@@ -95,7 +95,8 @@ def wait_for_demo(server, log_path, timeout=20):
     raise TimeoutError('시연 서버가 MQTT에 연결되지 않았습니다')
 
 
-def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps'):
+def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
+        state_dir=ROOT / 'data' / 'order-demo-state'):
     map_path, editor, project, ddc, broker_deps = validate_inputs(
         map_path, editor, project, ddc, broker_deps)
     broker_port = _select_broker_port()
@@ -103,6 +104,7 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
     broker_env = clean_environment(os.environ)
     broker_env['PYTHONPATH'] = str(broker_deps)
     server_env = make_server_environment(os.environ, broker_port, token, map_path)
+    server_env['AGV_ORDER_PERSIST_DIR'] = str(Path(state_dir).resolve())
     editor_env = clean_environment(os.environ)
     editor_env['AGV_TWIN_UNREAL_TOKEN'] = token
     base_python = getattr(sys, '_base_executable', sys.executable)
@@ -135,7 +137,13 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
                     print('Ctrl+C로 시연 서버와 브로커를 종료합니다. Unreal은 직접 닫으세요.', flush=True)
                     while True:
                         if server.poll() is not None:
-                            raise RuntimeError('시연 서버가 종료됐습니다')
+                            print('시연 서버가 종료되어 저장된 상태로 재시작합니다.', flush=True)
+                            server = subprocess.Popen([base_python, '-m', 'uvicorn', 'server.order_demo_app:app',
+                                                       '--host', '127.0.0.1', '--port', str(SERVER_PORT),
+                                                       '--workers', '1', '--no-proxy-headers'],
+                                                      cwd=ROOT, env=server_env, stdout=server_log,
+                                                      stderr=server_log, creationflags=flags)
+                            wait_for_demo(server, server_path)
                         if broker is None or broker.poll() is not None:
                             # Keep the same server, simulated robots and DB alive.
                             # A failed broker restart is retried, never mistaken for
@@ -171,9 +179,11 @@ def main():
     parser.add_argument('--ddc-path', help='optional existing Unreal derived data cache directory')
     parser.add_argument('--broker-deps', default=str(ROOT / '.venv' / 'broker-deps'),
                         help='directory containing separately installed aMQTT')
+    parser.add_argument('--state-dir', default=str(ROOT / 'data' / 'order-demo-state'),
+                        help='persistent isolated simulation state directory')
     args = parser.parse_args()
     try:
-        run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps)
+        run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps, args.state_dir)
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         print('시연 실패: {}'.format(exc), file=sys.stderr)
         return 1

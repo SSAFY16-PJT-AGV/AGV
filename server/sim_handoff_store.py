@@ -6,9 +6,11 @@ nor a simulated event proves a physical robot's state or message identity.
 Existing allocation databases are never opened or migrated by create_new().
 """
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import threading
@@ -23,6 +25,10 @@ from sim.event_receiver import SimEventReceiver
 
 
 _CONSTRUCTION_KEY = object()
+_SCHEMA_HASHES = {
+    False: 'f7bb0641f03d58fbcd478b1a4c0117b33bd1971b7704732bb7c6e786ac011b22',
+    True: '77c77335f721d5cd94bee5bbb60b5707bcf0e81f42f6a546bcda9755bf1a82ca',
+}
 
 
 class SimResourceBusy(AllocationConflict):
@@ -57,6 +63,7 @@ class SimHandoffStore(AllocationStore):
         os.close(descriptor)
         store = cls(name, _key=_CONSTRUCTION_KEY)
         store._idle_enabled = idle_positions is not None
+        store._reopened = False
         store._created_path = os.path.normcase(os.path.realpath(name))
         store._creation_id = secrets.token_hex(32)
         created_stat = os.stat(name)
@@ -106,7 +113,46 @@ class SimHandoffStore(AllocationStore):
                            "BEGIN SELECT RAISE(ABORT,'idle simulated robot occupies node'); END")
         return store
 
-    def validate_bound(self, path):
+    @property
+    def creation_id(self):
+        """Persist separately from this DB; never derive a restart identity from it."""
+        return self._creation_id
+
+    @property
+    def reopened(self):
+        return self._reopened
+
+    @classmethod
+    def open_existing(cls, path, *, expected_creation_id, expected_idle_enabled,
+                      simulation_enabled=False):
+        """Bind an existing isolated DB without creating, resetting, or migrating it.
+
+        A separately persisted creation identity is mandatory. Reopening is not
+        authorization to publish, move, release reservations, or assume a pose.
+        """
+        if simulation_enabled is not True or type(expected_idle_enabled) is not bool:
+            raise ValueError('explicit isolated simulation and idle mode required')
+        if not isinstance(expected_creation_id, str) or not re.fullmatch('[0-9a-f]{64}', expected_creation_id):
+            raise ValueError('independent simulation creation identity required')
+        name = os.fspath(path)
+        if not isinstance(name, str) or not name or name == ':memory:':
+            raise ValueError('existing file-backed simulation database required')
+        try:
+            if os.path.islink(name) or not os.path.isfile(name):
+                raise ValueError('existing regular simulation database required')
+            stat = os.stat(name)
+        except OSError as exc:
+            raise ValueError('existing simulation database unavailable') from exc
+        store = cls(name, _key=_CONSTRUCTION_KEY)
+        store._idle_enabled = expected_idle_enabled
+        store._reopened = True
+        store._created_path = os.path.normcase(os.path.realpath(name))
+        store._creation_id = expected_creation_id
+        store._creation_file = (stat.st_dev, stat.st_ino)
+        store.validate_bound(name, check_schema=True)
+        return store
+
+    def validate_bound(self, path, *, check_schema=False):
         """Fail closed if the exclusively created simulation DB was replaced."""
         if (os.path.normcase(os.path.realpath(os.fspath(path))) != self._created_path
                 or os.path.normcase(os.path.realpath(self.path)) != self._created_path):
@@ -117,6 +163,19 @@ class SimHandoffStore(AllocationStore):
                 raise ValueError('simulation store file was replaced')
             uri = Path(self.path).resolve().as_uri() + '?mode=ro'
             with closing(sqlite3.connect(uri, uri=True)) as db:
+                if self._reopened and check_schema:
+                    if db.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                        raise ValueError('simulation database integrity check failed')
+                    if db.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                        raise ValueError('simulation database foreign keys are invalid')
+                    schema = db.execute("SELECT type,name,sql FROM sqlite_master WHERE "
+                        "(type='trigger' AND name LIKE 'sim_%') OR (type='table' AND name IN "
+                        "('tasks','sim_store_identity','allocation_jobs','sim_active_robots',"
+                        "'sim_handoff_transfers','allocation_occupancy','allocation_outbox',"
+                        "'allocation_meta','sim_idle_robots')) ORDER BY type,name").fetchall()
+                    digest = hashlib.sha256(json.dumps(schema, separators=(',', ':')).encode()).hexdigest()
+                    if digest != _SCHEMA_HASHES[self._idle_enabled]:
+                        raise ValueError('simulation database schema or protection changed')
                 values = db.execute('SELECT value FROM sim_store_identity').fetchall()
                 trigger = db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name='sim_activate_robot'").fetchone()
                 if self._idle_enabled:
@@ -126,6 +185,9 @@ class SimHandoffStore(AllocationStore):
                         raise ValueError('simulation idle protection is invalid')
             if values != [(self._creation_id,)] or trigger != ('sim_activate_robot',):
                 raise ValueError('simulation database identity is invalid')
+            info = os.stat(self.path)
+            if (info.st_dev, info.st_ino) != self._creation_file:
+                raise ValueError('simulation store file was replaced')
         except (OSError, sqlite3.Error) as exc:
             raise ValueError('fresh simulation database is unavailable') from exc
 

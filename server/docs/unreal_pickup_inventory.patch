@@ -1,0 +1,105 @@
+--- a/Source/agvSimulation/AGVRobot.h
++++ b/Source/agvSimulation/AGVRobot.h
+@@ -96,0 +97,3 @@
++    // Demo pickup inventory; false means the world cannot be proven valid.
++    static bool GetPickupAvailability(UWorld* World, EProductType ProductType,
++        int32& OutCount, FVector& OutCenter);
+--- a/Source/agvSimulation/AGVRobot.cpp
++++ b/Source/agvSimulation/AGVRobot.cpp
+@@ -387,0 +388,58 @@
++// Both the snapshot and the grab use these exact demo source rules.
++// Items and node positions belong to this UWorld; never infer stock in another world.
++static bool CollectPickupObjects(UWorld* World, EProductType ProductType,
++    FVector& OutCenter, TArray<AAGVGrabbableObject*>& OutCandidates)
++{
++    if (!IsValid(World) || !IsInGameThread()) return false;
++    FString NodeId;
++    if (ProductType == EProductType::Red) NodeId = TEXT("D01");
++    else if (ProductType == EProductType::Blue) NodeId = TEXT("D06");
++    else return false;
++
++    int32 LoaderCount = 0;
++    int32 NodeCount = 0;
++    for (TActorIterator<AWarehouseMapLoader> It(World); It; ++It)
++    {
++        if (!IsValid(*It)) return false;
++        ++LoaderCount;
++        for (const FWarehouseNode& Node : It->Nodes)
++        {
++            if (Node.Id == NodeId) { OutCenter = Node.Position; ++NodeCount; }
++        }
++    }
++    if (LoaderCount != 1 || NodeCount != 1 || OutCenter.ContainsNaN()) return false;
++    TArray<AAGVDisplayShelf*> Shelves;
++    for (TActorIterator<AAGVDisplayShelf> It(World); It; ++It)
++    {
++        if (!IsValid(*It) || !It->IsSlotSnapshotValid()) return false;
++        Shelves.Add(*It);
++    }
++    if (Shelves.Num() != 2) return false;
++    for (TActorIterator<AAGVGrabbableObject> It(World); It; ++It)
++    {
++        AAGVGrabbableObject* Candidate = *It;
++        if (!IsValid(Candidate)) return false;
++        if (Candidate->bIsGrabbed || Candidate->GetProductType() != ProductType) continue;
++        bool bOnShelf = false;
++        for (AAGVDisplayShelf* Shelf : Shelves)
++        {
++            if (Shelf->FindProductSlot(Candidate) != INDEX_NONE) { bOnShelf = true; break; }
++        }
++        if (bOnShelf) continue;
++        const FVector Position = Candidate->GetActorLocation();
++        if (Position.ContainsNaN()) return false;
++        if (FVector::Dist2D(Position, OutCenter) <= 200.0)
++            OutCandidates.Add(Candidate);
++    }
++    return true;
++}
++
++bool AAGVRobot::GetPickupAvailability(UWorld* World, EProductType ProductType,
++    int32& OutCount, FVector& OutCenter)
++{
++    TArray<AAGVGrabbableObject*> Candidates;
++    if (!CollectPickupObjects(World, ProductType, OutCenter, Candidates)) return false;
++    OutCount = Candidates.Num();
++    return true;
++}
++
+@@ -405,0 +464,4 @@
++    FVector PickupCenter;
++    TArray<AAGVGrabbableObject*> EligibleCandidates;
++    if (!CollectPickupObjects(GetWorld(), ProductType, PickupCenter, EligibleCandidates) ||
++        FVector::Dist2D(GetActorLocation(), PickupCenter) > 25.0) return false;
+@@ -420 +482 @@
+-        if (Candidate->bIsGrabbed)
++        if (Candidate->bIsGrabbed || !EligibleCandidates.Contains(Candidate))
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -380,0 +381,14 @@
++            TArray<TSharedPtr<FJsonValue>> PickupValues;
++            for (int32 I = 0; I < 2; ++I)
++            {
++                const EProductType Type = I == 0 ? EProductType::Red : EProductType::Blue;
++                int32 Available = 0;
++                FVector Center;
++                if (!AAGVRobot::GetPickupAvailability(Self->GetWorld(), Type, Available, Center)) return;
++                TSharedRef<FJsonObject> Pickup = MakeShared<FJsonObject>();
++                Pickup->SetStringField(TEXT("source_id"), I == 0 ? TEXT("D01") : TEXT("D06"));
++                Pickup->SetStringField(TEXT("product_type"), I == 0 ? TEXT("Red") : TEXT("Blue"));
++                Pickup->SetNumberField(TEXT("available"), Available);
++                PickupValues.Add(MakeShared<FJsonValueObject>(Pickup));
++            }
++            Data->SetArrayField(TEXT("pickups"), PickupValues);
+@@ -612 +626,11 @@
+-            bApplied = Robot->ApplyExternalGrabSuccess(ProductType);
++            int32 PickupCount = 0;
++            FVector PickupCenter;
++            double PickupX = 0.0;
++            double PickupY = 0.0;
++            const bool bSourceMatches = bCorrelated &&
++                (*DataObject)->TryGetNumberField(TEXT("expected_x"), PickupX) &&
++                (*DataObject)->TryGetNumberField(TEXT("expected_y"), PickupY) &&
++                AAGVRobot::GetPickupAvailability(GetWorld(), ProductType, PickupCount, PickupCenter) &&
++                FVector::Dist2D(PickupCenter, FVector(PickupX * Robot->GetExternalPositionScale(),
++                    PickupY * Robot->GetExternalPositionScale(), PickupCenter.Z)) <= 1.0;
++            bApplied = bSourceMatches && Robot->ApplyExternalGrabSuccess(ProductType);

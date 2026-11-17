@@ -129,8 +129,11 @@ class PickupWorkflow:
             return False
         nodes = order.get('nodes')
         task, stop = self.accept_preceding
+        executor = getattr(self.robot, 'executor', None)
+        recovered = (state.get('recovered') is True and callable(getattr(executor, 'matches_recovered_stop', None))
+                     and executor.matches_recovered_stop(task, stop, receipt))
         return (state.get('status') == 'stopped' and state.get('current_node') == stop
-                and receipt.get('state') == 'completed' and receipt.get('new') is True
+                and receipt.get('state') == 'completed' and (receipt.get('new') is True or recovered)
                 and receipt.get('order_id') == task and order.get('order_id') == task
                 and receipt.get('seq') == order.get('seq') and isinstance(nodes, list)
                 and bool(nodes) and nodes[-1] == stop and order.get('released_until') == stop)

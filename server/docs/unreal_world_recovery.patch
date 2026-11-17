@@ -1,0 +1,81 @@
+--- a/Source/agvSimulation/AGVRobot.h
++++ b/Source/agvSimulation/AGVRobot.h
+@@ -48,2 +48,8 @@
+     float GetExternalPositionScale() const { return ExternalPositionScale; }
++    bool IsRecoveryPoseValid() const
++    {
++        return MovementMode == EAGVMovementMode::External &&
++            FMath::IsFinite(ExternalPositionScale) && ExternalPositionScale > 0.0f;
++    }
++    bool IsRecoveryInterpolating() const { return bExternalInterpolating || bExternalRotating; }
+ 
+--- a/Source/agvSimulation/AGVWebSocketClient.h
++++ b/Source/agvSimulation/AGVWebSocketClient.h
+@@ -59,2 +59,5 @@
+     TSharedPtr<IWebSocket> Socket;
++    // Fresh for each actor/world lifetime; never changed by reconnecting.
++    FString RecoveryWorldId;
++    TWeakObjectPtr<UWorld> RecoveryWorld;
+ 
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -24,2 +24,7 @@
+     Super::BeginPlay();
++    RecoveryWorld = GetWorld();
++    if (RecoveryWorld.IsValid())
++    {
++        RecoveryWorldId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
++    }
+ 
+@@ -290,3 +295,4 @@
+             if (!IsValid(Self) || !Connection.IsValid() ||
+-                Self->Socket != Connection || !Connection->IsConnected() || !Self->GetWorld())
++                Self->Socket != Connection || !Connection->IsConnected() || !Self->GetWorld() ||
++                Self->RecoveryWorld.Get() != Self->GetWorld() || Self->RecoveryWorldId.IsEmpty())
+             {
+@@ -331,2 +337,45 @@
+             Data->SetArrayField(TEXT("shelves"), ShelfValues);
++            // Display pose is a simulated observation, never physical evidence.
++            // Missing, duplicate, or non-external demo AGVs fail closed.
++            TArray<TSharedPtr<FJsonValue>> RobotValues;
++            TSet<FString> SeenRobots;
++            for (TActorIterator<AAGVRobot> It(Self->GetWorld()); It; ++It)
++            {
++                AAGVRobot* Robot = *It;
++                if (!IsValid(Robot))
++                {
++                    return;
++                }
++                const FString Id = Robot->GetAGVId();
++                if ((Id != TEXT("AGV_01") && Id != TEXT("AGV_02")) || SeenRobots.Contains(Id) ||
++                    !Robot->IsRecoveryPoseValid())
++                {
++                    return;
++                }
++                SeenRobots.Add(Id);
++                const FVector Position = Robot->GetActorLocation();
++                const double Scale = Robot->GetExternalPositionScale();
++                const double X = Position.X / Scale;
++                const double Y = Position.Y / Scale;
++                const double Yaw = Robot->GetActorRotation().Yaw;
++                if (!FMath::IsFinite(X) || !FMath::IsFinite(Y) || !FMath::IsFinite(Yaw))
++                {
++                    return;
++                }
++                TSharedRef<FJsonObject> RobotObject = MakeShared<FJsonObject>();
++                RobotObject->SetStringField(TEXT("agv_id"), Id);
++                RobotObject->SetNumberField(TEXT("x"), X);
++                RobotObject->SetNumberField(TEXT("y"), Y);
++                RobotObject->SetNumberField(TEXT("yaw"), Yaw);
++                RobotObject->SetBoolField(TEXT("carrying"), Robot->IsHoldingObject());
++                RobotObject->SetBoolField(TEXT("interpolating"), Robot->IsRecoveryInterpolating());
++                RobotValues.Add(MakeShared<FJsonValueObject>(RobotObject));
++            }
++            if (SeenRobots.Num() != 2 || !SeenRobots.Contains(TEXT("AGV_01")) ||
++                !SeenRobots.Contains(TEXT("AGV_02")))
++            {
++                return;
++            }
++            Data->SetStringField(TEXT("world_id"), Self->RecoveryWorldId);
++            Data->SetArrayField(TEXT("robots"), RobotValues);
+             TSharedRef<FJsonObject> Reply = MakeShared<FJsonObject>();
