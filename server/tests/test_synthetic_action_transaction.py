@@ -64,6 +64,14 @@ class SyntheticTransactionTests(unittest.TestCase):
         args.update(overrides)
         return session.stage_attempt(**args)
 
+    def result(self, session, outcome, **overrides):
+        self.assertTrue(hasattr(session, 'record_result'), 'synthetic result boundary is not implemented')
+        self.assertTrue(hasattr(session, 'session_id'), 'synthetic generation is not exposed')
+        args = dict(request_id='request-1', task_id='web-pickup', action_id='action-1',
+                    agv_id='AGV_01', world_id=WORLD, session_id=session.session_id, outcome=outcome)
+        args.update(overrides)
+        return session.record_result(**args)
+
     def seed_extra_reservation(self, *, number, task, robot):
         result = {'assigned_robot': robot, 'order_id': task, 'shelf_id': 'SHELF_RED',
                   'slot_index': number - 1, 'reservation_id': f'slot-{number}',
@@ -101,6 +109,246 @@ class SyntheticTransactionTests(unittest.TestCase):
         with self.assertRaises((ValueError, RuntimeError)):
             self.stage(session)
         self.assertEqual(len(self.database_state()[0]), 1)
+
+    def test_applied_result_consumes_stock_once_and_duplicate_is_idempotent(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.stage(session)
+        self.assertEqual(self.result(session, 'applied')['outcome'], 'applied')
+        attempts, slots, pickup, counts = self.database_state()
+        self.assertEqual(attempts, [('request-1', 'web-pickup', 'action-1', 'AGV_01', 'grab', 'applied')])
+        self.assertEqual(slots, [('reserved',)])
+        self.assertEqual(pickup, [('consumed', 'web-pickup', 'action-1', 'AGV_01')])
+        self.assertEqual(counts, [(0,)])
+        before = self.database_state()
+        self.assertEqual(self.result(session, 'applied')['outcome'], 'applied')
+        self.assertEqual(self.database_state(), before)
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.result(session, 'not_applied')
+        self.assertEqual(self.database_state(), before)
+
+    def test_not_applied_or_unknown_holds_slot_and_blocks_new_attempts(self):
+        for outcome, pickup_state in (('not_applied', 'released'), ('unknown', 'unknown')):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as folder:
+                self.path = Path(folder) / 'session'
+                session = self.create()
+                try:
+                    self.seed_test_reservation()
+                    self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+                    self.stage(session)
+                    self.assertEqual(self.result(session, outcome)['outcome'], outcome)
+                    attempts, slots, pickup, counts = self.database_state()
+                    self.assertEqual(attempts[0][-1], outcome)
+                    self.assertEqual([row[0] for row in slots], ['reserved', 'reserved'])
+                    self.assertEqual(pickup[0][0], pickup_state)
+                    self.assertEqual(pickup[1][0], 'reserved')
+                    self.assertEqual(counts, [(3,)])
+                    before = self.database_state()
+                    self.assertEqual(self.result(session, outcome)['outcome'], outcome)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        self.stage(session, request_id='request-2', task_id='web-pickup-2',
+                                   action_id='action-2', agv_id='AGV_02')
+                    self.assertEqual(self.database_state(), before)
+                    self.assertEqual(self.result(session, outcome)['outcome'], outcome)
+                finally:
+                    session.close()
+
+    def test_two_independent_applied_results_decrement_stock_once_each(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+        self.stage(session)
+        self.stage(session, request_id='request-2', task_id='web-pickup-2', action_id='action-2', agv_id='AGV_02')
+        self.assertEqual(self.result(session, 'applied')['outcome'], 'applied')
+        self.assertEqual(self.result(session, 'applied', request_id='request-2', task_id='web-pickup-2',
+                                     action_id='action-2', agv_id='AGV_02')['outcome'], 'applied')
+        attempts, slots, pickups, counts = self.database_state()
+        self.assertEqual([row[-1] for row in attempts], ['applied', 'applied'])
+        self.assertEqual([row[0] for row in pickups], ['consumed', 'consumed'])
+        self.assertEqual(slots, [('reserved',), ('reserved',)])
+        self.assertEqual(counts, [(1,)])
+
+    def test_unknown_result_blocks_another_inflight_result_but_allows_duplicate(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+        self.stage(session)
+        self.stage(session, request_id='request-2', task_id='web-pickup-2', action_id='action-2', agv_id='AGV_02')
+        self.result(session, 'unknown')
+        before = self.database_state()
+        with self.assertRaises(RuntimeError):
+            self.result(session, 'applied', request_id='request-2', task_id='web-pickup-2',
+                        action_id='action-2', agv_id='AGV_02')
+        self.assertEqual(self.database_state(), before)
+        self.assertTrue(self.result(session, 'unknown')['duplicate'])
+
+    def test_corrupt_resolved_pickup_blocks_other_result_without_second_decrement(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+        self.stage(session)
+        self.stage(session, request_id='request-2', task_id='web-pickup-2', action_id='action-2', agv_id='AGV_02')
+        self.result(session, 'applied')
+        with closing(sqlite3.connect(self.path / 'pickup-inventory.sqlite3')) as db:
+            db.execute("UPDATE reservations SET state='unknown' WHERE reservation_id='pickup-1'")
+            db.commit()
+        before = self.database_state()
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.result(session, 'applied', request_id='request-2', task_id='web-pickup-2',
+                        action_id='action-2', agv_id='AGV_02')
+        self.assertEqual(self.database_state(), before)
+
+    def test_freshness_fence_corruption_cannot_reenable_progress(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+        self.stage(session)
+        self.result(session, 'not_applied')
+        with closing(sqlite3.connect(self.path / 'orders.sqlite3')) as db:
+            db.execute('UPDATE synthetic_action_session SET progress_blocked=0')
+            db.commit()
+        before = self.database_state()
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.stage(session, request_id='request-2', task_id='web-pickup-2',
+                       action_id='action-2', agv_id='AGV_02')
+        self.assertEqual(self.database_state(), before)
+
+    def test_orphan_resolved_pickup_blocks_other_result(self):
+        for state in ('consumed', 'released'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as folder:
+                self.path = Path(folder) / 'session'
+                session = self.create()
+                try:
+                    self.seed_test_reservation()
+                    self.seed_extra_reservation(number=2, task='web-pickup-2', robot='sim-r2')
+                    with closing(sqlite3.connect(self.path / 'pickup-inventory.sqlite3')) as db:
+                        db.execute("UPDATE reservations SET state=?,action_id='orphan-action' "
+                                   "WHERE reservation_id='pickup-1'", (state,))
+                        db.commit()
+                    before = self.database_state()
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        self.stage(session, request_id='request-2', task_id='web-pickup-2',
+                                   action_id='action-2', agv_id='AGV_02')
+                    self.assertEqual(self.database_state(), before)
+                finally:
+                    session.close()
+
+    def test_result_rejects_wrong_identity_or_generation_without_mutation(self):
+        scenarios = ({'request_id': 'wrong'}, {'task_id': 'wrong'}, {'action_id': 'wrong'},
+                     {'agv_id': 'AGV_02'}, {'world_id': 'b' * 32}, {'session_id': 'f' * 64})
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as folder:
+                self.path = Path(folder) / 'session'
+                session = self.create()
+                try:
+                    self.seed_test_reservation()
+                    self.stage(session)
+                    before = self.database_state()
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        self.result(session, 'applied', **scenario)
+                    self.assertEqual(self.database_state(), before)
+                finally:
+                    session.close()
+
+    def test_database_error_rolls_back_result_and_latches(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.stage(session)
+        before = self.database_state()
+        module = importlib.import_module('server.synthetic_action_transaction')
+        original = module._open_connection
+        def deny_count_update(pair):
+            db = original(pair)
+            def authorize(kind, arg1, arg2, name, trigger):
+                if kind == sqlite3.SQLITE_UPDATE and name == 'pickup' and arg1 == 'counts':
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            db.set_authorizer(authorize)
+            return db
+        with patch.object(module, '_open_connection', side_effect=deny_count_update):
+            with self.assertRaises((ValueError, RuntimeError)):
+                self.result(session, 'applied')
+        self.assertEqual(self.database_state(), before)
+        with self.assertRaises(RuntimeError):
+            self.result(session, 'applied')
+
+    def test_result_commit_then_failure_preserves_confirmed_count_and_blocks(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.stage(session)
+        original = session._pair._validate_live
+        calls = []
+        def fail_after_commit():
+            calls.append(True)
+            if len(calls) == 2:
+                raise ValueError('post-result commit check failed')
+            original()
+        with patch.object(session._pair, '_validate_live', side_effect=fail_after_commit):
+            with self.assertRaisesRegex(ValueError, 'post-result'):
+                self.result(session, 'applied')
+        attempts, slots, pickup, counts = self.database_state()
+        self.assertEqual(attempts[0][-1], 'applied')
+        self.assertEqual(slots, [('reserved',)])
+        self.assertEqual(pickup[0][0], 'consumed')
+        self.assertEqual(counts, [(0,)])
+        with self.assertRaises(RuntimeError):
+            self.result(session, 'applied')
+
+    def test_result_transaction_holds_both_database_writer_locks(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.stage(session)
+        entered, release = threading.Event(), threading.Event()
+        module = importlib.import_module('server.synthetic_action_transaction')
+        original = module._open_connection
+        def pause_after_begin(pair):
+            db = original(pair)
+            def trace(statement):
+                if 'FROM main.synthetic_pair_binding' in statement:
+                    entered.set()
+                    release.wait(5)
+            db.set_trace_callback(trace)
+            return db
+        with patch.object(module, '_open_connection', side_effect=pause_after_begin):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.result, session, 'applied')
+                try:
+                    self.assertTrue(entered.wait(5))
+                    for name in ('orders.sqlite3', 'pickup-inventory.sqlite3'):
+                        with closing(sqlite3.connect(self.path / name, isolation_level=None, timeout=0)) as db:
+                            with self.assertRaises(sqlite3.OperationalError) as error:
+                                db.execute('BEGIN IMMEDIATE')
+                            self.assertEqual(error.exception.sqlite_errorcode, sqlite3.SQLITE_BUSY)
+                finally:
+                    release.set()
+                self.assertEqual(future.result(timeout=5)['outcome'], 'applied')
+
+    def test_result_conflicting_concurrent_calls_never_consume_twice(self):
+        session = self.create()
+        self.seed_test_reservation()
+        self.stage(session)
+        entered, release = threading.Event(), threading.Event()
+        module = importlib.import_module('server.synthetic_action_transaction')
+        original = module._open_connection
+        def pause_after_begin(pair):
+            db = original(pair)
+            def trace(statement):
+                if 'FROM main.synthetic_pair_binding' in statement:
+                    entered.set()
+                    release.wait(5)
+            db.set_trace_callback(trace)
+            return db
+        with patch.object(module, '_open_connection', side_effect=pause_after_begin):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.result, session, 'applied')
+                try:
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(RuntimeError):
+                        self.result(session, 'not_applied')
+                finally:
+                    release.set()
+                self.assertEqual(future.result(timeout=5)['outcome'], 'applied')
+        self.assertEqual(self.database_state()[3], [(0,)])
 
     def test_same_task_or_same_robot_cannot_get_another_uncertain_attempt(self):
         for task, robot, agv in (('web-pickup-2', 'sim-r1', 'AGV_01'),
@@ -499,6 +747,72 @@ session.stage_attempt(request_id='request-1', task_id='web-pickup', action_id='a
             self.assertNotEqual(process.returncode, 0)
             self.assertEqual(self.database_state(),
                              ([], [('reserved',)], [('reserved', None, None, None)], [(1,)]))
+            with self.assertRaises(RuntimeError):
+                self.api().open_existing(self.path)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+            reader.join(timeout=5)
+
+    def test_result_process_death_before_attempt_update_preserves_uncertainty(self):
+        self.api()
+        code = r'''
+import json, sys
+import server.synthetic_action_transaction as transaction
+from server.synthetic_action_transaction import SyntheticActionSession
+data = json.loads(sys.stdin.readline())
+session = SyntheticActionSession.create_new(**data)
+print('ready', flush=True)
+sys.stdin.readline()
+session.stage_attempt(request_id='request-1', task_id='web-pickup', action_id='action-1',
+                      agv_id='AGV_01', action='grab')
+print('staged', flush=True)
+sys.stdin.readline()
+old = transaction._open_connection
+def wrapped(pair):
+    db = old(pair)
+    def trace(sql):
+        if sql.startswith('UPDATE main.synthetic_action_attempt SET state='):
+            print('after-pickup-result', flush=True)
+            sys.stdin.readline()
+    db.set_trace_callback(trace)
+    return db
+transaction._open_connection = wrapped
+session.record_result(request_id='request-1', task_id='web-pickup', action_id='action-1',
+                      agv_id='AGV_01', world_id=data['world_id'], session_id=session.session_id,
+                      outcome='applied')
+'''
+        process = subprocess.Popen([sys.executable, '-u', '-c', code], text=True,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = queue.Queue()
+        def collect():
+            for line in process.stdout:
+                output.put(line.strip())
+        reader = threading.Thread(target=collect, daemon=True)
+        reader.start()
+        try:
+            data = dict(path=str(self.path), map_id='map-v1', catalog=CATALOG, pickup_sources=SOURCES,
+                        world_id=WORLD, robot_twins={'sim-r1': 'AGV_01'})
+            process.stdin.write(json.dumps(data) + '\n')
+            process.stdin.flush()
+            self.assertEqual(output.get(timeout=20), 'ready')
+            self.seed_test_reservation()
+            process.stdin.write('go\n')
+            process.stdin.flush()
+            self.assertEqual(output.get(timeout=20), 'staged')
+            process.stdin.write('go\n')
+            process.stdin.flush()
+            self.assertEqual(output.get(timeout=20), 'after-pickup-result')
+            process.kill()
+            process.wait(timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(self.database_state(),
+                             ([('request-1', 'web-pickup', 'action-1', 'AGV_01', 'grab', 'uncertain')],
+                              [('reserved',)], [('inflight', 'web-pickup', 'action-1', 'AGV_01')], [(1,)]))
             with self.assertRaises(RuntimeError):
                 self.api().open_existing(self.path)
         finally:
