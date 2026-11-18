@@ -78,9 +78,13 @@ def _wait_for_test_server(testcase, child, folder, port):
 
 class PersistentFakeUnreal(FakeUnreal):
     """Keep the synthetic world's own pose, separate from restored server state."""
-    def __init__(self, port, token, simulated_map, world=None):
+    def __init__(self, port, token, simulated_map, world=None, *, drop_grab_ack=False):
         super().__init__(port, token)
         self.states_before_snapshot = []
+        self.drop_grab_ack = drop_grab_ack
+        self.grab_ack_dropped = threading.Event()
+        self.ping_requested = threading.Event()
+        self.ping_completed = threading.Event()
         if world is None:
             nodes = {node['id']: node for node in simulated_map['nodes']}
             self.world_id = secrets.token_hex(16)
@@ -101,6 +105,12 @@ class PersistentFakeUnreal(FakeUnreal):
                     'stock': dict(self.stock), 'world_id': self.world_id,
                     'robots': {key: dict(value) for key, value in self.robots.items()}}
 
+    def probe_connection(self):
+        """Require a fresh WebSocket pong from this test's server."""
+        self.ping_completed.clear()
+        self.ping_requested.set()
+        return self.ping_completed.wait(5)
+
     def _run(self):
         try:
             uri = 'ws://127.0.0.1:{}/ws/digital-twin'.format(self.port)
@@ -109,6 +119,11 @@ class PersistentFakeUnreal(FakeUnreal):
                 self.connected.set()
                 initial_snapshot_sent = False
                 while not self.stop_event.is_set():
+                    if self.ping_requested.is_set():
+                        self.ping_requested.clear()
+                        if not ws.ping().wait(3):
+                            raise AssertionError('fake Unreal did not receive a WebSocket pong')
+                        self.ping_completed.set()
                     try:
                         message = json.loads(ws.recv(timeout=.1))
                     except TimeoutError:
@@ -156,6 +171,11 @@ class PersistentFakeUnreal(FakeUnreal):
                             else:
                                 raise AssertionError('unexpected action')
                             self.actions.append(dict(data, applied=applied))
+                        if self.drop_grab_ack and data['action'] == 'grab' and applied:
+                            # The synthetic world changed, but the server never
+                            # receives a result for this action.
+                            self.grab_ack_dropped.set()
+                            continue
                         ws.send(action_reply(data, applied=applied))
                         if not applied:
                             raise AssertionError('fake Unreal rejected missing stock or occupied slot')
@@ -402,7 +422,10 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
     def test_completed_order_and_occupied_slot_survive_server_restart(self):
         self._exercise_restart(completed=True)
 
-    def _exercise_restart(self, *, completed):
+    def test_applied_grab_with_lost_ack_stays_unknown_after_server_restart(self):
+        self._exercise_restart(completed=False, lost_grab=True)
+
+    def _exercise_restart(self, *, completed, lost_grab=False):
         broker_port, server_port = free_port(), free_port()
         while broker_port == server_port or 8000 in (broker_port, server_port):
             broker_port, server_port = free_port(), free_port()
@@ -427,7 +450,10 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
             ready_file = str(folder / 'broker.ready')
             broker = subprocess.Popen([python, '-c', BROKER, str(broker_port), ready_file], cwd=ROOT,
                                       env=broker_env, stdout=broker_log, stderr=broker_log, creationflags=flags)
-            cleanup.callback(stop, broker)
+            def stop_owned(child):
+                stop(child)
+                self.assertIsNotNone(child.poll(), 'test-owned child must exit during cleanup')
+            cleanup.callback(stop_owned, broker)
             wait_for_owned_broker(self, broker, ready_file)
             env = isolated_environment(os.environ)
             for key in list(env):
@@ -445,12 +471,13 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
 
             def start_server():
                 child = _start_test_server(python, server_port, env, server_log, ROOT, flags)
-                cleanup.callback(stop, child)
+                cleanup.callback(stop_owned, child)
                 _wait_for_test_server(self, child, folder, server_port)
                 return child
 
-            def start_unreal(world=None):
-                unreal = PersistentFakeUnreal(server_port, token, simulated_map, world)
+            def start_unreal(world=None, *, drop_grab_ack=False):
+                unreal = PersistentFakeUnreal(server_port, token, simulated_map, world,
+                                              drop_grab_ack=drop_grab_ack)
                 unreal.start()
                 cleanup.callback(unreal.stop)
                 return unreal
@@ -489,7 +516,7 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
                 return 'request_id={!r}; actions={!r}; {}'.format(request_id, unreal.actions, child_evidence())
 
             server = start_server()
-            unreal = start_unreal()
+            unreal = start_unreal(drop_grab_ack=lost_grab)
             self.assertTrue(wait_for(lambda: get('/order-demo/api/status').get('accepting_orders')))
             self.assertEqual(unreal.states_before_snapshot, [], 'poses must not precede the first world proof')
             products_before = get('/order-demo/api/products')
@@ -498,6 +525,78 @@ class PersistentRestartIntegrationTest(unittest.TestCase):
             self.assertIn(code, (200, 202))
             first_id = first.get('request_id')
             self.assertIsInstance(first_id, str, 'all accepted orders need an addressable durable ID')
+
+            if lost_grab:
+                self.assertTrue(unreal.grab_ack_dropped.wait(120), diagnostics(first_id))
+                with unreal.lock:
+                    self.assertEqual(unreal.stock['Red'], 2)
+                    self.assertEqual([a['action'] for a in unreal.actions], ['grab'])
+                    self.assertTrue(unreal.actions[0]['applied'])
+                    self.assertTrue(unreal.robots[unreal.actions[0]['agv_id']]['carrying'])
+                pickup_db = durable / 'pickup-inventory.sqlite3'
+                simulation_db = durable / 'simulation.sqlite3'
+                with closing(sqlite3.connect(pickup_db)) as db:
+                    before = db.execute('SELECT reservation_id,state FROM reservations WHERE request_id=?',
+                                        (first_id,)).fetchone()
+                self.assertIsNotNone(before)
+                self.assertEqual(before[1], 'inflight')
+                with closing(sqlite3.connect(simulation_db)) as db:
+                    occupancy = tuple(db.execute('SELECT kind,resource_id,task_id FROM allocation_occupancy '
+                                                 'ORDER BY kind,resource_id,task_id'))
+                self.assertTrue(occupancy)
+
+                # Stop only this test's server after the fake world applied the
+                # grab but before it sent any acknowledgement.
+                stop(server)
+                unreal.stop()
+                world = unreal.capture_world()
+                server = start_server()
+                unreal = start_unreal(world)
+                self.assertTrue(wait_for(lambda: get('/order-demo/api/status').get('unreal_connected')))
+                self.assertTrue(wait_for(lambda: unreal.snapshots), 'restart must request a world snapshot')
+                recovered = order(first_id)
+                self.assertEqual(recovered['status'], 'unknown', diagnostics(first_id))
+                self.assertFalse(get('/order-demo/api/status')['accepting_orders'])
+                def reconciled_pickup_observation():
+                    observed = get('/order-demo/api/inventory')['pickup']
+                    if (observed['sources']['D01']['available'] == 2
+                            and any(item['request_id'] == first_id and item['state'] == 'unknown'
+                                    for item in observed['reservations'])):
+                        return observed
+                    return None
+                pickup = wait_for(reconciled_pickup_observation)
+                self.assertIsNotNone(pickup, diagnostics(first_id))
+                with closing(sqlite3.connect(pickup_db)) as db:
+                    after = db.execute('SELECT reservation_id,state FROM reservations WHERE request_id=?',
+                                       (first_id,)).fetchone()
+                self.assertEqual(after, (before[0], 'unknown'))
+                self.assertEqual(pickup['sources']['D01']['available'], 2)
+                self.assertEqual(pickup['sources']['D01']['reserved'], 1)
+                self.assertTrue(any(item['request_id'] == first_id and item['state'] == 'unknown'
+                                    for item in pickup['reservations']))
+                with closing(sqlite3.connect(simulation_db)) as db:
+                    self.assertEqual(tuple(db.execute('SELECT kind,resource_id,task_id FROM allocation_occupancy '
+                                                      'ORDER BY kind,resource_id,task_id')), occupancy)
+                _code, replay = submit('persist-running')
+                self.assertEqual(replay['request_id'], first_id)
+                self.assertTrue(unreal.thread.is_alive(), 'the new fake Unreal must still receive actions')
+                self.assertEqual(unreal.errors, [], 'the new fake Unreal must not have failed')
+                self.assertTrue(unreal.probe_connection(), 'the new fake Unreal must receive a pong')
+                self.assertTrue(wait_for(lambda: get('/order-demo/api/status')['unreal_connected'], timeout=5))
+                time.sleep(1)
+                self.assertTrue(unreal.thread.is_alive(), 'the fake Unreal must stay alive during observation')
+                self.assertEqual(unreal.errors, [], 'the fake Unreal must not have failed during observation')
+                self.assertTrue(unreal.probe_connection(), 'the fake Unreal must remain connected')
+                self.assertTrue(wait_for(lambda: get('/order-demo/api/status')['unreal_connected'], timeout=5))
+                unreal.stop()
+                self.assertFalse(unreal.thread.is_alive(), 'the fake Unreal must stop cleanly')
+                self.assertEqual(unreal.errors, [], 'the fake Unreal must exit without an error')
+                with unreal.lock:
+                    self.assertEqual(unreal.actions, [], 'the unknown grab must not run twice')
+                    self.assertEqual(unreal.stock['Red'], 2)
+                    self.assertEqual(sum(robot['carrying'] for robot in unreal.robots.values()), 1)
+                self.assertEqual(order(first_id)['status'], 'unknown')
+                return
 
             if completed:
                 completed_order = wait_for(lambda: terminal(first_id), timeout=120)
