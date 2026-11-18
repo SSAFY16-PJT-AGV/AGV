@@ -112,6 +112,12 @@
 교차 규칙이 불완전하면 거부하고, 목적지 스퍼 출입은 아직 지원하지 않는다.
 입력 간선은 현재 위치 증명이 아니다.
 
+`server.field_dispatch.choose_field_robot`은 `sim-` 후보의 명시된 진입
+간선과 현재 노드가 일치하는지 검사한 뒤, 방향상 갈 수 있는 후보 중 가장
+가까운 가상 로봇을 선택한다. 신선한 상태·위치·로봇 신원은 호출자가 별도
+검증해야 하며, 선택만으로 점유 예약이나 명령 발행을 하지 않는다. 현재는
+기존 `Coordinator`에 연결되지 않은 시험용 계산이다.
+
 `server.route_occurrence.plan_occurrence_segment`와 `occurrence_clearance`는
 노드 이름이 아닌 경로의 방문 순번으로 구간 자원과 이탈 **후보**를 계산한다.
 `visit_indices_from_orders`는 전달된 연속 주문 이력이 서로 일치하는지 확인해
