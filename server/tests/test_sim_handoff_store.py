@@ -323,6 +323,9 @@ class HandoffTests(unittest.TestCase):
         runtime = SimRuntime(separate.path, self.map, {'sim-r1': {'T1': 'boot-1'}},
                              port=18888, client_id='startup-test', simulation_store=separate)
         client = Mock()
+        # This client is a stub: loop_start does not create a network thread.
+        # An unspecified Mock attribute is itself truthy, unlike Paho's None.
+        client._thread = None
         client.connect.return_value = 0
         client.loop_start.return_value = 0
         with patch.object(runtime, '_new_client', return_value=client), \
@@ -335,6 +338,30 @@ class HandoffTests(unittest.TestCase):
                 self.assertTrue(runtime.status()['ready'])
             finally:
                 runtime.stop()
+        client.disconnect.assert_called_once_with()
+        client.loop_stop.assert_called_once_with()
+        self.assertIsNone(runtime._owner.file)
+
+    def test_client_cleanup_rejects_a_real_running_thread(self):
+        running, release = threading.Event(), threading.Event()
+        def network_loop():
+            running.set()
+            release.wait(30)
+        thread = threading.Thread(target=network_loop)
+        client = Mock()
+        client._thread = thread
+        thread.start()
+        try:
+            self.assertTrue(running.wait(2))
+            # A faulty loop_stop that returns without joining must not be
+            # treated as successful cleanup merely because it returned.
+            with self.assertRaisesRegex(RuntimeError, 'network thread is still running'):
+                SimRuntime._close_client(client)
+        finally:
+            release.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        SimRuntime._close_client(client)
 
     def test_runtime_rejects_corrupted_simulation_store_identity(self):
         with closing(sqlite3.connect(self.path)) as db:
