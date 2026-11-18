@@ -18,6 +18,7 @@ import paho.mqtt.client as mqtt
 from server.allocation_store import AllocationStore, _id
 from server.coordinator import Coordinator
 from server.dispatch import RobotCandidate
+from server.field_dispatch import FieldCandidate
 from server.order_publisher import OrderPublisher, _topic
 from server.mqtt_security import configure_mqtt_client, read_mqtt_security
 from server.recovery import RecoveryGate
@@ -67,7 +68,13 @@ class _DatabaseOwner:
 
 class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
-                 host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None):
+                 host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
+                 field_simulation=False):
+        if type(field_simulation) is not bool:
+            raise ValueError('field_simulation must be boolean')
+        if field_simulation and simulation_store is not None:
+            raise ValueError('field simulation does not support the web handoff store')
+        self._field_simulation = field_simulation
         if host != '127.0.0.1':
             raise ValueError('simulation broker must use explicit IPv4 loopback')
         if type(port) is not int or not 1 <= port <= 65535:
@@ -163,7 +170,8 @@ class SimRuntime:
                 self._simulation_store.validate_bound(self.path)
             self._owner.acquire()
             try:
-                self.store = self._simulation_store or AllocationStore(self.path)
+                self.store = self._simulation_store or (AllocationStore(self.path, field_required=True)
+                                                        if self._field_simulation else AllocationStore(self.path))
                 if self._simulation_store is not None:
                     # Repeat after the process-wide lock: a validated file may
                     # have been replaced or modified while ownership was pending.
@@ -183,12 +191,27 @@ class SimRuntime:
                                                   'map_fingerprint': expected._fingerprint}:
                         raise ValueError('existing simulation map differs from stored map')
                 self.store.initialize()
-                self.gate = RecoveryGate(self.path); self.gate.initialize()
+                self.gate = (RecoveryGate(self.path, field_required=True) if self._field_simulation
+                             else RecoveryGate(self.path))
+                self.gate.initialize()
                 if self._simulation_store is not None and self.store.reopened:
                     # Never let a queued event or a stale publisher move a
                     # restored task before a separately verified reconciliation.
                     self.gate.invalidate_many(tuple(self._tasks))
-                self.progress = SegmentProgress(self.store, self.map_data, simulation_enabled=True, recovery_gate=self.gate)
+                elif self._field_simulation:
+                    # A generic field-simulation DB can also be reopened. Do
+                    # not allow an old in-flight order to move merely because
+                    # a fresh runtime was attached to the same broker.
+                    with closing(self.store._connect()) as db:
+                        existing = db.execute('SELECT task_id,robot_id FROM allocation_jobs').fetchall()
+                    if any(self._tasks.get(task, (None,))[0] != robot for task, robot in existing):
+                        raise ValueError('existing field simulation tasks are not mapped')
+                    if existing:
+                        self.gate.invalidate_many(tuple(task for task, _robot in existing))
+                options = {'simulation_enabled': True, 'recovery_gate': self.gate}
+                if self._field_simulation:
+                    options['field_simulation'] = True
+                self.progress = SegmentProgress(self.store, self.map_data, **options)
                 self.progress.initialize()
                 mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
                 self.inbox = SimEventInbox(self.path, robot_tasks=mapping, simulation_enabled=True)
@@ -327,7 +350,7 @@ class SimRuntime:
                     raise ValueError('completed final event unavailable')
                 event, event_json, event_digest = _event(row[0].encode('ascii'))
                 result = json.loads(row[6]) if row[6] else None
-                cleared = set(self.progress._segment(route, stopped).resources) - {('node', stopped)}
+                cleared = set(self.progress._segment_for_task(db, task_id, route, stopped).resources) - {('node', stopped)}
                 if (event_json != row[0] or event_digest != row[1] or row[1] != row[7]
                         or row[2:6] != (session, task_id, seq, 'applied')
                         or row[8:12] != (task_id, seq, None, 'finished')
@@ -407,7 +430,7 @@ class SimRuntime:
                                              allow_nan=False, separators=(',', ':'))
                         if (status not in ('uncertain', 'acked') or seq != parsed['seq']
                                 or encoded != canonical or self.progress._occupancy(db, task_id)
-                                != set(self.progress._segment(path, stop).resources)):
+                                != set(self.progress._segment_for_task(db, task_id, path, stop).resources)):
                             raise ValueError('current command or reservation differs')
                         table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_active_robots'").fetchone()
                         if (type(self.store) is SimHandoffStore and table is None) or (table is not None and
@@ -493,6 +516,8 @@ class SimRuntime:
     def prepare(self, task_id, destination, candidates, action, *, handoff_store=None):
         with self._lock:
             self._ready()
+            if self._field_simulation:
+                raise ValueError('field simulation requires direction-aware preparation')
             robot, _session = self._tasks.get(task_id, (None, None))
             if robot is None or not isinstance(candidates, list) or not candidates:
                 raise ValueError('mapped task and candidates required')
@@ -521,6 +546,40 @@ class SimRuntime:
                             raise RuntimeError('robot recovery is blocked')
                         generation = self.gate._generations.get(task_id, 0)
                     result = coordinator.prepare(task_id, destination, checked, action)
+            except BaseException:
+                self._close_client(client)
+                raise
+            self._prepared[task_id] = (coordinator, client, generation)
+            return result
+
+    def prepare_field(self, task_id, destination, candidates, action):
+        """Prepare a team-map order in the explicitly enabled simulation only."""
+        with self._lock:
+            self._ready()
+            if not self._field_simulation:
+                raise ValueError('field simulation is disabled')
+            robot, _session = self._tasks.get(task_id, (None, None))
+            if robot is None or not isinstance(candidates, list) or not candidates:
+                raise ValueError('mapped task and candidates required')
+            checked = []
+            for item in candidates:
+                if (not isinstance(item, dict)
+                        or set(item) != {'robot_id', 'node', 'incoming_edge', 'available'}
+                        or item['robot_id'] != robot):
+                    raise ValueError('candidate must match configured simulation robot')
+                checked.append(FieldCandidate(item['robot_id'], item['node'],
+                                              item['incoming_edge'], item['available']))
+            client, publisher = self._connect_publisher()
+            try:
+                coordinator = Coordinator(self.store, self.map_data, publisher,
+                                          ack_timeout=self.ack_timeout, field_simulation=True)
+                with self.receiver._dispatch_lock, self.gate.serialized():
+                    self._ready()
+                    with self.gate._state_lock:
+                        if task_id in self.gate._blocked:
+                            raise RuntimeError('robot recovery is blocked')
+                        generation = self.gate._generations.get(task_id, 0)
+                    result = coordinator.prepare_field(task_id, destination, checked, action)
             except BaseException:
                 self._close_client(client)
                 raise

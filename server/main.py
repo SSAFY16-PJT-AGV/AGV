@@ -31,7 +31,10 @@ def load_sim_runtime():
             data[key] = value
         return data
     config = json.loads(raw.decode('utf-8'), object_pairs_hook=pairs)
-    if not isinstance(config, dict) or set(config) != {'database', 'map_file', 'robots', 'mqtt_port', 'mqtt_client_id'}:
+    required = {'database', 'map_file', 'robots', 'mqtt_port', 'mqtt_client_id'}
+    if (not isinstance(config, dict) or not required.issubset(config)
+            or set(config) - required - {'field_simulation'}
+            or type(config.get('field_simulation', False)) is not bool):
         raise ValueError('invalid simulation configuration fields')
     for key in ('database', 'map_file'):
         if not isinstance(config[key], str) or not config[key].strip() or config[key] == ':memory:':
@@ -43,8 +46,11 @@ def load_sim_runtime():
         raise ValueError('simulation map is too large')
     map_data = json.loads(map_raw.decode('utf-8'), object_pairs_hook=pairs)
     from server.sim_runtime import SimRuntime
+    options = {}
+    if config.get('field_simulation', False):
+        options['field_simulation'] = True
     runtime = SimRuntime(db_path, map_data, config['robots'], port=config['mqtt_port'],
-                         client_id=config['mqtt_client_id'])
+                         client_id=config['mqtt_client_id'], **options)
     return runtime, token
 
 

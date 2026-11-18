@@ -15,6 +15,8 @@ from server.allocation_store import AllocationConflict, InvalidAllocation, _vali
 from server.order_publisher import OrderPublishingDisabled, validate_order
 from server.routing import MapGraph
 from server.segments import plan_segment
+from server.route_occurrence import plan_occurrence_segment
+from server.field_dispatch import choose_field_robot
 
 
 class CoordinatorError(RuntimeError):
@@ -24,11 +26,14 @@ class CoordinatorError(RuntimeError):
 class Coordinator:
     """One coordinator instance authorizes only tasks that it prepared."""
 
-    def __init__(self, store, map_data, publisher=None, *, ack_timeout=3.0):
+    def __init__(self, store, map_data, publisher=None, *, ack_timeout=3.0, field_simulation=False):
         if (isinstance(ack_timeout, bool) or not isinstance(ack_timeout, (int, float))
                 or not 0 < ack_timeout <= 30 or not math.isfinite(ack_timeout)):
             raise ValueError('ack_timeout must be finite, greater than 0, and at most 30 seconds')
         self._map = copy.deepcopy(map_data)
+        if type(field_simulation) is not bool:
+            raise ValueError('field_simulation must be boolean')
+        self._field_simulation = field_simulation
         _validate_json(self._map)
         try:
             encoded_map = json.dumps(self._map, sort_keys=True, ensure_ascii=True,
@@ -56,6 +61,8 @@ class Coordinator:
 
     def prepare(self, task_id, pickup_node, candidates, action_at_end):
         """Persist one planned allocation, reserving every computed segment resource."""
+        if self._field_simulation:
+            raise CoordinatorError('field simulation requires direction-aware preparation')
         candidates_copy = copy.deepcopy(candidates)
         action_copy = copy.deepcopy(action_at_end)
         choice = choose_robot(self._graph, pickup_node, candidates_copy)
@@ -63,11 +70,40 @@ class Coordinator:
             raise CoordinatorError('no reachable available robot')
         route = list(choice.route.nodes)
         segment = plan_segment(self._map, route)
+        return self._prepare_choice(task_id, choice, route, segment, action_copy)
+
+    def prepare_field(self, task_id, destination, candidates, action_at_end):
+        """Prepare a field-map route only for an explicitly isolated simulator.
+
+        Candidate entry edges are caller-supplied simulation assumptions, not
+        identity, freshness, location or physical motion proof.
+        """
+        if not self._field_simulation:
+            raise CoordinatorError('field-map simulation is disabled')
+        candidates_copy = copy.deepcopy(candidates)
+        action_copy = copy.deepcopy(action_at_end)
+        choice = choose_field_robot(self._map, self._map_version, destination, candidates_copy)
+        if choice is None:
+            raise CoordinatorError('no reachable available robot')
+        route = list(choice.route.nodes)
+        segment = plan_occurrence_segment(self._map, route, 0)
+        selected = next(item for item in candidates_copy if item.robot_id == choice.robot_id)
+        field_context = {'map_data': copy.deepcopy(self._map),
+                         'incoming_edge': selected.incoming_edge, 'goal': destination}
+        release_index = segment.end_index if len(set(route)) != len(route) else None
+        return self._prepare_choice(task_id, choice, route, segment, action_copy,
+                                    release_index=release_index, field_context=field_context)
+
+    def _prepare_choice(self, task_id, choice, route, segment, action_copy, *,
+                        release_index=None, field_context=None):
         expected_order = {'order_id': task_id, 'seq': 1, 'map_id': self._map_version,
                           'nodes': route, 'released_until': segment.released_until,
                           'action_at_end': action_copy}
         # Reject unusable simulated order format before persisting reservations.
         validate_order(choice.robot_id, expected_order)
+        if field_context is not None:
+            from server.field_robot_contract import validate_field_robot_order
+            validate_field_robot_order(expected_order)
         if self._publisher is None:
             raise OrderPublishingDisabled('simulation publishing is disabled')
         # One publisher handles at most one attempt; never prepare another task
@@ -89,11 +125,12 @@ class Coordinator:
             self._release_preparation_claim()
             raise
         try:
+            options = {'map_fingerprint': self._map_fingerprint}
+            if field_context is not None:
+                options.update(release_index=release_index, field_context=field_context)
             allocation = self._store.allocate(
                 task_id, choice.robot_id, self._map_version, route, segment.released_until,
-                segment.resources, action_copy,
-                map_fingerprint=self._map_fingerprint,
-            )
+                segment.resources, action_copy, **options)
         except (AllocationConflict, InvalidAllocation):
             # A post-commit failure may look like an allocation error. Release
             # this publisher only when persisted reads prove no task allocation
@@ -110,6 +147,9 @@ class Coordinator:
                                'map_id': self._map_version, 'nodes': route,
                                'released_until': segment.released_until,
                                'map_fingerprint': self._map_fingerprint}
+        if field_context is not None:
+            expected_allocation['field_route'] = {
+                'incoming_edge': field_context['incoming_edge'], 'goal': field_context['goal']}
         order_record = self._store.get_order(task_id)
         if (allocation != expected_allocation or not isinstance(order_record, dict)
                 or order_record.get('state') != 'pending'):

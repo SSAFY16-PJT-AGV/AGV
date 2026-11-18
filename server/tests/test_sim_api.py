@@ -96,6 +96,18 @@ class SimulationApiTests(unittest.TestCase):
                 self.assertEqual(self.runtime.calls[-1], (target, args))
                 self.assertEqual(headers.get(b"cache-control"), b"no-store")
 
+    def test_field_prepare_requires_auth_and_a_directed_entry(self):
+        body = {'destination': 'D', 'candidates': [{'robot_id': 'sim-a', 'node': 'A',
+                'incoming_edge': 'E0', 'available': True}], 'action': {'type': 'none'}}
+        self.assertEqual(self.call('POST', '/tasks/T1/prepare-field', body=body, token=None)[0], 401)
+        self.assertEqual(self.runtime.calls, [])
+        code, result, headers = self.call('POST', '/tasks/T1/prepare-field', body=body)
+        self.assertEqual((code, result), (200, {'method': 'prepare_field'}))
+        self.assertEqual(self.runtime.calls[-1], ('prepare_field', ('T1', 'D', body['candidates'], body['action'])))
+        self.assertEqual(headers.get(b'cache-control'), b'no-store')
+        del body['candidates'][0]['incoming_edge']
+        self.assertEqual(self.call('POST', '/tasks/T1/prepare-field', body=body)[0], 422)
+
     def test_recovery_retry_and_submit_are_dispatched(self):
         complete = {"session": "boot-1", "challenge": "abc", "robot_id": "sim-r1",
                     "order_id": "T1", "seq": 1, "map_id": "M@v1", "stopped_at": "N3",

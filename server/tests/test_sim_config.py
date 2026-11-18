@@ -47,6 +47,21 @@ class SimConfigTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_sim_runtime()
 
+    def test_field_simulation_requires_explicit_boolean_opt_in(self):
+        config = json.loads(self.config.read_text(encoding='utf-8'))
+        env = {'AGV_SIM_CONFIG': str(self.config), 'AGV_SIM_API_TOKEN': 'x' * 40}
+        for value in (True, False):
+            config['field_simulation'] = value
+            self.config.write_text(json.dumps(config), encoding='utf-8')
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True), \
+                    patch('server.sim_runtime.SimRuntime') as constructor:
+                load_sim_runtime()
+                self.assertEqual(constructor.call_args.kwargs.get('field_simulation', False), value)
+        config['field_simulation'] = 'true'
+        self.config.write_text(json.dumps(config), encoding='utf-8')
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            load_sim_runtime()
+
 
 if __name__ == '__main__':
     unittest.main()

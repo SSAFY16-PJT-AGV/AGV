@@ -87,6 +87,19 @@ class _Prepare(_Model):
     action: dict
 
 
+class _FieldCandidate(_Model):
+    robot_id: StrictStr
+    node: StrictStr
+    incoming_edge: StrictStr
+    available: StrictBool
+
+
+class _PrepareField(_Model):
+    destination: StrictStr
+    candidates: list[_FieldCandidate]
+    action: dict
+
+
 class _Session(_Model):
     session: StrictStr
 
@@ -127,6 +140,12 @@ def prepare(task_id: str, body: _Prepare, runtime=Depends(_runtime)):
 @router.post("/tasks/{task_id}/publish")
 def publish(task_id: str, runtime=Depends(_runtime)):
     return _invoke(runtime, "publish", task_id)
+
+
+@router.post("/tasks/{task_id}/prepare-field")
+def prepare_field(task_id: str, body: _PrepareField, runtime=Depends(_runtime)):
+    return _invoke(runtime, "prepare_field", task_id, body.destination,
+                   [candidate.model_dump() for candidate in body.candidates], body.action)
 
 
 @router.post("/recovery/{task_id}/begin")
