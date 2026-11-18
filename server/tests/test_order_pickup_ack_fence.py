@@ -42,6 +42,69 @@ class PickupAckFenceTests(unittest.TestCase):
     def prepare(self, action):
         self.store.mark_dispatched(self.token, self.rid, action['order_id'], action['action_id'], action['agv_id'])
 
+    def test_simultaneous_duplicate_ack_consumes_pickup_once(self):
+        """Two simultaneous synthetic Unreal replies cannot consume stock twice."""
+        entered, release, second_entering = (threading.Event() for _ in range(3))
+        results = []
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == 'duplicate-ack':
+                    second_entering.set()
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self.lock.release()
+
+        def confirm_slow(action):
+            self.store.confirm(self.token, self.rid, action['order_id'], action['action_id'],
+                               action['agv_id'], applied=action['applied'])
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test did not release confirmation callback')
+
+        session = DemoActionSession(self.engine, ObservedLock(), settle_seconds=0,
+                                    on_prepare_action=self.prepare, on_action_result=confirm_slow)
+        self.assertTrue(session.attach(self.client, authenticated=True))
+        self.assertIsNotNone(session.poll(self.client, now=0))
+        reply = {'type': 'robot.action.result', 'data': dict(self.engine.action, applied=True)}
+
+        def first_receive():
+            results.append(session.receive(self.client, reply, now=1))
+
+        def second_receive():
+            results.append(session.receive(self.client, reply, now=1))
+
+        first = threading.Thread(target=first_receive)
+        second = threading.Thread(target=second_receive, name='duplicate-ack')
+        first.start()
+        try:
+            self.assertTrue(entered.wait(5), 'first ACK must reach the inventory confirmation')
+            second.start()
+            self.assertTrue(second_entering.wait(5), 'duplicate ACK must arrive while confirmation is pending')
+            release.set()
+            first.join(5)
+            second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+        finally:
+            release.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+
+        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(self.engine.applied, 1)
+        self.assertEqual(self.engine.unknown, 0)
+        snapshot = self.store.snapshot()
+        self.assertEqual(snapshot['reservations'][0]['state'], 'consumed')
+        self.assertEqual(snapshot['sources']['D01']['available'], 0)
+        self.assertEqual(snapshot['sources']['D01']['reserved'], 0)
+
     def test_disconnect_during_slow_ack_persistence_never_applies_later_leg(self):
         entered, release, invalidated, invalidation_done = (threading.Event() for _ in range(4))
         result = []
