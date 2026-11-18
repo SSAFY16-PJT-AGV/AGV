@@ -7,6 +7,7 @@ from contextlib import closing, contextmanager
 import json
 import sqlite3
 
+from server.allocation_store import _verify_field_global
 from server.sim_handoff_store import SimHandoffStore
 from sim.order_inbox import _decode
 
@@ -50,6 +51,9 @@ class SimOrderAuthorizer:
                         try:
                             gate._active(db)
                             progress._check_database(db)
+                            # Validate all field allocations in this same read
+                            # transaction before accepting any robot's order.
+                            _verify_field_global(db, field_required=progress._field_required)
                             parsed, canonical, digest = _decode(payload, self.robot_id, progress._map_id)
                             task = parsed['order_id']
                             mapping = runtime._tasks.get(task)
@@ -68,7 +72,7 @@ class SimOrderAuthorizer:
                             if (state not in ('uncertain', 'acked') or parsed['seq'] != seq
                                     or canonical != encoded):
                                 raise ValueError('order is not the currently attempted simulated payload')
-                            expected = set(progress._segment(path, stop).resources)
+                            expected = set(progress._segment_for_task(db, task, path, stop).resources)
                             if progress._occupancy(db, task) != expected:
                                 raise ValueError('current occupancy differs from the reserved segment')
                             table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_active_robots'").fetchone()

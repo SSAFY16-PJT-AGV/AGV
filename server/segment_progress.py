@@ -11,10 +11,12 @@ import os
 import sqlite3
 from contextlib import closing, contextmanager
 
-from server.allocation_store import AllocationConflict, InvalidAllocation, _id, _validate_json
+from server.allocation_store import (AllocationConflict, InvalidAllocation, _id, _validate_json,
+                                     _stored_field_route, _verify_field_global)
 from server.order_publisher import validate_order
 from server.routing import MapGraph, UnsupportedRobotRoutingError
 from server.segments import plan_segment
+from server.route_occurrence import plan_occurrence_segment, visit_indices_from_orders
 
 
 _EVENT_KEYS = frozenset(('type', 'event_id', 'robot_session', 'order_id', 'seq',
@@ -63,9 +65,11 @@ def _resources(value):
 
 
 class SegmentProgress:
-    def __init__(self, store, map_data, *, simulation_enabled=False, recovery_gate=None):
-        if type(simulation_enabled) is not bool:
+    def __init__(self, store, map_data, *, simulation_enabled=False, recovery_gate=None, field_simulation=False):
+        if type(simulation_enabled) is not bool or type(field_simulation) is not bool:
             raise ValueError('simulation_enabled must be boolean')
+        if field_simulation and not simulation_enabled:
+            raise ValueError('field simulation requires explicit simulation_enabled')
         self.store = store
         self._enabled = simulation_enabled
         self._gate = recovery_gate
@@ -75,10 +79,13 @@ class SegmentProgress:
         # A restored allocation can bypass the route search performed during
         # initial assignment. Never advance it on a map whose vehicle-heading
         # and turn rules are not supported by the simulation planner.
-        if graph.requires_robot_navigation:
+        if graph.requires_robot_navigation and not field_simulation:
             raise UnsupportedRobotRoutingError(
                 'robot heading and direction-aware turn constraints are required'
             )
+        # The caller explicitly selected this mode; do not silently downgrade
+        # it merely because a particular map has no navigation metadata.
+        self._field_required = field_simulation
         if '@' in graph.map_id or graph.map_id != graph.map_id.strip():
             raise ValueError('invalid map id')
         self._map_id = '{}@v{}'.format(graph.map_id, graph.version)
@@ -130,13 +137,35 @@ class SegmentProgress:
             raise AllocationConflict('task, robot, map or fingerprint does not match')
         try:
             path = json.loads(row[3])
-            if not isinstance(path, list) or len(path) < 2 or len(set(path)) != len(path):
+            if not isinstance(path, list) or len(path) < 2:
                 raise ValueError('invalid route')
+            repeated = len(set(path)) != len(path)
+            table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='occurrence_allocations'").fetchone()
+            occurrence = (db.execute('SELECT current_index FROM occurrence_allocations WHERE task_id=?',
+                                     (task_id,)).fetchone() if table else None)
+            if repeated:
+                if (occurrence is None or type(occurrence[0]) is not int
+                        or not 1 <= occurrence[0] < len(path) or path[occurrence[0]] != row[4]):
+                    raise ValueError('repeated route occurrence is missing or inconsistent')
+            elif occurrence is not None:
+                raise ValueError('unexpected occurrence for non-repeated route')
         except (ValueError, TypeError) as error:
             raise AllocationConflict('invalid stored route') from error
+        field = _stored_field_route(db, task_id, row[2], path, self._fingerprint)
+        field_mode = db.execute("SELECT value FROM allocation_meta WHERE key='field_route_mode'").fetchone()
+        if self._field_required and field_mode != ('required',):
+            raise AllocationConflict('field route mode is missing or invalid')
+        if not self._field_required and field_mode is not None:
+            raise AllocationConflict('unexpected field route mode')
+        if self._field_required and field is None:
+            raise AllocationConflict('field route provenance is required')
+        if not self._field_required and field is not None:
+            raise AllocationConflict('unexpected field route provenance')
         return row[1], path, row[4]
 
     def _segment(self, path, released_until):
+        if len(set(path)) != len(path):
+            raise AllocationConflict('repeated route requires its stored occurrence index')
         offset = 0
         while offset < len(path) - 1:
             segment = plan_segment(self._map, path[offset:])
@@ -151,6 +180,11 @@ class SegmentProgress:
             raise AllocationConflict('initial order has not been attempted')
         first = _read_order(initial[0])
         validate_order(robot_id, first)
+        if self._field_required:
+            from server.field_robot_contract import validate_field_robot_order
+            validate_field_robot_order(first)
+        if len(set(path)) != len(path):
+            return self._latest_occurrence(db, task_id, robot_id, path, current_stop, initial, first)
         if (first['order_id'] != task_id or first['seq'] != 1 or first['map_id'] != self._map_id
                 or first['nodes'] != path
                 or first['released_until'] != plan_segment(self._map, path).released_until):
@@ -176,6 +210,9 @@ class SegmentProgress:
                     raise AllocationConflict('previous order has no verified progression event')
             order = _read_order(payload)
             validate_order(robot_id, order)
+            if self._field_required:
+                from server.field_robot_contract import validate_field_robot_order
+                validate_field_robot_order(order)
             if (order['order_id'] != task_id or order['seq'] != seq
                     or order['map_id'] != self._map_id or order['nodes'] != path
                     or order['action_at_end'] != first['action_at_end']):
@@ -188,6 +225,67 @@ class SegmentProgress:
         if previous_stop != current_stop:
             raise AllocationConflict('current released node disagrees with order history')
         return seq, payload, state, _read_order(payload)
+
+    def _latest_occurrence(self, db, task_id, robot_id, path, stop, initial, first):
+        rows = db.execute('SELECT seq,payload,state FROM progress_orders WHERE task_id=? ORDER BY seq',
+                          (task_id,)).fetchall()
+        if rows:
+            if rows[0] != (1, initial[0], initial[1]):
+                raise AllocationConflict('initial order histories disagree')
+        else:
+            rows = [(1, initial[0], initial[1])]
+        orders = []
+        for index, (seq, payload, state) in enumerate(rows, 1):
+            if seq != index or state not in ('pending', 'uncertain', 'acked'):
+                raise AllocationConflict('order history is invalid')
+            if index < len(rows):
+                verified = db.execute("SELECT 1 FROM progress_events WHERE task_id=? AND robot_id=? AND seq=? "
+                                      "AND next_seq=? AND result='advanced'", (task_id, robot_id, seq, seq + 1)).fetchone()
+                if state not in ('uncertain', 'acked') or verified is None:
+                    raise AllocationConflict('previous order has no verified progression event')
+            order = _read_order(payload)
+            validate_order(robot_id, order)
+            if (order['order_id'] != task_id or order['map_id'] != self._map_id or order['nodes'] != path):
+                raise AllocationConflict('order history disagrees with route')
+            orders.append(order)
+        try:
+            indices = visit_indices_from_orders(orders)
+            previous = 0
+            for index in indices:
+                segment = plan_occurrence_segment(self._map, path, previous)
+                if segment.end_index != index:
+                    raise ValueError('order skips a waiting occurrence')
+                previous = index
+        except (ValueError, TypeError) as exc:
+            raise AllocationConflict('occurrence order history is invalid') from exc
+        current = db.execute('SELECT current_index FROM occurrence_allocations WHERE task_id=?',
+                             (task_id,)).fetchone()
+        if current != (indices[-1],) or path[indices[-1]] != stop:
+            raise AllocationConflict('current visit index disagrees with order history')
+        return rows[-1][0], rows[-1][1], rows[-1][2], orders[-1]
+
+    def _segment_for_task(self, db, task_id, path, stop):
+        if len(set(path)) == len(path):
+            return self._segment(path, stop)
+        row = db.execute('SELECT current_index FROM occurrence_allocations WHERE task_id=?', (task_id,)).fetchone()
+        if row is None:
+            raise AllocationConflict('repeated route occurrence is unavailable')
+        current = row[0]
+        rows = db.execute('SELECT payload FROM progress_orders WHERE task_id=? ORDER BY seq', (task_id,)).fetchall()
+        if not rows:
+            payload = db.execute('SELECT payload FROM allocation_outbox WHERE task_id=?', (task_id,)).fetchone()
+            rows = [payload] if payload else []
+        try:
+            indices = visit_indices_from_orders([_read_order(item[0]) for item in rows])
+            if indices[-1] != current or path[current] != stop:
+                raise ValueError('stored occurrence differs from history')
+            start = 0 if len(indices) == 1 else indices[-2]
+            segment = plan_occurrence_segment(self._map, path, start)
+            if segment.end_index != current:
+                raise ValueError('stored occurrence is not the next waiting point')
+            return segment
+        except (ValueError, TypeError, IndexError) as exc:
+            raise AllocationConflict('repeated route occurrence is invalid') from exc
 
     @staticmethod
     def _occupancy(db, task_id):
@@ -211,6 +309,7 @@ class SegmentProgress:
         digest = hashlib.sha256(_canonical(event)).hexdigest()
         task_id, seq = event['order_id'], event['seq']
         with self._transaction() as db:
+            _verify_field_global(db, field_required=self._field_required)
             self._authorize(db, task_id, event['robot_session'], seq, event['stopped_at'])
             existing = db.execute('SELECT digest,task_id,seq,next_seq,result FROM progress_events '
                                   'WHERE robot_id=? AND event_id=?', (robot_id, event['event_id'])).fetchone()
@@ -230,11 +329,15 @@ class SegmentProgress:
             if (state not in ('acked', 'uncertain') or seq != current_seq or event['map_id'] != self._map_id
                     or event['stopped_at'] != current_stop):
                 raise AllocationConflict('event does not match the acknowledged current segment')
-            current = set(self._segment(path, current_stop).resources)
+            current_segment = self._segment_for_task(db, task_id, path, current_stop)
+            current = set(current_segment.resources)
             if self._occupancy(db, task_id) != current:
                 raise AllocationConflict('current occupancy differs from the planned segment')
-            end_index = path.index(current_stop)
-            next_segment = None if end_index == len(path) - 1 else plan_segment(self._map, path[end_index:])
+            repeated = len(set(path)) != len(path)
+            end_index = current_segment.end_index if repeated else path.index(current_stop)
+            next_segment = (None if end_index == len(path) - 1 else
+                            plan_occurrence_segment(self._map, path, end_index) if repeated else
+                            plan_segment(self._map, path[end_index:]))
             keep = {('node', current_stop)} if next_segment is None else set(next_segment.resources)
             removable = current - keep
             if cleared != removable:
@@ -271,13 +374,23 @@ class SegmentProgress:
                 next_seq, status = seq + 1, 'advanced'
                 next_order = dict(order, seq=next_seq, released_until=next_segment.released_until)
                 validate_order(robot_id, next_order)
+                if self._field_required:
+                    from server.field_robot_contract import validate_field_robot_order
+                    validate_field_robot_order(next_order)
                 next_payload = json.dumps(next_order, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
                 db.execute('INSERT INTO progress_orders(task_id,seq,payload,state) VALUES(?,?,?,?)',
                            (task_id, next_seq, next_payload, 'pending'))
                 db.execute('UPDATE allocation_jobs SET released_until=? WHERE task_id=?',
                            (next_segment.released_until, task_id))
+                if repeated:
+                    updated = db.execute('UPDATE occurrence_allocations SET current_index=? '
+                                         'WHERE task_id=? AND current_index=?',
+                                         (next_segment.end_index, task_id, end_index))
+                    if updated.rowcount != 1:
+                        raise AllocationConflict('visit index changed during advancement')
             db.execute('INSERT INTO progress_events VALUES(?,?,?,?,?,?,?)',
                        (robot_id, event['event_id'], digest, task_id, seq, next_seq, status))
+            _verify_field_global(db, field_required=self._field_required)
             return {'status': status, 'task_id': task_id, 'next_seq': next_seq, 'payload': next_payload}
 
     def get_order(self, task_id, seq):
@@ -295,11 +408,12 @@ class SegmentProgress:
             raise ValueError('invalid order transition')
         expected = set(copy.deepcopy(expected_resources))
         self._check_database(db)
+        _verify_field_global(db, field_required=self._field_required)
         robot, path, stop = self._job(db, task_id)
         current_seq, payload, state, order = self._latest(db, task_id, robot, path, stop)
         if current_seq != seq or payload != expected_payload or state != source:
             raise AllocationConflict('order changed before transition')
-        current = set(self._segment(path, stop).resources)
+        current = set(self._segment_for_task(db, task_id, path, stop).resources)
         if expected != current or self._occupancy(db, task_id) != current:
             raise AllocationConflict('reserved resources changed before transition')
         prior_row = db.execute('SELECT payload FROM progress_orders WHERE task_id=? AND seq=?',
@@ -326,6 +440,7 @@ class SegmentProgress:
                                  (target, task_id, seq, source))
             if updated.rowcount != 1:
                 raise AllocationConflict('order state changed')
+            _verify_field_global(db, field_required=self._field_required)
 
     def mark_attempted(self, task_id, seq, robot_session, expected_payload, expected_resources):
         self._transition(task_id, seq, robot_session, expected_payload, expected_resources, 'pending', 'uncertain')

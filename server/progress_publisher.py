@@ -6,6 +6,7 @@ performed; an uncertain attempt retains occupancy for manual reconciliation.
 import copy
 import math
 import threading
+from contextlib import closing
 
 from server.allocation_store import _id
 from server.order_publisher import OrderPublisher, OrderPublishingDisabled, validate_order
@@ -55,7 +56,14 @@ class ProgressPublisher:
                     or order['nodes'] != allocation['nodes']
                     or order['released_until'] != allocation['released_until']):
                 raise ValueError('order and allocation mismatch')
-            segment = self._progress._segment(allocation['nodes'], allocation['released_until'])
+            # The same node name may occur more than once. Resolve the current
+            # segment from the persisted sequence/index history rather than
+            # choosing the first matching node. The later writer-locked fence
+            # still rechecks this optimistic read before queueing MQTT.
+            with closing(self._progress.store._connect()) as db:
+                db.execute('BEGIN')
+                segment = self._progress._segment_for_task(
+                    db, task_id, allocation['nodes'], allocation['released_until'])
             if not segment.nodes or segment.nodes[0] != prior['released_until']:
                 raise ValueError('previous and next segments do not meet')
         except (KeyError, TypeError, ValueError, RecursionError) as exc:

@@ -15,7 +15,8 @@ import threading
 import time
 from contextlib import closing, contextmanager
 
-from server.allocation_store import _validate_json
+from server.allocation_store import _validate_json, _stored_field_route, _verify_field_global
+from server.route_occurrence import visit_indices_from_orders
 
 
 class RecoveryError(ValueError):
@@ -67,7 +68,7 @@ def _digest_json(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _snapshot(db, task_id):
+def _snapshot(db, task_id, *, field_required=False):
     """Read an internally consistent order history and currently held resources."""
     row = db.execute(
         "SELECT j.robot_id,j.map_id,j.nodes_json,j.released_until,o.payload,o.state,t.status "
@@ -93,8 +94,14 @@ def _snapshot(db, task_id):
         raise RecoveryError('stored route is invalid') from exc
     if not isinstance(nodes, list) or not nodes or any(not isinstance(n, str) or not n for n in nodes):
         raise RecoveryError('stored route is invalid')
-    if len(set(nodes)) != len(nodes):
-        raise RecoveryError('stored route is ambiguous')
+    repeated = len(set(nodes)) != len(nodes)
+    occurrence_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='occurrence_allocations'").fetchone()
+    occurrence = (db.execute('SELECT current_index FROM occurrence_allocations WHERE task_id=?',
+                             (task_id,)).fetchone() if occurrence_table else None)
+    if repeated and (occurrence is None or type(occurrence[0]) is not int):
+        raise RecoveryError('stored repeated route has no visit index')
+    if not repeated and occurrence is not None:
+        raise RecoveryError('unexpected visit index for unique route')
     records = {1: (first_payload, first_state)}
     exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='progress_orders'").fetchone()
     if exists:
@@ -122,9 +129,16 @@ def _snapshot(db, task_id):
                 or order['map_id'] != map_id or order['nodes'] != nodes
                 or order['released_until'] not in nodes or not isinstance(order['action_at_end'], dict)):
             raise RecoveryError('stored order and allocation disagree')
-        if parsed and nodes.index(order['released_until']) <= nodes.index(parsed[-1][1]['released_until']):
+        if not repeated and parsed and nodes.index(order['released_until']) <= nodes.index(parsed[-1][1]['released_until']):
             raise RecoveryError('release sequence does not advance')
         parsed.append((state, order, payload))
+    if repeated:
+        try:
+            indices = visit_indices_from_orders([entry[1] for entry in parsed])
+            if occurrence != (indices[-1],) or nodes[indices[-1]] != released:
+                raise ValueError('stored occurrence differs from order history')
+        except (ValueError, TypeError, IndexError) as exc:
+            raise RecoveryError('stored occurrence history is invalid') from exc
     if parsed[-1][1]['released_until'] != released:
         raise RecoveryError('latest order and released node disagree')
     sent = [entry for entry in parsed if entry[0] in ('uncertain', 'acked')]
@@ -140,6 +154,27 @@ def _snapshot(db, task_id):
                 'route': nodes, 'released_until': released, 'task_status': status,
                 'orders': [[seq, *records[seq]] for seq in seqs],
                 'occupancy': [list(item) for item in occupancy]}
+    if repeated:
+        snapshot['released_index'] = indices[-1]
+    field_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='field_route_provenance'").fetchone()
+    field_mode = db.execute("SELECT value FROM allocation_meta WHERE key='field_route_mode'").fetchone()
+    if field_required and field_mode != ('required',):
+        raise RecoveryError('field route mode is missing')
+    if field_mode is not None and field_mode != ('required',):
+        raise RecoveryError('field route mode is invalid')
+    if field_table:
+        try:
+            field = _stored_field_route(db, task_id, map_id, nodes, digest)
+        except (ValueError, TypeError, KeyError, RecursionError) as exc:
+            raise RecoveryError('field route provenance is invalid') from exc
+        if field is not None:
+            snapshot['field_route'] = field
+        if field_mode == ('required',) and field is None:
+            raise RecoveryError('field route provenance is missing')
+        if field_mode is None and field is not None:
+            raise RecoveryError('field route mode is missing')
+    elif field_mode is not None:
+        raise RecoveryError('field route provenance table is missing')
     return {'robot_id': robot, 'order_id': task_id, 'seq': latest['seq'], 'map_id': map_id,
             'stopped_at': latest['released_until'], 'order_digest': _digest_json(latest),
             'snapshot_digest': _digest_json(snapshot), 'map_fingerprint': digest}
@@ -148,7 +183,7 @@ def _snapshot(db, task_id):
 class RecoveryGate:
     """Per-instance recovery epoch with short-lived, single-use challenges."""
 
-    def __init__(self, path, *, clock=time.monotonic, ttl=30):
+    def __init__(self, path, *, clock=time.monotonic, ttl=30, field_required=False):
         raw = os.fspath(path)
         if not isinstance(raw, str) or not raw or raw == ':memory:':
             raise ValueError('file-backed database path is required')
@@ -156,6 +191,9 @@ class RecoveryGate:
             raise ValueError('ttl must be finite and in (0, 300] seconds')
         if not callable(clock):
             raise ValueError('clock must be callable')
+        if type(field_required) is not bool:
+            raise ValueError('field_required must be boolean')
+        self._field_required = field_required
         self.path = os.path.normcase(os.path.realpath(raw))
         self._clock, self._ttl = clock, float(ttl)
         self._epoch = secrets.token_hex(32)
@@ -258,7 +296,7 @@ class RecoveryGate:
                 self._active(db)
                 db.execute("UPDATE recovery_challenges SET status='revoked' WHERE task_id=?", (task_id,))
                 try:
-                    data = _snapshot(db, task_id)
+                    data = _snapshot(db, task_id, field_required=self._field_required)
                 except Exception as exc:
                     failure = exc
                 if failure is None:
@@ -304,7 +342,7 @@ class RecoveryGate:
                     raise RecoveryError('challenge is unknown or already used')
                 db.execute("UPDATE recovery_challenges SET status='consumed' WHERE task_id=?", (task_id,))
                 try:
-                    data = _snapshot(db, task_id)
+                    data = _snapshot(db, task_id, field_required=self._field_required)
                     if (self._now() >= row[10] or type(stopped) is not bool or stopped is not True
                             or type(seq) is not int or robot_session != row[2] or robot_id != row[3]
                             or order_id != row[4] or seq != row[5] or map_id != row[6]
@@ -457,6 +495,10 @@ class RecoveryGate:
         if not main_path or os.path.normcase(os.path.realpath(main_path)) != self.path:
             raise RecoveryError('recovery proof must use the same database')
         self._active(db)
+        try:
+            _verify_field_global(db, field_required=self._field_required)
+        except (ValueError, TypeError, sqlite3.Error) as exc:
+            raise RecoveryError('field simulation allocations are inconsistent') from exc
         row = db.execute('SELECT c.epoch,c.robot_session,c.seq,c.stopped_at,c.expires,c.status, '
                          'c.robot_id,c.map_id,j.robot_id,j.map_id,t.status,m.value, '
                          'c.order_id,c.order_digest,c.map_fingerprint, '
