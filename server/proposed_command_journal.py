@@ -292,16 +292,25 @@ class ProposedCommandJournal:
             self._validate_all(db)
         return self.get(*identity)
 
-    def mark_attempted(self, robot_id, order_id, seq):
+    def mark_attempted(self, robot_id, order_id, seq, *, expected_payload):
+        """Persist the attempt only for these exact immutable wire bytes.
+
+        Returns the stored bytes; this method does not publish or authorize.
+        """
         self._check_identity(robot_id, order_id, seq)
+        if type(expected_payload) is not bytes:
+            raise ValueError('exact immutable expected payload bytes are required')
         with self._transaction() as db:
             self._validate_all(db)
             updated = db.execute("UPDATE commands SET state='uncertain' WHERE robot_id=? AND order_id=? "
-                                 "AND seq=? AND state='pending' AND generation=?",
-                                 (robot_id, order_id, seq, self._generation))
+                                 "AND seq=? AND state='pending' AND generation=? AND payload=?",
+                                 (robot_id, order_id, seq, self._generation, expected_payload))
             if updated.rowcount != 1:
-                raise JournalConflict('command is not eligible for its first attempt')
+                raise JournalConflict('command, payload or generation is not eligible for its first attempt')
             self._validate_all(db)
+            (payload,) = db.execute('SELECT payload FROM commands WHERE robot_id=? AND order_id=? AND seq=?',
+                                    (robot_id, order_id, seq)).fetchone()
+            return payload
 
     def record_response(self, robot_id, response, *, retained=False):
         _topic(robot_id)

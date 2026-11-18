@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from server.order_publisher import _payload
+
 
 def sample_order(seq=1, release='B'):
     return {'order_id': 'task-1', 'seq': seq, 'map_id': 'mat@v1',
@@ -34,7 +36,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         actual = None
         if journal is not None:
             journal.stage('sim-r1', 'boot-1', sample_order())
-            journal.mark_attempted('sim-r1', 'task-1', 1)
+            journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
             actual = journal.get('sim-r1', 'task-1', 1)['state']
         self.assertEqual(actual, 'uncertain')
 
@@ -95,7 +97,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import ProposedCommandJournal, JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         second = dict(sample_order(), order_id='task-2')
         journal.stage('sim-r2', 'boot-2', second)
         reopened = ProposedCommandJournal.open_existing(self.path, simulation=True,
@@ -103,9 +105,9 @@ class ProposedCommandJournalTests(unittest.TestCase):
         self.assertEqual(reopened.get('sim-r1', 'task-1', 1)['state'], 'uncertain')
         self.assertEqual(reopened.get('sim-r2', 'task-2', 1)['state'], 'blocked')
         with self.assertRaises(JournalConflict):
-            reopened.mark_attempted('sim-r1', 'task-1', 1)
+            reopened.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         with self.assertRaises(JournalConflict):
-            reopened.mark_attempted('sim-r2', 'task-2', 1)
+            reopened.mark_attempted('sim-r2', 'task-2', 1, expected_payload=_payload(second))
         with self.assertRaises(JournalConflict):
             journal.stage('sim-r3', 'boot-3', dict(sample_order(), order_id='task-3'))
 
@@ -120,6 +122,32 @@ class ProposedCommandJournalTests(unittest.TestCase):
         with self.assertRaises(JournalConflict):
             journal.stage('sim-r1', 'boot-2', original)
 
+    def test_attempt_rejects_different_exact_payload_without_state_change(self):
+        from server.order_publisher import _payload
+        from server.proposed_command_journal import JournalConflict
+        journal = self.make()
+        journal.stage('sim-r1', 'boot-1', sample_order())
+        different = _payload(dict(sample_order(), released_until='C'))
+        try:
+            journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=different)
+        except JournalConflict:
+            pass
+        except TypeError:
+            self.fail('mark_attempted must validate the expected wire bytes')
+        else:
+            self.fail('mismatched payload was accepted')
+        self.assertEqual(journal.get('sim-r1', 'task-1', 1)['state'], 'pending')
+
+    def test_attempt_requires_immutable_bytes_and_returns_stored_wire_bytes(self):
+        journal = self.make()
+        staged = journal.stage('sim-r1', 'boot-1', sample_order())
+        for invalid in (None, bytearray(staged['payload']), staged['payload'].decode('utf-8')):
+            with self.subTest(invalid=type(invalid)), self.assertRaises(ValueError):
+                journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=invalid)
+        self.assertEqual(journal.get('sim-r1', 'task-1', 1)['state'], 'pending')
+        self.assertEqual(journal.mark_attempted('sim-r1', 'task-1', 1,
+                                               expected_payload=staged['payload']), staged['payload'])
+
     def test_same_robot_cannot_stage_a_different_task_in_any_state(self):
         from server.proposed_command_journal import JournalConflict
         for state in ('pending', 'uncertain', 'accepted', 'rejected', 'blocked'):
@@ -129,7 +157,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
                 journal = ProposedCommandJournal.create(path, simulation=True)
                 journal.stage('sim-r1', 'boot-1', sample_order())
                 if state in ('uncertain', 'accepted', 'rejected'):
-                    journal.mark_attempted('sim-r1', 'task-1', 1)
+                    journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
                 if state in ('accepted', 'rejected'):
                     journal.record_response('sim-r1', self.response(journal, outcome=state))
                 if state == 'blocked':
@@ -174,7 +202,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         event = self.response(journal)
         self.assertEqual(journal.record_response('sim-r1', event), 'accepted')
         self.assertEqual(journal.record_response('sim-r1', event), 'accepted')
@@ -189,7 +217,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         event = self.response(journal)
         for field, value in [('robot_session', 'other'), ('map_id', 'other@v1'),
                              ('order_digest', '0' * 64), ('seq', 2)]:
@@ -201,7 +229,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         event = self.response(journal, outcome='rejected')
         with self.assertRaises(JournalConflict):
             journal.record_response('sim-r1', event, retained=True)
@@ -214,7 +242,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         event = self.response(journal)
         original = journal._validate_all
         counter = [0]
@@ -236,7 +264,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         journal.stage('sim-r1', 'boot-1', sample_order())
         def attempt(_):
             try:
-                journal.mark_attempted('sim-r1', 'task-1', 1)
+                journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
                 return 'won'
             except JournalConflict:
                 return 'blocked'
@@ -252,13 +280,13 @@ class ProposedCommandJournalTests(unittest.TestCase):
             with db:
                 db.execute("UPDATE commands SET payload = '{}' WHERE order_id = 'task-1'")
         with self.assertRaises(JournalConflict):
-            journal.mark_attempted('sim-r1', 'task-1', 1)
+            journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
 
     def test_corrupt_event_identity_is_detected_before_further_work(self):
         from server.proposed_command_journal import JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         journal.record_response('sim-r1', self.response(journal))
         with closing(sqlite3.connect(self.path)) as db:
             with db:
@@ -270,7 +298,7 @@ class ProposedCommandJournalTests(unittest.TestCase):
         from server.proposed_command_journal import ProposedCommandJournal, JournalConflict
         journal = self.make()
         journal.stage('sim-r1', 'boot-1', sample_order())
-        journal.mark_attempted('sim-r1', 'task-1', 1)
+        journal.mark_attempted('sim-r1', 'task-1', 1, expected_payload=_payload(sample_order()))
         journal.record_response('sim-r1', self.response(journal))
         reopened = ProposedCommandJournal.open_existing(self.path, simulation=True,
                                                         expected_creation_id=journal.creation_id)
