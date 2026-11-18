@@ -595,6 +595,48 @@ class SimRuntime:
                                     "FROM sim_event_inbox WHERE task_id=? AND robot_id=? "
                                     "AND state='pending' ORDER BY event_id LIMIT 101",
                                     (task_id, robot_id)).fetchall()
+                # This opt-in table may exist even when its receiver is now
+                # disabled. Inspect schema and historical claims in this same
+                # read transaction; do not infer state from runtime options.
+                observation_objects = db.execute(
+                    "SELECT type,name FROM sqlite_master WHERE lower(name) IN "
+                    "('sim_command_observations','sim_command_observation_meta')").fetchall()
+                if not observation_objects and self._command_observations_enabled:
+                    raise RuntimeError('enabled simulation observation tables are missing')
+                claims = None
+                if observation_objects:
+                    from server.sim_command_observations import SimCommandObservations
+                    try:
+                        SimCommandObservations._check_schema(db)
+                    except ValueError as exc:
+                        raise RuntimeError('simulation observation schema unavailable') from exc
+                    valid_meta = db.execute(
+                        "SELECT COUNT(*), SUM(CASE WHEN singleton=1 AND typeof(epoch)='text' "
+                        "AND length(CAST(epoch AS BLOB))=64 AND instr(CAST(epoch AS BLOB), X'00')=0 "
+                        "AND epoch NOT GLOB '*[^0-9a-f]*' "
+                        "THEN 1 ELSE 0 END) FROM sim_command_observation_meta").fetchone()
+                    if valid_meta != (1, 1):
+                        raise RuntimeError('simulation observation metadata unavailable')
+                    # Compare only database metadata; none of these values
+                    # authenticates the sender or the currently running gate.
+                    valid_epoch = lambda name: ("typeof({0})='text' AND length(CAST({0} AS BLOB))=64 "
+                                                "AND instr(CAST({0} AS BLOB), X'00')=0 "
+                                                "AND {0} NOT GLOB '*[^0-9a-f]*'").format(name)
+                    epoch_checks = ' AND '.join(valid_epoch(name) for name in ('o.epoch', 'm.epoch', 'r.epoch'))
+                    claims = db.execute(
+                        "SELECT CASE WHEN typeof(o.event_id)='text' "
+                        "AND length(CAST(o.event_id AS BLOB)) BETWEEN 1 AND 256 "
+                        "THEN o.event_id ELSE NULL END, "
+                        "CASE WHEN typeof(o.seq)='integer' AND o.seq>=1 THEN o.seq ELSE NULL END, "
+                        "CASE WHEN o.outcome IN ('accepted','rejected') THEN o.outcome ELSE NULL END, "
+                        "CASE WHEN " + epoch_checks + " AND o.epoch=m.epoch AND o.epoch=r.epoch "
+                        "THEN 'same_at_db_snapshot' WHEN " + epoch_checks +
+                        " AND o.epoch=m.epoch AND o.epoch<>r.epoch THEN 'different_at_db_snapshot' "
+                        "ELSE 'unknown' END FROM sim_command_observations o "
+                        "LEFT JOIN sim_command_observation_meta m ON m.singleton=1 "
+                        "LEFT JOIN recovery_runtime r ON r.singleton=1 "
+                        "WHERE o.task_id=? AND o.robot_id=? ORDER BY o.seq,o.event_id LIMIT 101",
+                        (task_id, robot_id)).fetchall()
             if (job is None) != (first is None) or (job is not None and job[0] != robot_id):
                 raise RuntimeError('inconsistent simulation allocation')
             if (task[0] is None or (job is not None and any(value is None for value in job))
@@ -612,13 +654,28 @@ class SimRuntime:
                 if seq is None:
                     item['seq_omitted'] = True
                 event_metadata.append(item)
+            claim_metadata = []
+            for event_id, seq, outcome, relation in (claims or [])[:100]:
+                item = {'event_id': event_id, 'seq': seq, 'claimed_outcome': outcome,
+                        'epoch_relation': relation}
+                if event_id is None:
+                    item['event_id_omitted'] = True
+                if seq is None:
+                    item['seq_omitted'] = True
+                if outcome is None:
+                    item['outcome_unrecognized'] = True
+                claim_metadata.append(item)
+            observations = {'availability': 'not_installed' if claims is None else 'available',
+                            'records': claim_metadata, 'truncated': claims is not None and len(claims) > 100,
+                            'integrity': 'not_checked', 'kind': 'unverified_simulation_claim'}
             snapshot = {'task_id': task_id, 'status': task[0], 'robot_id': job[0] if job else None,
                         'map_id': job[1] if job else None, 'released_until': job[2] if job else None,
                         'orders': orders, 'orders_truncated': len(later) > 99,
                         'occupancy': [list(row) for row in resources[:500]],
                         'occupancy_truncated': len(resources) > 500,
                         'pending_events': event_metadata, 'pending_events_integrity': 'not_checked',
-                        'pending_events_truncated': len(events) > 100}
+                        'pending_events_truncated': len(events) > 100,
+                        'command_response_observations': observations}
             # These are observed after the DB transaction, so they must not be
             # treated as a single atomic view or as recovery authorization.
             blocked = None

@@ -8,6 +8,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 
@@ -78,6 +79,233 @@ class SimulationTaskDiagnosticsTests(unittest.TestCase):
         self.assertNotIn('boot-1', repr(result))
         self.assertEqual(self.store.list_occupancy(), before_occupancy)
         self.assertEqual(self.store.get_order('T1')['state'], 'uncertain')
+
+    def test_uninstalled_command_observations_are_distinct_from_empty_installed_table(self):
+        snapshot = self.runtime.task_diagnostics('T1')['database_snapshot']
+        self.assertEqual(snapshot['command_response_observations'], {
+            'availability': 'not_installed', 'records': [], 'truncated': False,
+            'integrity': 'not_checked', 'kind': 'unverified_simulation_claim'})
+        self.install_observations()
+        snapshot = self.runtime.task_diagnostics('T1')['database_snapshot']
+        self.assertEqual(snapshot['command_response_observations']['availability'], 'available')
+        self.assertEqual(snapshot['command_response_observations']['records'], [])
+
+    def test_enabled_observations_with_both_tables_missing_fail_closed(self):
+        self.runtime._command_observations_enabled = True
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+
+    def install_observations(self):
+        from server.sim_command_observations import _CREATE, _CREATE_META
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(_CREATE)
+            db.execute(_CREATE_META)
+            db.execute('INSERT INTO sim_command_observation_meta VALUES (1,?)', (self.gate._epoch,))
+
+    def insert_claim(self, *, robot='sim-r1', task='T1', event='claim-1', seq=1,
+                     outcome='accepted', epoch=None):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('INSERT INTO sim_command_observations VALUES (?,?,?,?,?,?,?,?,?,?)',
+                       (robot, event, task, seq, 'sensitive-session', 'integration@v1',
+                        'sensitive-digest', outcome, self.gate._epoch if epoch is None else epoch,
+                        'sensitive-response-body'))
+
+    def test_claim_metadata_is_task_scoped_unverified_and_never_contains_payload(self):
+        self.install_observations()
+        self.insert_claim()
+        self.insert_claim(robot='sim-r2', task='T2', event='other-claim-secret')
+        self.insert_claim(robot='sim-r2', task='T1', event='wrong-robot-secret', seq=2)
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result, {'availability': 'available', 'integrity': 'not_checked',
+            'kind': 'unverified_simulation_claim', 'truncated': False,
+            'records': [{'event_id': 'claim-1', 'seq': 1, 'claimed_outcome': 'accepted',
+                         'epoch_relation': 'same_at_db_snapshot'}]})
+        for secret in ('sensitive-session', 'sensitive-digest', 'sensitive-response-body',
+                       'other-claim-secret', 'wrong-robot-secret', self.gate._epoch):
+            self.assertNotIn(secret, repr(result))
+
+    def test_persisted_claim_epoch_differs_after_new_recovery_epoch(self):
+        self.install_observations()
+        self.insert_claim()
+        RecoveryGate(self.path).initialize()
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result['records'][0]['epoch_relation'], 'different_at_db_snapshot')
+        self.assertEqual(result['kind'], 'unverified_simulation_claim')
+
+    def test_corrupt_claim_metadata_is_bounded_and_never_promoted_to_verified(self):
+        self.install_observations()
+        self.insert_claim(event='나' * 86, seq=1, outcome='private-invalid-outcome' * 50,
+                          epoch='not-an-epoch')
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result['integrity'], 'not_checked')
+        self.assertEqual(result['records'], [{'event_id': None, 'event_id_omitted': True,
+            'seq': 1, 'claimed_outcome': None, 'outcome_unrecognized': True,
+            'epoch_relation': 'unknown'}])
+        self.assertNotIn('private-invalid-outcome', repr(result))
+
+    def test_partial_or_changed_observation_schema_fails_closed(self):
+        from server.sim_command_observations import _CREATE
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(_CREATE)
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('DROP TABLE sim_command_observations')
+        self.install_observations()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('ALTER TABLE sim_command_observations ADD COLUMN wrong TEXT')
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+
+    def test_missing_or_malformed_observation_epoch_fails_closed(self):
+        self.install_observations()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('DELETE FROM sim_command_observation_meta')
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("INSERT INTO sim_command_observation_meta VALUES (1,'bad')")
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+
+    def test_nul_in_observation_meta_epoch_fails_closed(self):
+        self.install_observations()
+        malformed = 'a' * 32 + '\x00' + 'Z' * 31
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('UPDATE sim_command_observation_meta SET epoch=?', (malformed,))
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+
+    def test_nul_in_claim_or_recovery_epoch_reports_unknown(self):
+        self.install_observations()
+        malformed = 'a' * 32 + '\x00' + 'Z' * 31
+        self.insert_claim(epoch=malformed)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('UPDATE recovery_runtime SET epoch=?', (malformed,))
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result['records'][0]['epoch_relation'], 'unknown')
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('UPDATE sim_command_observations SET epoch=?', (self.gate._epoch,))
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result['records'][0]['epoch_relation'], 'unknown')
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('UPDATE sim_command_observations SET epoch=?', (malformed,))
+            db.execute('UPDATE recovery_runtime SET epoch=?', (self.gate._epoch,))
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(result['records'][0]['epoch_relation'], 'unknown')
+
+    def test_claim_output_count_utf8_and_sequence_limits(self):
+        self.install_observations()
+        rows = []
+        for seq in range(1, 103):
+            event_id = ('가' * 85 if seq == 1 else '나' * 86 if seq == 2 else
+                        'a' * 256 if seq == 3 else 'b' * 257 if seq == 4 else 'event-%03d' % seq)
+            rows.append(('sim-r1', event_id, 'T1', seq, 'sensitive-session', 'integration@v1',
+                         'sensitive-digest', 'accepted', self.gate._epoch, 'sensitive-response-body'))
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.executemany('INSERT INTO sim_command_observations VALUES (?,?,?,?,?,?,?,?,?,?)', rows)
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertEqual(len(result['records']), 100)
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['records'][0]['event_id'], '가' * 85)
+        self.assertEqual(result['records'][1]['event_id'], None)
+        self.assertTrue(result['records'][1]['event_id_omitted'])
+        self.assertEqual(result['records'][2]['event_id'], 'a' * 256)
+        self.assertIsNone(result['records'][3]['event_id'])
+        self.assertTrue(result['records'][3]['event_id_omitted'])
+        self.assertNotIn('나' * 86, repr(result))
+        self.assertNotIn('b' * 257, repr(result))
+
+    def test_malformed_claim_sequence_and_trigger_are_not_exposed_or_trusted(self):
+        self.install_observations()
+        self.insert_claim(seq='secret-sequence-' * 50)
+        result = self.runtime.task_diagnostics('T1')['database_snapshot']['command_response_observations']
+        self.assertIsNone(result['records'][0]['seq'])
+        self.assertTrue(result['records'][0]['seq_omitted'])
+        self.assertNotIn('secret-sequence', repr(result))
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('CREATE TRIGGER evil AFTER INSERT ON SIM_COMMAND_OBSERVATIONS BEGIN SELECT 1; END')
+        with self.assertRaises(RuntimeError):
+            self.runtime.task_diagnostics('T1')
+
+    def test_authenticated_claim_api_fails_closed_on_partial_schema(self):
+        self.install_observations()
+        self.insert_claim()
+        app = FastAPI()
+        app.include_router(router)
+        app.state.sim_runtime = self.runtime
+        app.state.sim_api_token = 'secret-token'
+        def get(token='Bearer secret-token'):
+            return asyncio.run(request(app, 'GET', '/simulation/tasks/T1/diagnostics', token=token))
+        self.assertEqual(get(token=None)[0], 401)
+        code, result, headers = get()
+        self.assertEqual(code, 200)
+        self.assertEqual(headers[b'cache-control'], b'no-store')
+        self.assertEqual(result['database_snapshot']['command_response_observations']['records'][0]
+                         ['claimed_outcome'], 'accepted')
+        self.assertNotIn('sensitive-session', repr(result))
+        self.assertNotIn('sensitive-digest', repr(result))
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('DROP TABLE sim_command_observation_meta')
+        code, result, headers = get()
+        self.assertEqual((code, result), (503, {'detail': 'simulation unavailable'}))
+        self.assertEqual(headers[b'cache-control'], b'no-store')
+
+    def test_claims_and_order_are_read_from_the_same_snapshot(self):
+        self.install_observations()
+        self.insert_claim()
+        original_connect = sqlite3.connect
+        with closing(original_connect(self.path)) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower(), 'wal')
+        started, first_read, committed = threading.Event(), threading.Event(), threading.Event()
+        failures = []
+        def writer():
+            try:
+                with closing(original_connect(self.path, timeout=10)) as db:
+                    started.set()
+                    if not first_read.wait(5):
+                        raise RuntimeError('diagnostic did not reach its first read')
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute("UPDATE allocation_outbox SET state='acked' WHERE task_id='T1'")
+                    db.execute("UPDATE sim_command_observations SET outcome='rejected' WHERE task_id='T1'")
+                    db.commit()
+                    committed.set()
+            except Exception as exc:
+                failures.append(exc)
+                committed.set()
+
+        class PausingConnection(sqlite3.Connection):
+            def execute(self, statement, parameters=()):
+                cursor = super().execute(statement, parameters)
+                if 'FROM tasks WHERE task_id=?' in statement:
+                    first_read.set()
+                    if not committed.wait(5):
+                        raise RuntimeError('test writer did not commit during the read')
+                    if failures:
+                        raise RuntimeError('test writer failed') from failures[0]
+                return cursor
+
+        def diagnostic_connection(*args, **kwargs):
+            kwargs['factory'] = PausingConnection
+            return original_connect(*args, **kwargs)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(started.wait(5))
+        try:
+            with patch('server.sim_runtime.sqlite3.connect', side_effect=diagnostic_connection):
+                snapshot = self.runtime.task_diagnostics('T1')['database_snapshot']
+        finally:
+            thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(first_read.is_set() and committed.is_set())
+        self.assertEqual(snapshot['orders'][0]['state'], 'uncertain')
+        self.assertEqual(snapshot['command_response_observations']['records'][0]['claimed_outcome'], 'accepted')
+        with closing(original_connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT state FROM allocation_outbox WHERE task_id='T1'").fetchone(), ('acked',))
+            self.assertEqual(db.execute("SELECT outcome FROM sim_command_observations WHERE task_id='T1'").fetchone(),
+                             ('rejected',))
 
     def test_missing_task_and_stopped_runtime_fail_closed(self):
         for name in ('not-configured', 'T3'):

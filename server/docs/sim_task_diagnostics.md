@@ -34,6 +34,39 @@
 일치하지 않는 저장 메타데이터도 포함될 수 있고, 이 목록은 이벤트 처리나
 주행에 사용할 유효한 증거가 아니다.
 
+`command_response_observations`는 선택적 가상 명령 응답 기록의 메타데이터다.
+`availability: "not_installed"`는 관련 테이블이 둘 다 없는 기본 DB이고,
+`"available"`은 해당 형식의 테이블이 있는 경우다. 일부 테이블만 존재하거나
+스키마·트리거·epoch 메타데이터가 올바르지 않으면 진단을 일반 오류로 중단한다.
+관측 기능이 활성화된 런타임에서 두 테이블이 모두 없어져도 오류다. 기능이
+비활성화된 상태에서 두 테이블이 없는 경우는 이전 기록이 존재한 적이 없음을
+증명하지 않으며, 단지 현재 DB 스냅샷에서 찾지 못했다는 의미다.
+현재 수신기를 비활성화했더라도 과거 테이블이 남아 있으면 저장된 주장을
+조회한다. 한 작업과 그 작업에 설정된 가상 로봇에 속하는 기록만 최대 100건
+돌려주며, 나머지는 `truncated: true`로 표시한다.
+
+각 항목의 `claimed_outcome`은 팀 미합의 가상 응답의 주장으로, 정상 값은
+`accepted` 또는 `rejected`다. 그 밖의 값은 `null`과
+`outcome_unrecognized: true`로 표시한다. 이벤트 ID는 256 UTF-8바이트를
+넘으면 `null`과 `event_id_omitted: true`, 순번이 양의 정수가 아니면 `null`과
+`seq_omitted: true`로 표시한다. 세션, 주문 digest, 응답 본문과 epoch 값은
+반환하지 않는다. 이벤트 본문·digest·송신자 출처는 검사하지 않으며 결과에는
+항상 `integrity: "not_checked"`, `kind: "unverified_simulation_claim"`이
+붙는다. DB 내용이 손상되거나 임의로 변경된 경우에도 이런 메타데이터가 나올
+수 있다.
+
+`epoch_relation`의 `same_at_db_snapshot` 또는 `different_at_db_snapshot`은
+관측 행의 epoch, 관측 메타의 epoch, DB에 기록된 복구 epoch를 **그 읽기
+스냅샷 안에서 비교한 결과**다. 비교할 값이 없거나 잘못됐거나 관측 행이 메타와
+다르면 `unknown`이다. 이는 실행 중인 gate와 원자적으로 비교한 결과도 아니고,
+현재 수락·정지·명령 전달·브로커 ACK 전달이나 물리적 안전의 증거도 아니다.
+각 epoch는 NUL이 없는 64바이트 소문자 16진 문자열이어야 한다. 관측 메타의
+epoch가 이 형식에 맞지 않으면 진단을 중단하고, 관측 행이나 복구 epoch가
+잘못되면 비교 결과를 `unknown`으로 표시한다.
+같은 프로세스에서 런타임을 재생성할 때 기존 명령 응답 관측 기능은 이전 epoch에
+재설치할 수 없지만, 기본 모드로 실행하면 기존 기록을 과거 주장으로 조회할 수
+있다.
+
 `recovery_blocked_observation`과 `mqtt_ready_observation`은 DB 조회가 끝난
 뒤 각각 현재 런타임의 메모리 상태에서 읽는다. 이 값들은 DB와 원자적으로
 동일한 순간의 상태가 아니며 `null`은 알 수 없다는 뜻이다. 차단 여부가
