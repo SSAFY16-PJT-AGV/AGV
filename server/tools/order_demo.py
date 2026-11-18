@@ -97,8 +97,8 @@ def wait_for_demo(server, log_path, timeout=20):
 
 def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
         state_dir=ROOT / 'data' / 'order-demo-state', field_config=None, synthetic=False):
-    if synthetic and (editor is not None or project is not None or field_config is not None):
-        raise ValueError('synthetic mode cannot be combined with Unreal or field mapping')
+    if synthetic and (editor is not None or project is not None):
+        raise ValueError('synthetic mode cannot be combined with Unreal')
     if synthetic and Path(state_dir).exists():
         raise ValueError('synthetic mode requires a new, nonexistent state directory')
     map_path, editor, project, ddc, broker_deps = validate_inputs(

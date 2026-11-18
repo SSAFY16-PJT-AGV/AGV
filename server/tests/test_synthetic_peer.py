@@ -74,7 +74,7 @@ class SyntheticPeerTests(unittest.TestCase):
         actions = Mock()
         actions.attach.return_value = True
         actions.can_dispatch.return_value = True
-        actions.motion_guard.return_value = nullcontext(True)
+        actions.synthetic_effect_guard.side_effect = lambda *_args: nullcontext(True)
         actions.poll.side_effect = [{'type': 'robot.action', 'data': self.action()}, None]
         actions.receive.return_value = False
         actions.detach.side_effect = lambda owner: detached.set()
@@ -92,7 +92,7 @@ class SyntheticPeerTests(unittest.TestCase):
         actions = Mock()
         actions.attach.return_value = True
         actions.can_dispatch.return_value = True
-        actions.motion_guard.return_value = nullcontext(True)
+        actions.synthetic_effect_guard.side_effect = lambda *_args: nullcontext(True)
         actions.invalidate_owner.side_effect = lambda owner: invalidated.set()
         def pending(_owner):
             observed.set()
@@ -117,7 +117,7 @@ class SyntheticPeerTests(unittest.TestCase):
         actions = Mock()
         actions.attach.return_value = True
         actions.can_dispatch.return_value = True
-        actions.motion_guard.return_value = nullcontext(True)
+        actions.synthetic_effect_guard.side_effect = lambda *_args: nullcontext(True)
         actions.detach.side_effect = lambda owner: detached.set()
         def pending(_owner):
             observed.set()
@@ -133,13 +133,197 @@ class SyntheticPeerTests(unittest.TestCase):
         self.assertEqual(peer._stock['D01'], 3)
         actions.receive.assert_not_called()
 
+    def test_pose_is_refreshed_after_poll_before_world_effect(self):
+        delivered = threading.Event()
+        actions = Mock()
+        actions.attach.return_value = True
+        actions.can_dispatch.return_value = True
+        actions.synthetic_effect_guard.side_effect = lambda *_args: nullcontext(True)
+        fresh = {'value': False}
+        def latest(robot):
+            value = observation(*(POSES[robot][k] for k in ('x', 'y')))
+            if not fresh['value']:
+                value['received_at'] -= 2
+            return value
+        self.observer.twin_observation.side_effect = latest
+        def poll(_owner):
+            if not fresh['value']:
+                # A slow poll has ended and a newer MQTT observation has arrived.
+                fresh['value'] = True
+                return {'type': 'robot.action', 'data': self.action()}
+            return None
+        actions.poll.side_effect = poll
+        actions.receive.side_effect = lambda *_args: delivered.set() or True
+        peer = SyntheticPeer(actions, self.observer, PRODUCTS, POSES, 'a' * 32).start()
+        try:
+            self.assertTrue(delivered.wait(2))
+            self.assertEqual(peer._stock['D01'], 2)
+        finally:
+            peer.stop()
+
+    def test_refresh_without_new_observation_cannot_fabricate_freshness(self):
+        detached = threading.Event()
+        actions = Mock()
+        actions.attach.return_value = True
+        actions.can_dispatch.return_value = True
+        actions.synthetic_effect_guard.side_effect = [nullcontext(True), nullcontext(False)]
+        actions.poll.return_value = {'type': 'robot.action', 'data': self.action()}
+        actions.detach.side_effect = lambda _owner: detached.set()
+        old_time = time.monotonic() - 3
+        def stale(robot):
+            value = observation(*(POSES[robot][k] for k in ('x', 'y')))
+            value['received_at'] = old_time
+            return value
+        self.observer.twin_observation.side_effect = stale
+        peer = SyntheticPeer(actions, self.observer, PRODUCTS, POSES, 'a' * 32).start()
+        try:
+            self.assertTrue(detached.wait(2))
+            self.assertEqual(peer._stock['D01'], 3)
+            actions.receive.assert_not_called()
+        finally:
+            peer.stop()
+
+    def test_stale_observation_waits_without_locks_until_new_mqtt_state(self):
+        waiting, delivered = threading.Event(), threading.Event()
+        actions = Mock()
+        actions.attach.return_value = True
+        actions.can_dispatch.return_value = True
+        actions.synthetic_effect_guard.side_effect = lambda *_args: nullcontext(True)
+        actions.poll.side_effect = [{'type': 'robot.action', 'data': self.action()}, None]
+        actions.receive.side_effect = lambda *_args: delivered.set() or True
+        fresh = {'value': False}
+        def latest(robot):
+            value = observation(*(POSES[robot][k] for k in ('x', 'y')))
+            if not fresh['value']:
+                value['received_at'] -= 2
+            return value
+        self.observer.twin_observation.side_effect = latest
+        peer = SyntheticPeer(actions, self.observer, PRODUCTS, POSES, 'a' * 32)
+        original_wait = peer._stop.wait
+        def observed_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+        peer._stop.wait = observed_wait
+        peer.start()
+        try:
+            self.assertTrue(waiting.wait(2))
+            self.assertFalse(delivered.is_set())
+            fresh['value'] = True
+            self.assertTrue(delivered.wait(2))
+            self.assertEqual(peer._stock['D01'], 2)
+        finally:
+            peer.stop()
+
+    def test_real_session_effect_guard_checks_owner_pending_and_timeout(self):
+        engine = Mock()
+        action = self.action()
+        engine.snapshot.return_value = {'pending_action': {key: action[key] for key in
+                                         ('order_id', 'action_id', 'agv_id', 'action')}}
+        session = DemoActionSession(engine, threading.RLock(), action_source='synthetic',
+                                    timeout_seconds=10)
+        owner = object()
+        self.assertTrue(session.attach(owner, True, source='synthetic'))
+        session.action_id, session.sent_at = action['action_id'], time.monotonic()
+        with session.synthetic_effect_guard(owner, action) as allowed:
+            self.assertTrue(allowed)
+        with session.synthetic_effect_guard(object(), action) as allowed:
+            self.assertFalse(allowed)
+        with session.synthetic_effect_guard(owner, dict(action, order_id='different')) as allowed:
+            self.assertFalse(allowed)
+        session.can_dispatch = lambda: False
+        with session.synthetic_effect_guard(owner, action) as allowed:
+            self.assertFalse(allowed)
+        session.can_dispatch = lambda: True
+        session.sent_at = time.monotonic() - 11
+        with session.synthetic_effect_guard(owner, action) as allowed:
+            self.assertFalse(allowed)
+        unreal = DemoActionSession(engine, threading.RLock())
+        self.assertTrue(unreal.attach(owner, True))
+        unreal.action_id, unreal.sent_at = action['action_id'], time.monotonic()
+        with unreal.synthetic_effect_guard(owner, action) as allowed:
+            self.assertFalse(allowed)
+
+    def test_timeout_during_observer_read_blocks_the_world_effect(self):
+        entered, release = threading.Event(), threading.Event()
+        engine = Mock()
+        action = self.action()
+        engine.snapshot.return_value = {'pending_action': {key: action[key] for key in
+                                         ('order_id', 'action_id', 'agv_id', 'action')}}
+        session = DemoActionSession(engine, threading.RLock(), action_source='synthetic', timeout_seconds=1)
+        session.action_id, session.sent_at = action['action_id'], time.monotonic()
+        session.poll = Mock(return_value={'type': 'robot.action', 'data': action})
+        peer = SyntheticPeer(session, self.observer, PRODUCTS, POSES, 'a' * 32)
+        original, calls = peer._refresh_poses, []
+        def slow_observer():
+            calls.append(True)
+            if len(calls) == 2:
+                entered.set()
+                self.assertTrue(release.wait(2))
+            original()
+        peer._refresh_poses = slow_observer
+        peer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            # Test-only controlled deadline expiry while the observer blocks.
+            session.sent_at = time.monotonic() - 2
+        finally:
+            release.set()
+            peer._thread.join(2)
+            peer.stop()
+        self.assertFalse(peer._thread.is_alive())
+        self.assertEqual(peer._stock['D01'], 3)
+
+    def test_waiting_for_fresh_mqtt_does_not_hold_session_fences(self):
+        waiting, invalidated = threading.Event(), threading.Event()
+        engine = Mock()
+        action = self.action()
+        engine.snapshot.return_value = {'pending_action': {key: action[key] for key in
+                                         ('order_id', 'action_id', 'agv_id', 'action')}}
+        session = DemoActionSession(engine, threading.RLock(), action_source='synthetic')
+        session.action_id, session.sent_at = action['action_id'], time.monotonic()
+        session.poll = Mock(return_value={'type': 'robot.action', 'data': action})
+        old_time = time.monotonic() - 3
+        def stale(robot):
+            value = observation(*(POSES[robot][key] for key in ('x', 'y')))
+            value['received_at'] = old_time
+            return value
+        self.observer.twin_observation.side_effect = stale
+        peer = SyntheticPeer(session, self.observer, PRODUCTS, POSES, 'a' * 32)
+        original_wait = peer._stop.wait
+        def observed_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+        peer._stop.wait = observed_wait
+        peer.start()
+        worker = None
+        try:
+            self.assertTrue(waiting.wait(2))
+            self.assertTrue(session.lock.acquire(blocking=False))
+            session.lock.release()
+            def invalidate():
+                session.invalidate_owner(peer)
+                invalidated.set()
+            worker = threading.Thread(target=invalidate, daemon=True)
+            worker.start()
+            self.assertTrue(invalidated.wait(2))
+        finally:
+            peer.stop()
+            if worker is not None:
+                worker.join(2)
+        self.assertFalse(peer._thread.is_alive())
+        self.assertEqual(peer._stock['D01'], 3)
+
     def test_real_owner_invalidation_fences_effect_before_and_during_apply(self):
         for at_effect in (False, True):
             with self.subTest(at_effect=at_effect):
                 entered, release, invalidated = threading.Event(), threading.Event(), threading.Event()
                 invalidating = threading.Event()
-                actions = DemoActionSession(Mock(), threading.RLock(), action_source='synthetic',
+                engine = Mock()
+                engine.snapshot.return_value = {'pending_action': {
+                    key: self.action()[key] for key in ('order_id', 'action_id', 'agv_id', 'action')}}
+                actions = DemoActionSession(engine, threading.RLock(), action_source='synthetic',
                                             on_invalidate=invalidating.set)
+                actions.action_id, actions.sent_at = 'a1', time.monotonic()
                 peer = SyntheticPeer(actions, self.observer, PRODUCTS, POSES, 'b' * 32)
                 message = {'type': 'robot.action', 'data': self.action()}
                 if at_effect:
@@ -193,26 +377,33 @@ class SyntheticConfigurationTests(unittest.IsolatedAsyncioTestCase):
                     'AGV_ORDER_ACTION_SOURCE': 'synthetic', 'AGV_ORDER_DEMO_ENABLED': '1',
                     'AGV_ORDER_COORDINATED': '1', 'AGV_ORDER_FLEET': '1', 'AGV_ORDER_SHELF_SYNC': '1',
                     'AGV_ORDER_DEMO_MAP': str(map_path), 'AGV_ORDER_PERSIST_DIR': str(root / 'new')}
-            for change in ({'AGV_ORDER_FIELD_CONFIG': 'field.json'}, {'AGV_ORDER_PERSIST_DIR': ''},
+            for change in ({'AGV_ORDER_FIELD_CONFIG': 'missing.json'}, {'AGV_ORDER_PERSIST_DIR': ''},
                            {'AGV_ORDER_FLEET': '0'}, {'AGV_ORDER_SHELF_SYNC': '0'},
                            {'AGV_ORDER_COORDINATED': '0'}, {'AGV_ORDER_ACTION_SOURCE': 'other'},
                            {'AGV_ORDER_PERSIST_DIR': str(existing)}):
                 with self.subTest(change=change), patch.dict(os.environ, dict(base, **change), clear=True):
-                    with self.assertRaises((ValueError, FileExistsError)):
+                    with self.assertRaises((ValueError, FileExistsError, FileNotFoundError)):
                         async with lifespan(SimpleNamespace(state=SimpleNamespace())):
                             self.fail('invalid configuration must not start')
                 self.assertEqual(marker.read_text(encoding='utf-8'), 'keep')
                 self.assertEqual(sorted(p.name for p in existing.iterdir()), ['preserve.txt'])
                 self.assertFalse((root / 'new').exists())
 
-    def test_launcher_rejects_ue_field_and_existing_path_before_start(self):
+    def test_launcher_rejects_ue_and_existing_path_before_start(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             marker = root / 'keep'
             marker.write_text('sentinel', encoding='utf-8')
-            for args in ({'editor': 'unreal.exe'}, {'project': 'unreal.uproject'},
-                         {'field_config': 'field.json'}, {}):
+            for args in ({'editor': 'unreal.exe'}, {'project': 'unreal.uproject'}, {}):
                 with self.subTest(args=args), self.assertRaises(ValueError):
                     run('not-needed.json', state_dir=root, synthetic=True, **args)
             self.assertEqual(marker.read_text(encoding='utf-8'), 'sentinel')
+
+    def test_launcher_accepts_explicit_field_option_for_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('server.tools.order_demo.validate_inputs', side_effect=RuntimeError('validate paths')) as check:
+                with self.assertRaisesRegex(RuntimeError, 'validate paths'):
+                    run('map.json', state_dir=Path(folder) / 'new', synthetic=True,
+                        field_config='field-config.json')
+                check.assert_called_once()
 

@@ -133,6 +133,30 @@ class DemoActionSession:
         with self._motion_fence:
             yield self._owner_available.is_set()
 
+    @contextmanager
+    def synthetic_effect_guard(self, client, action):
+        """Fence one internal synthetic effect against owner/action expiry.
+
+        Callers must not wait for new observations while holding this guard.
+        This is not an authorization or acknowledgement for physical robots.
+        """
+        with self.lock, self._motion_fence:
+            valid = (self._action_source == 'synthetic' and client is self.owner
+                     and self._owner_available.is_set() and isinstance(action, dict)
+                     and self.sent_at is not None and action.get('action_id') == self.action_id)
+            if valid:
+                pending = self.engine.snapshot().get('pending_action')
+                keys = ('order_id', 'action_id', 'agv_id', 'action')
+                valid = (isinstance(pending, dict) and all(action.get(key) == pending.get(key)
+                         and isinstance(action.get(key), str) and action[key] for key in keys)
+                         and self.can_dispatch() is True)
+            if valid:
+                age = time.monotonic() - self.sent_at
+                valid = (self._owner_available.is_set() and client is self.owner
+                         and self.sent_at is not None and action.get('action_id') == self.action_id
+                         and 0 <= age < self.timeout_seconds)
+            yield bool(valid)
+
     def invalidate_owner(self, client):
         """Signal immediately, then fence any already-running simulated tick."""
         with self._owner_fast_lock:

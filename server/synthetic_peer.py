@@ -11,12 +11,26 @@ import time
 
 
 class SyntheticPeer:
-    def __init__(self, actions, observer, products, initial_poses, world_id):
+    def __init__(self, actions, observer, products, initial_poses, world_id, *, field_mapping=None):
         if (not isinstance(world_id, str) or len(world_id) != 32
                 or any(c not in '0123456789abcdef' for c in world_id)
                 or set(initial_poses) != {'sim-r1', 'sim-r2'}):
             raise ValueError('a fresh isolated simulated world is required')
         self.actions, self.observer, self.world_id = actions, observer, world_id
+        if field_mapping is not None:
+            from server.field_twin_mapping import FieldTwinMapping
+            if not isinstance(field_mapping, FieldTwinMapping):
+                raise ValueError('a validated explicit synthetic field mapping is required')
+            if products != field_mapping.products:
+                raise ValueError('synthetic products differ from the explicit field mapping')
+            field_to_world = {node: world for world, node in field_mapping.pickup_sources.items()}
+            if (len(field_to_world) != len(field_mapping.pickup_sources)
+                    or set(field_to_world) != {item['pickup_node'] for item in products}):
+                raise ValueError('field pickup source mapping differs from product catalog')
+        else:
+            field_to_world = {item['pickup_node']: item['pickup_node'] for item in products}
+        self._field_mapping = field_mapping
+        self._map_ref = field_mapping.map_ref if field_mapping is not None else 'twin-validation-v1'
         self._stop = threading.Event()
         self._effect_lock = threading.Lock()
         self._thread = None
@@ -29,13 +43,19 @@ class SyntheticPeer:
                     or any(type(pose[k]) not in (int, float) or not math.isfinite(pose[k])
                            for k in ('x', 'y', 'yaw'))):
                 raise ValueError('valid initial synthetic robot poses required')
+            if field_mapping is not None:
+                start = field_mapping.robots[robot]['node']
+                x, y = field_mapping._field[start]
+                expected = field_mapping.pose({'x': x, 'y': y, 'th': 0.})
+                if any(abs(pose[key] - expected[key]) > 1e-9 for key in ('x', 'y', 'yaw')):
+                    raise ValueError('synthetic initial pose differs from the explicit field mapping')
             self._robots[twin] = dict(pose, carrying=False, interpolating=False)
             self._pose_at[twin] = 0.
         self._products = {}
         self._sources = {}
         self._slots = {}
         for item in products:
-            kind, source, shelf, size = (item['product_type'], item['pickup_node'],
+            kind, source, shelf, size = (item['product_type'], field_to_world[item['pickup_node']],
                                          item['shelf_id'], item['slot_count'])
             if (kind in self._products or source in self._sources or shelf in self._slots
                     or any(type(v) is not str or not v for v in (kind, source, shelf))
@@ -59,14 +79,20 @@ class SyntheticPeer:
             if (not isinstance(state, dict) or state.get('connected') is not True
                     or state.get('ready') is not True or not isinstance(seen, dict)
                     or seen.get('state_received_live') is not True or not isinstance(live, dict)
-                    or live.get('map_id') != 'twin-validation-v1' or not isinstance(pose, dict)
+                    or live.get('map_id') != self._map_ref or not isinstance(pose, dict)
                     or type(received) not in (int, float)
                     or not 0 <= time.monotonic() - received <= 1.
                     or any(type(pose.get(k)) not in (int, float) or not math.isfinite(pose[k])
                            for k in ('x', 'y', 'th'))):
                 self._pose_at[twin] = 0.
                 continue
-            self._robots[twin].update(x=pose['x'] / 1000, y=pose['y'] / 1000, yaw=pose['th'])
+            try:
+                converted = (self._field_mapping.pose(pose) if self._field_mapping is not None else
+                             {'x': pose['x'] / 1000, 'y': pose['y'] / 1000, 'yaw': pose['th']})
+            except (ValueError, TypeError, KeyError, OverflowError):
+                self._pose_at[twin] = 0.
+                continue
+            self._robots[twin].update(converted)
             self._pose_at[twin] = received
 
     def _snapshot(self, request_id):
@@ -122,6 +148,38 @@ class SyntheticPeer:
         return {'type': 'robot.action.result', 'data': {
             key: action[key] for key in ('order_id', 'action_id', 'agv_id', 'action')} | {'applied': True}}
 
+    def _apply_after_observation(self, action):
+        if (not isinstance(action, dict) or action.get('agv_id') not in self._robots
+                or any(type(action.get(key)) not in (int, float) or not math.isfinite(action[key])
+                       for key in ('expected_x', 'expected_y'))):
+            raise ValueError('invalid synthetic action pose')
+        twin = action['agv_id']
+        while not self._stop.is_set():
+            # Lock ordering matches DemoActionSession.poll()/receive(). Waiting
+            # for the next broker observation always happens outside the guard.
+            with self._effect_lock, self.actions.synthetic_effect_guard(self, action) as available:
+                if self._stop.is_set() or not available or self.actions.can_dispatch() is not True:
+                    return None
+                self._refresh_poses()
+                if (self._stop.is_set() or not self.actions.available_fast()
+                        or self.actions.can_dispatch() is not True):
+                    return None
+                robot = self._robots[twin]
+                age = time.monotonic() - self._pose_at[twin]
+                if (0 <= age <= 1. and
+                        math.hypot(robot['x'] - action['expected_x'], robot['y'] - action['expected_y']) <= .25):
+                    # Observation reads may themselves block; recheck the
+                    # original action deadline/owner immediately before the
+                    # effect while keeping the same reentrant fences held.
+                    with self.actions.synthetic_effect_guard(self, action) as current:
+                        if self._stop.is_set() or not current:
+                            return None
+                        age = time.monotonic() - self._pose_at[twin]
+                        if 0 <= age <= 1.:
+                            return self._apply(action)
+            self._stop.wait(.05)
+        return None
+
     def start(self):
         if self._thread is not None or not self.actions.attach(self, True, source='synthetic'):
             raise RuntimeError('synthetic owner could not attach')
@@ -143,14 +201,9 @@ class SyntheticPeer:
                     if kind == 'shelf.snapshot.request':
                         reply = self._snapshot(data['request_id'])
                     elif kind == 'robot.action':
-                        # Admit a world effect only while the same owner is
-                        # still valid. stop() sets the signal first; an effect
-                        # already under this fence may finish before stop does.
-                        with self._effect_lock, self.actions.motion_guard() as available:
-                            if (self._stop.is_set() or not available or self.actions.can_dispatch() is not True
-                                    or self._stop.is_set()):
-                                break
-                            reply = self._apply(data)
+                        reply = self._apply_after_observation(data)
+                        if reply is None:
+                            break
                     else:
                         raise ValueError('unexpected synthetic request')
                     if self._stop.is_set() or not self.actions.receive(self, reply):

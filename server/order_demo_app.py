@@ -746,11 +746,10 @@ async def lifespan(app):
     action_source = os.environ.get('AGV_ORDER_ACTION_SOURCE', 'unreal')
     if action_source not in ('unreal', 'synthetic'):
         raise ValueError('invalid simulated action source')
-    if action_source == 'synthetic' and (os.environ.get('AGV_ORDER_FIELD_CONFIG')
-            or not os.environ.get('AGV_ORDER_PERSIST_DIR')
+    if action_source == 'synthetic' and (not os.environ.get('AGV_ORDER_PERSIST_DIR')
             or any(os.environ.get(key) != '1' for key in
                    ('AGV_ORDER_COORDINATED', 'AGV_ORDER_FLEET', 'AGV_ORDER_SHELF_SYNC'))):
-        raise ValueError('synthetic world requires a fresh fleet state path and no field mapping')
+        raise ValueError('synthetic world requires a fresh fleet state path')
     port = int(os.environ['MQTT_PORT'])
     if not 1 <= port <= 65535:
         raise ValueError('invalid broker port')
@@ -924,10 +923,20 @@ async def lifespan(app):
             cleanup.callback(demo.stop)
             if action_source == 'synthetic':
                 from server.synthetic_peer import SyntheticPeer
-                by_id = {node['id']: node for node in map_data['nodes']}
-                initial = {robot: {'agv_id': twin, 'x': by_id[node]['x'], 'y': by_id[node]['y'], 'yaw': 0.}
-                           for robot, twin, node in (('sim-r1', 'AGV_01', 'J01'), ('sim-r2', 'AGV_02', 'J05'))}
-                peer = SyntheticPeer(demo.actions, service, products, initial, secrets.token_hex(16))
+                if field_mapping is not None:
+                    by_id = {node['id']: node['pos'] for node in field_map['nodes']}
+                    initial = {}
+                    for robot, twin in (('sim-r1', 'AGV_01'), ('sim-r2', 'AGV_02')):
+                        x, y = by_id[field_mapping.robots[robot]['node']]
+                        # The simulated executor starts at yaw 0. Its explicit
+                        # incoming edge is a routing input, not a measured yaw.
+                        initial[robot] = dict(agv_id=twin, **field_mapping.pose({'x': x, 'y': y, 'th': 0.}))
+                else:
+                    by_id = {node['id']: node for node in map_data['nodes']}
+                    initial = {robot: {'agv_id': twin, 'x': by_id[node]['x'], 'y': by_id[node]['y'], 'yaw': 0.}
+                               for robot, twin, node in (('sim-r1', 'AGV_01', 'J01'), ('sim-r2', 'AGV_02', 'J05'))}
+                peer = SyntheticPeer(demo.actions, service, products, initial, secrets.token_hex(16),
+                                     field_mapping=field_mapping)
                 peer.start()
                 cleanup.callback(peer.stop)
             app.state.demo = demo

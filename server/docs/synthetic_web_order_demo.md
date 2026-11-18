@@ -25,8 +25,32 @@ $newState = 'D:\관통\synthetic-run-01'
 기존 Unreal WebSocket의 owner는 합성 owner를 차지하거나 동작 결과를
 제출할 수 없고, 합성 주문·pickup DB의 출처별 버전은 기존 Unreal 모드가
 거부한다. 소스 표식은 내부 경로를 구분하기 위한 것이며 장치 인증이나 DB
-위변조 방지가 아니다. 팀 맵의 `--field-config` 및 Unreal `--editor`는
-합성 모드와 함께 사용할 수 없다. 팀 맵 합성 종단 검증은 아직 없다.
+위변조 방지가 아니다. Unreal `--editor`는 합성 모드와 함께 사용할 수 없다.
+
+팀 맵 사본을 사용하는 경우 기존에 검증한 가상 대응 파일을 명시할 수 있다.
+
+```powershell
+$map = 'C:\경로\Content\Data\warehouse_map.json'
+$newState = 'D:\관통\synthetic-field-run-01'
+.\.venv\Scripts\python.exe -m server.tools.order_demo --map $map --synthetic `
+  --field-config server\examples\field_unreal_demo.json --state-dir $newState
+```
+
+`--field-config`의 맵 해시·두 좌표계 기준점·시작 노드와 진입 간선·상품
+대응을 먼저 검증한다. 합성 세계의 위치·방향은 이 대응의 변환을 사용하고,
+세계의 pickup ID를 서버 팀 맵의 ID로 변환해 재고를 확인한다. 가상 executor의
+초기 yaw는 0°이고 진입 간선은 경로 계산의 명시적 입력이지 물리 방향 측정이
+아니다. 예제는 가상 대기점과 빨강 상품 한 종류, D01/D04 두 점의 임의
+대응을 사용한다. 실제 대기점·상품 위치·지형 정합이나 물리 안전의 근거가
+아니다. 격리 종단 시험에서는 세계 노드에 별도 `U_` 접두사를 붙여 실제
+서버 노드 ID와 변환이 필요한 경우를 검사한다.
+
+합성 동작 직전에 MQTT 위치 관측이 1초보다 오래되었거나 목표 좌표와 맞지
+않으면 잠금을 풀고 새로운 관측을 기다린다. 원본 수신 시각을 임의로 바꾸지
+않으며, 다음 시도마다 같은 owner·작업·연결 및 기존 동작의 원래 10초 기한을
+다시 확인한다. 기한 만료, 연결 상실 또는 종료 때는 효과를 만들지 않고 불명
+상태로 보존한다. 이 시간과 좌표 확인은 합성 시연의 조건일 뿐 실물 측정이
+아니다.
 
 프로세스가 종료되면 합성 세계 자체가 사라지므로 같은 상태 폴더로는 완료
 여부와 무관하게 자동 재시작하지 않는다. 강제 종료 중 저장된 `inflight`는
@@ -49,4 +73,5 @@ $env:TMP = $env:TEMP
 $env:PYTHON_DOTENV_DISABLED = '1'
 $env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
 .\.venv\Scripts\python.exe -m unittest server.tests.test_synthetic_peer server.tests.test_synthetic_peer_web_integration -v
+.\.venv\Scripts\python.exe -m unittest server.tests.test_synthetic_peer_field server.tests.test_synthetic_field_web_integration -v
 ```
