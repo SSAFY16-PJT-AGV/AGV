@@ -1,0 +1,423 @@
+diff --git a/agv/nav/navigator.py b/agv/nav/navigator.py
+--- a/agv/nav/navigator.py
++++ b/agv/nav/navigator.py
+@@ -87,6 +87,7 @@
+         self.final = None           # 경로의 마지막 노드
+         self.allowed = None         # 정해진 경로의 엣지 집합(None이면 최단 경로 자유)
+         self.route = None
++        self._strict_repeat = False  # limited repeat support, one held segment at a time
+         self._route_pos = 0         # 경로에서 마지막으로 지난(또는 서 있는) 노드의 순번
+         self._target_i = None       # 해제 노드의 경로 순번(같은 노드가 경로에 두 번 나올 수 있음)
+         self.at_node = None         # 대기 중인 노드
+@@ -134,8 +135,53 @@
+         """최단 경로로 node까지 간다."""
+         self._check_node(node)
+         self.route, self.allowed = None, None
++        self._strict_repeat = False
+         self.target = self.final = node
+         self._after_new_target()
++
++    def _sequence_transition(self, before, after):
++        if before not in self.m.edges or after not in self.m.edges:
++            raise ValueError("sequence direction is unavailable")
++        edge = self.m.edges[before]
++        if edge["to"] != self.m.edges[after]["from"]:
++            raise ValueError("sequence edges do not meet")
++        node = self.m.nodes[edge["to"]]
++        turning = after == edge["rev"] and self.m.uturn_ok(edge["to"])
++        if node["crossing"] and not turning:
++            if not node["through"]:
++                raise ValueError("crossing through rules are required")
++            pair = ((before, after) if edge["dir"] == FWD else
++                    (self.m.rev(after), self.m.rev(before)))
++            if pair not in node["through"]:
++                raise ValueError("sequence violates crossing through rules")
++        if after not in self.m.next_edges(before) and not turning:
++            raise ValueError("sequence violates direction or U-turn rules")
++
++    def _sequence_allowed(self, nodes):
++        """Fail closed unless each mainline arc and turn is unambiguous."""
++        edges = []
++        for a, b in zip(nodes[:-1], nodes[1:]):
++            matches = [e for e in self.m.out.get(a, []) if self.m.edges[e]["to"] == b]
++            if len(matches) != 1:
++                raise ValueError("sequence edge is missing or ambiguous")
++            edges.append(matches[0])
++        for before, after in zip(edges[:-1], edges[1:]):
++            self._sequence_transition(before, after)
++        return set(edges)
++
++    def _sequence_entry(self, node, next_node):
++        """Require one observed entry arc and a valid first outgoing arc."""
++        best = self._best()
++        entries = set()
++        for h in best:
++            entry = h.came if h.last == node else h.edge
++            if entry not in self.m.edges or self.m.edges[entry]["to"] != node:
++                raise ValueError("repeated route needs a known entry edge")
++            entries.add(entry)
++        outgoing = [e for e in self.m.out.get(node, []) if self.m.edges[e]["to"] == next_node]
++        if len(entries) != 1 or len(outgoing) != 1:
++            raise ValueError("repeated route needs an unambiguous direction")
++        self._sequence_transition(next(iter(entries)), outgoing[0])
+ 
+     def set_route(self, nodes, release=None):
+         """정해진 노드 목록을 따라간다(서버 주문의 nodes). release(released_until)까지만 가고 대기."""
+@@ -146,8 +192,21 @@
+         release = release or nodes[-1]
+         if release not in nodes:
+             raise ValueError(u"해제 노드가 경로에 없어요: %s" % release)
+-        self.allowed = self.m.route_edges(nodes)
++        # Validate the entire path's connectivity/U-turn rules first. A
++        # repeated path is supported only as unique, mainline segments.
++        allowed = self.m.route_edges(nodes)
++        strict = len(set(nodes)) != len(nodes)
++        if strict:
++            if any(self.m.kind(n) in ("via", "spur_end") for n in nodes):
++                raise ValueError("repeated routes with via/spur are unsupported")
++            end = next((i for i in range(1, len(nodes)) if nodes[i] == release), None)
++            if end is None or len(set(nodes[:end + 1])) != end + 1:
++                raise ValueError("released segment must have distinct nodes")
++            self._sequence_entry(nodes[0], nodes[1])
++            allowed = self._sequence_allowed(nodes[:end + 1])
++        self.allowed = allowed
+         self.route = list(nodes)
++        self._strict_repeat = strict
+         self._route_pos = 0
+         self.final = nodes[-1]
+         self.target = release
+@@ -164,6 +223,18 @@
+     def _route_advance(self, node):
+         """경로 다음 몇 노드 안에서 node를 지났으면 진행 순번을 올린다."""
+         if self.route is None:
++            return
++        if self._strict_repeat:
++            if self.route[self._route_pos] == node:
++                return  # repeated/delayed observation of the current occurrence
++            next_pos = self._route_pos + 1
++            if next_pos <= self._target_i and self.route[next_pos] == node:
++                self._route_pos = next_pos
++                return
++            self._note("nav_sequence_ambiguous", event="unexpected_node", node=node)
++            self._request_stop(None, self.target, reason="nav_off_route")
++            self._stop["hold"] = True
++            self.at_node = None
+             return
+         for i in range(self._route_pos + 1, min(len(self.route), self._route_pos + 5)):
+             if self.route[i] == node:
+@@ -183,6 +254,23 @@
+         """해제 노드를 늘린다. 대기 중이었으면 runner.resume()을 불러야 다시 간다."""
+         if self.route is None or release not in self.route:
+             raise ValueError(u"지금 경로에 없는 해제 노드: %s" % release)
++        if self._strict_repeat:
++            if self.at_node is None or self.at_node != self.target or self._target_i is None:
++                raise ValueError("repeated route requires confirmed hold before extend")
++            old = self._target_i
++            i = next((j for j in range(old + 1, len(self.route)) if self.route[j] == release), None)
++            if i is None:
++                raise ValueError("released occurrence must move forward")
++            segment = self.route[old:i + 1]
++            if len(set(segment)) != len(segment):
++                raise ValueError("released segment must have distinct nodes")
++            allowed = self._sequence_allowed(segment)
++            self._sequence_entry(segment[0], segment[1])
++            self.allowed = allowed
++            self._route_pos = old
++            self.target, self._target_i = release, i
++            self._after_new_target()
++            return
+         i = self._route_index(release)
+         if i is None or (self._target_i is not None and i < self._target_i):
+             raise ValueError(u"해제 노드를 줄일 수는 없어요")
+@@ -442,10 +530,17 @@
+             d = self.m.dir(e)
+             k = self.m.kind_seen(node, d)
+             if k in SKIP_COST:
++                # A physical observed node must never be assumed to have been
++                # visited just because a later observation fits. Limited
++                # repeat routes already reject non-observable via nodes.
++                if self._strict_repeat:
++                    continue
+                 step = 0 if k == "via" else 1
+                 if dep + step > MAX_SKIP:
+                     continue
+                 nexts = list(self.m.branches_seen(node, d).values()) if k == "split" else self.m.next_edges(e)
++                if self._strict_repeat:
++                    nexts = [f for f in nexts if f in self.allowed]
+                 for f in nexts:
+                     if f in self.m.edges and not self.m.edges[f]["spur"]:
+                         stack.append((f, L2, c + SKIP_COST[k], dep + step))
+@@ -501,6 +596,8 @@
+                     succ = [br[side]] if side in br else []
+                 else:
+                     succ = self.m.next_edges(e)
++                if self._strict_repeat:
++                    succ = [f for f in succ if f in self.allowed]
+                 pen = self._dist_pen(d, L)
+                 for f in succ:
+                     cands.append(Hyp(f, odo, h.cost + sc + pen, node, e))
+@@ -508,6 +605,12 @@
+                     # 목표가 막다른 노드(나가는 길 없음)여도 도착은 인정
+                     cands.append(Hyp(e, odo, h.cost + sc + pen, node, e))
+         if not cands:
++            if self._strict_repeat:
++                self._note("nav_sequence_ambiguous", event=kind)
++                self._request_stop(None, self.target, reason="nav_off_route")
++                self._stop["hold"] = True
++                self.at_node = None
++                return
+             if kind == "patch" and color in self.m.by_color:
+                 p = self.m.by_color[color]
+                 self.hyps = [Hyp(f, odo, 0.0, p) for f in self.m.out[p]]    # 방향도 모름
+@@ -534,6 +637,8 @@
+     def on_patch_early(self, color, pos):
+         """runner가 교차 판정 때문에 패치 기록을 보류할 때 부른다. 목표 패치면 정지 위치만 먼저 정한다.
+         패치 색은 맵에 하나씩이라 색만으로 목표인지 안다. 스퍼 끝 목표면 그 부모 패치에서 무장한다."""
++        if self._strict_repeat:
++            return  # a delayed early observation alone is not a visit proof
+         par = self._approach(self.target)
+         if par is not None and par != self.target and self.spur is None \
+                 and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color \
+@@ -564,8 +669,16 @@
+         best = self._best()
+         par = self._approach(self.target)
+         just = best and all(h.s0 == odo for h in best) and len(set(h.last for h in best)) == 1
++        if self._strict_repeat and just and (len(set(h.came for h in best)) != 1 or best[0].came is None):
++            self._note("nav_sequence_ambiguous", event="arrival")
++            self._request_stop(None, self.target, reason="nav_off_route")
++            self._stop["hold"] = True
++            self.at_node = None
++            return
+         if just:
+             self._route_advance(best[0].last)
++            if self._strict_repeat and self._stop is not None:
++                return
+         if self._via_stop():
+             return
+         if par != self.target:
+@@ -620,12 +733,24 @@
+ 
+     def on_dead_end(self, side, odo):
+         """고른 갈림길이 사실은 스퍼였다: 갈림길 직전 가설로 돌아간다(되돌아 나와 원래 선을 탄다)."""
++        if self._strict_repeat:
++            self._note("nav_sequence_ambiguous", event="dead_end")
++            self._request_stop(None, self.target, reason="nav_off_route")
++            self._stop["hold"] = True
++            self.at_node = None
++            return
+         if self._pre_split is not None:
+             self.hyps = self._pre_split
+             self._pre_split = None
+         self._note("nav_dead_end", side=side)
+ 
+     def on_gap(self):
++        if self._strict_repeat:
++            self._note("nav_sequence_ambiguous", event="gap")
++            self._request_stop(None, self.target, reason="nav_off_route")
++            self._stop["hold"] = True
++            self.at_node = None
++            return
+         self.hyps = self._unknown()
+ 
+     def known_dead(self):
+@@ -659,6 +784,11 @@
+                     interps.append((h.cost + sc, "spur", self.m.spur_side_at(node, ed), None))
+         if not interps:
+             self._note("nav_split_unknown")
++            if self._strict_repeat:
++                self._request_stop(None, self.target, reason="nav_off_route")
++                self._stop["hold"] = True
++                self.at_node = None
++                return None
+             return self.default_side
+         m = min(i[0] for i in interps)
+         best = [i for i in interps if i[0] <= m + CHOICE_SLACK]
+@@ -674,6 +804,13 @@
+                 v[a] = SPUR_PENALTY
+             else:
+                 br = self.m.branches_seen(a, self.m.dir(_e))
++                if self._strict_repeat and (R is None or not any(
++                        f in self.allowed and f in R for f in br.values())):
++                    self._note("nav_sequence_ambiguous", event="branch")
++                    self._request_stop(None, self.target, reason="nav_off_route")
++                    self._stop["hold"] = True
++                    self.at_node = None
++                    return None
+                 v = {}
+                 for s in ("left", "right"):
+                     f = br.get(s)
+diff --git a/agv/link/controller.py b/agv/link/controller.py
+--- a/agv/link/controller.py
++++ b/agv/link/controller.py
+@@ -74,8 +74,15 @@
+         now = self.clock() if now is None else now
+         for msg, kw in getattr(self.link, "pop_notes", lambda: [])():
+             self._note(msg, **kw)
+-        for payload in self.link.poll():
+-            self._handle(payload)
++        poll_tagged = getattr(self.link, "poll_with_generation", None)
++        process = getattr(self.link, "process_if_current", None)
++        if poll_tagged is not None and process is not None:
++            for generation, payload in poll_tagged():
++                if not process(generation, payload, self._handle):
++                    self._note("link_stale_order_discarded")
++        else:
++            for payload in self.link.poll():
++                self._handle(payload)
+         self._watch_link(now)
+         self._watch_stop()
+         st = self.state(now)
+@@ -120,6 +127,12 @@
+         if d.kind == "duplicate":
+             self._note("link_order_duplicate", order_id=o["order_id"], seq=o["seq"])
+             return
++        # A previously queued first order must not start after link loss.
++        # Reconnect races are additionally fenced by MqttLink's queue lock.
++        if not self.link.connected and (getattr(self.nav, "_strict_repeat", False)
++                                        or len(set(o["nodes"])) != len(o["nodes"])):
++            self._reject(o, "repeated route requires a connected link")
++            return
+         if r is None or r.finished:
+             self._reject(o, "robot stopped (%s)" % (r.finish_reason if r is not None else "not ready"))
+             return
+@@ -134,6 +147,13 @@
+                 self.nav.hold_at_end = True       # 마지막 노드에 닿아도 끝내지 않고 다음 작업을 기다림
+                 self.nav.set_route(o["nodes"], o["released_until"])
+             else:
++                if getattr(self.nav, "_strict_repeat", False):
++                    previous = self.book.current
++                    key = (previous["order_id"], previous["seq"])
++                    if (not self.link.connected or r.state != "hold" or r.hold_reason != "nav_hold"
++                            or self.nav.at_node != previous["released_until"]
++                            or key not in self._stopped):
++                        raise OrderRejected("repeated route requires stop before extend")
+                 self.nav.extend(o["released_until"])
+         except (OrderRejected, ValueError) as e:
+             self._reject(o, e.args[0] if e.args else str(e))
+@@ -153,6 +173,8 @@
+         r, b = self.runner, self.book
+         if r is None or b.current is None:
+             return
++        if getattr(self.nav, "_strict_repeat", False) and self.error == "event_unconfirmed":
++            return  # never replay an uncertain stop event automatically
+         o = b.current
+         key = (o["order_id"], o["seq"])
+         release = o["released_until"]
+@@ -162,6 +184,10 @@
+         if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
+                 or self.nav.at_node != release:
+             return
++        if getattr(self.nav, "_strict_repeat", False) and not self.link.connected:
++            self.error = "event_unconfirmed"
++            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
++            return
+         self._stopped.add(key)
+         self._anchor = (release, b.release_i, r.odo)
+         self._event_n += 1
+@@ -169,7 +195,18 @@
+               "robot_session": self.session, "order_id": o["order_id"], "seq": o["seq"],
+               "map_id": o["map_id"], "stopped_at": release,
+               "cleared_resources": self.rules.cleared(o["nodes"], b.segment_start_i, b.release_i)}
+-        self.link.publish_event(ev)
++        try:
++            accepted = self.link.publish_event(ev)
++        except Exception:
++            if not getattr(self.nav, "_strict_repeat", False):
++                raise
++            self.error = "event_unconfirmed"
++            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
++            return
++        if getattr(self.nav, "_strict_repeat", False) and accepted is not True:
++            self.error = "event_unconfirmed"
++            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
++            return
+         final = b.at_final_release
+         if final:
+             b.mark_finished()
+@@ -196,7 +233,7 @@
+             return
+         if r.state == "hold" and r.hold_reason == "link_lost":
+             # 구간 가운데에 섰음: 남은 구간을 이어 갈지는 재동기화 규약이 정할 일(기본: 그대로 섬)
+-            if self.resume_after_reconnect:
++            if self.resume_after_reconnect and not getattr(self.nav, "_strict_repeat", False):
+                 self.error = None
+                 self._note("link_restored", resumed=True)
+                 r.resume()
+diff --git a/agv/link/mqtt.py b/agv/link/mqtt.py
+--- a/agv/link/mqtt.py
++++ b/agv/link/mqtt.py
+@@ -52,7 +52,8 @@
+         self.topic = lambda kind: "agv/%s/%s" % (robot_id, kind)
+         self.host, self.port, self.keepalive = host, int(port), int(keepalive)
+         self._log = log
+-        self._lock = threading.Lock()
++        self._lock = threading.RLock()
++        self._connection_generation = 0
+         self._orders = []
+         self._notes = []
+         self.connected = False
+@@ -92,16 +93,21 @@
+         if rc != 0:
+             self._note("link_connect_failed", rc=rc)
+             return
+-        self.connected = True
+-        self.ever_connected = True
+-        self.disconnected_at = None
++        with self._lock:
++            self._connection_generation += 1
++            self.connected = True
++            self.ever_connected = True
++            self.disconnected_at = None
+         client.publish(self.topic("conn"), "online", qos=1, retain=True)
+         client.subscribe(self.topic("order"), qos=1)
+         self._note("link_connected", host=self.host, port=self.port)
+ 
+     def _on_disconnect(self, client, userdata, rc):
+-        self.connected = False
+-        self.disconnected_at = time.time()
++        with self._lock:
++            self.connected = False
++            self.disconnected_at = time.time()
++            self._connection_generation += 1
++            self._orders = []  # never replay orders from a lost connection
+         self._note("link_disconnected", rc=rc)
+ 
+     def _on_message(self, client, userdata, msg):
+@@ -112,8 +118,8 @@
+             self.dropped_retained += 1
+             return
+         with self._lock:
+-            if len(self._orders) < 64:
+-                self._orders.append(bytes(msg.payload))
++            if self.connected and len(self._orders) < 64:
++                self._orders.append((self._connection_generation, bytes(msg.payload)))
+ 
+     def start(self):
+         self.c.connect_async(self.host, self.port, keepalive=self.keepalive)
+@@ -130,7 +136,25 @@
+         """받은 주문 payload(bytes) 목록을 꺼낸다."""
+         with self._lock:
+             out, self._orders = self._orders, []
+-        return out
++        return [payload for _, payload in out]
++
++    def poll_with_generation(self):
++        """Atomically return orders tagged with the connection they arrived on."""
++        with self._lock:
++            out, self._orders = self._orders, []
++            return out
++
++    def process_if_current(self, generation, payload, handler):
++        """Serialize processing with disconnect and reject stale queued input.
++
++        This fences callbacks already observed here; it cannot detect a
++        physical network loss before the MQTT callback is delivered.
++        """
++        with self._lock:
++            if not self.connected or generation != self._connection_generation:
++                return False
++            handler(payload)
++            return True
+ 
+     def publish_state(self, state):
+         if self.connected:
