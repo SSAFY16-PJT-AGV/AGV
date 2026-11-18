@@ -80,7 +80,9 @@ class FleetMqttIntegrationTest(unittest.TestCase):
         while time.monotonic() < deadline:
             if self.broker.poll() is not None:
                 self.fail('test broker exited before becoming ready')
-            if re.search(r'mosquitto version .* running', log_path.read_text(encoding='utf-8')):
+            # Windows Mosquitto may log a non-UTF-8 config path. The startup
+            # marker is ASCII; inspect its bytes without decoding the path.
+            if re.search(rb'mosquitto version .* running', log_path.read_bytes()):
                 break
             time.sleep(0.05)
         else:
