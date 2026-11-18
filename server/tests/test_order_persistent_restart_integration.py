@@ -187,6 +187,7 @@ class RestoredWorldProofTest(unittest.TestCase):
         }
         runtime = self.runtime = DemoRuntime.__new__(DemoRuntime)
         runtime.journal, runtime._world_ready = journal, threading.Event()
+        runtime.field_mapping = None  # Match the legacy non-field demo constructor.
         runtime.pickup_store = None
         runtime._restart_blocked = False
         runtime._bootstrap_pending = False
