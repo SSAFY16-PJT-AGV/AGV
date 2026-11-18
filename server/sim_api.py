@@ -131,6 +131,11 @@ def task_status(task_id: str, runtime=Depends(_runtime)):
     return _invoke(runtime, "task_status", task_id)
 
 
+@router.get("/tasks/{task_id}/diagnostics")
+def task_diagnostics(task_id: str, runtime=Depends(_runtime)):
+    return _invoke(runtime, "task_diagnostics", task_id)
+
+
 @router.post("/tasks/{task_id}/prepare")
 def prepare(task_id: str, body: _Prepare, runtime=Depends(_runtime)):
     return _invoke(runtime, "prepare", task_id, body.pickup_node,

@@ -521,6 +521,94 @@ class SimRuntime:
                     'occupancy': [list(row) for row in resources[:500]],
                     'occupancy_truncated': len(resources) > 500}
 
+    def task_diagnostics(self, task_id):
+        """Read one task's simulated DB snapshot and separate live observations.
+
+        No result from this function authenticates a robot, verifies its
+        physical position, or authorizes an order or reservation release.
+        """
+        with self._lock:
+            if not self._started or self._stopped:
+                raise RuntimeError('simulation runtime is not started')
+            if task_id not in self._tasks:
+                raise ValueError('task is not configured')
+            try:
+                if not isinstance(task_id, str) or not 1 <= len(task_id.encode('utf-8')) <= 256:
+                    raise ValueError('invalid diagnostic task ID')
+            except UnicodeEncodeError as exc:
+                raise ValueError('invalid diagnostic task ID') from exc
+            robot_id = self._tasks[task_id][0]
+            uri = Path(self.path).resolve().as_uri() + '?mode=ro'
+            # Column names below are fixed in this function, never user input.
+            def bounded_text(column):
+                return ("CASE WHEN typeof({0})='text' AND length(CAST({0} AS BLOB)) "
+                        "BETWEEN 1 AND 256 THEN {0} ELSE NULL END").format(column)
+            with closing(sqlite3.connect(uri, uri=True)) as db:
+                db.execute('BEGIN')
+                task = db.execute('SELECT ' + bounded_text('status') + ' FROM tasks WHERE task_id=?',
+                                  (task_id,)).fetchone()
+                if task is None:
+                    raise ValueError('task does not exist')
+                job = db.execute('SELECT ' + ','.join(bounded_text(field) for field in
+                                 ('robot_id', 'map_id', 'released_until')) +
+                                 ' FROM allocation_jobs WHERE task_id=?',
+                                 (task_id,)).fetchone()
+                first = db.execute('SELECT ' + bounded_text('state') +
+                                   ' FROM allocation_outbox WHERE task_id=?', (task_id,)).fetchone()
+                later = db.execute("SELECT CASE WHEN typeof(seq)='integer' AND seq>1 THEN seq ELSE NULL END, " +
+                                   bounded_text('state') + " FROM progress_orders WHERE task_id=? "
+                                   "AND (seq<>1 OR typeof(seq)<>'integer') ORDER BY seq LIMIT 100",
+                                   (task_id,)).fetchall()
+                resources = db.execute('SELECT ' + bounded_text('kind') + ',' + bounded_text('resource_id') +
+                                       ' FROM allocation_occupancy WHERE task_id=? '
+                                       'ORDER BY kind,resource_id LIMIT 501', (task_id,)).fetchall()
+                # Bound the values in SQL, before transferring them to Python.
+                # Never truncate an identifier into a different valid ID.
+                events = db.execute("SELECT CASE WHEN typeof(event_id)='text' "
+                                    "AND length(CAST(event_id AS BLOB)) BETWEEN 1 AND 256 "
+                                    "THEN event_id ELSE NULL END, "
+                                    "CASE WHEN typeof(seq)='integer' AND seq>=1 THEN seq ELSE NULL END "
+                                    "FROM sim_event_inbox WHERE task_id=? AND robot_id=? "
+                                    "AND state='pending' ORDER BY event_id LIMIT 101",
+                                    (task_id, robot_id)).fetchall()
+            if (job is None) != (first is None) or (job is not None and job[0] != robot_id):
+                raise RuntimeError('inconsistent simulation allocation')
+            if (task[0] is None or (job is not None and any(value is None for value in job))
+                    or (first is not None and first[0] is None)
+                    or any(seq is None or state is None for seq, state in later)
+                    or any(kind is None or resource is None for kind, resource in resources)):
+                raise RuntimeError('invalid or oversized simulation diagnostic metadata')
+            orders = ([{'seq': 1, 'state': first[0]}] if first else [])
+            orders.extend({'seq': seq, 'state': state} for seq, state in later[:99])
+            event_metadata = []
+            for event_id, seq in events[:100]:
+                item = {'event_id': event_id, 'seq': seq}
+                if event_id is None:
+                    item['event_id_omitted'] = True
+                if seq is None:
+                    item['seq_omitted'] = True
+                event_metadata.append(item)
+            snapshot = {'task_id': task_id, 'status': task[0], 'robot_id': job[0] if job else None,
+                        'map_id': job[1] if job else None, 'released_until': job[2] if job else None,
+                        'orders': orders, 'orders_truncated': len(later) > 99,
+                        'occupancy': [list(row) for row in resources[:500]],
+                        'occupancy_truncated': len(resources) > 500,
+                        'pending_events': event_metadata, 'pending_events_integrity': 'not_checked',
+                        'pending_events_truncated': len(events) > 100}
+            # These are observed after the DB transaction, so they must not be
+            # treated as a single atomic view or as recovery authorization.
+            blocked = None
+            gate = self.gate
+            if gate is not None and gate._initialized:
+                with gate._state_lock:
+                    blocked = task_id in gate._blocked
+            receiver = self.receiver
+            ready = None if receiver is None else receiver.ready
+            if type(ready) is not bool:
+                ready = None
+            return {'scope': 'isolated_simulation', 'database_snapshot': snapshot,
+                    'recovery_blocked_observation': blocked, 'mqtt_ready_observation': ready}
+
     def create_task(self, task_id, *, reset_unallocated=False):
         with self._lock:
             self._ready()

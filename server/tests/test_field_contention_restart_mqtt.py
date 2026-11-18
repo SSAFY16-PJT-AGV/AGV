@@ -1,5 +1,6 @@
 """Team map, two virtual robots and an isolated broker; no physical evidence."""
 from contextlib import ExitStack
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -11,12 +12,15 @@ import unittest
 from unittest.mock import patch
 
 import paho.mqtt.client as mqtt
+from fastapi import FastAPI
 
 from server.route_occurrence import occurrence_clearance
 from server.recovery import RecoveryError
 from server.segment_progress import SegmentOccupied
 from server.sim_order_authorization import SimOrderAuthorizer
+from server.sim_api import router
 from server.sim_runtime import SimRuntime
+from server.tests.test_sim_api import request
 from server.tests.test_twin_broker_integration import (BROKER, connect_publisher, free_port,
                                                        stop, stop_publisher, wait_for_owned_broker)
 from server.tools.twin_multi_test import isolated_environment
@@ -150,6 +154,21 @@ class FieldContentionRestartTests(unittest.TestCase):
             robots['sim-r2'].publish_event(delayed)
             wait(lambda: {e['event_id'] for e in restarted.pending_events()['events']} == {'a2', 'b1'},
                  'delayed B event after restart')
+            app = FastAPI()
+            app.include_router(router)
+            app.state.sim_runtime = restarted
+            app.state.sim_api_token = 'test-token'
+            code, diagnostics, headers = asyncio.run(request(
+                app, 'GET', '/simulation/tasks/T1/diagnostics', token='Bearer test-token'))
+            self.assertEqual(code, 200)
+            self.assertEqual(headers.get(b'cache-control'), b'no-store')
+            self.assertTrue(diagnostics['recovery_blocked_observation'])
+            self.assertTrue(diagnostics['mqtt_ready_observation'])
+            snapshot = diagnostics['database_snapshot']
+            self.assertEqual(snapshot['orders'], tasks_before['T1']['orders'])
+            self.assertEqual(snapshot['occupancy'], tasks_before['T1']['occupancy'])
+            self.assertEqual(snapshot['pending_events'], [{'event_id': 'a2', 'seq': 2}])
+            self.assertNotIn('b1', repr(diagnostics))
             with self.assertRaises(RecoveryError):
                 restarted.retry('sim-r1', 'a2')
             with self.assertRaises(RecoveryError):
