@@ -132,6 +132,47 @@ class SimOrderInboxTest(unittest.TestCase):
             self.inbox.mark_completed("T1", 1, first.digest, "N3", rear_clear_confirmed=True)
         self.assertFalse(self.inbox.accept(encode(message())).new)
 
+    def test_repeated_final_name_does_not_finish_before_final_occurrence(self):
+        route = ["N1", "N2", "N3", "N2"]
+        first = message(seq=1, released="N2"); first["nodes"] = route
+        received = self.inbox.accept(encode(first))
+        self.inbox.mark_completed("T1", 1, received.digest, "N2", rear_clear_confirmed=True)
+        with self.assertRaises(self.module.OrderRejected):
+            self.inbox.accept(encode(message(order_id="T2")))
+        second = dict(first, seq=2)
+        received2 = self.inbox.accept(encode(second))
+        self.inbox.mark_completed("T1", 2, received2.digest, "N2", rear_clear_confirmed=True)
+        self.assertTrue(self.inbox.accept(encode(message(order_id="T2"))).new)
+
+    def test_missing_intermediate_history_cannot_be_used_to_advance_repeated_route(self):
+        route = ["N1", "N2", "N3", "N2", "N4"]
+        first = message(seq=1, released="N2"); first["nodes"] = route
+        received = self.inbox.accept(encode(first))
+        self.inbox.mark_completed("T1", 1, received.digest, "N2", rear_clear_confirmed=True)
+        second = dict(first, seq=2)
+        received2 = self.inbox.accept(encode(second))
+        self.inbox.mark_completed("T1", 2, received2.digest, "N2", rear_clear_confirmed=True)
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute("DELETE FROM sim_inbox_orders WHERE order_id=? AND seq=?", ("T1", 1))
+            db.commit()
+        with self.assertRaises(self.module.OrderRejected):
+            self.inbox.accept(encode(dict(first, seq=3, released_until="N4")))
+
+    def test_reboot_stop_name_does_not_prove_repeated_visit_completed(self):
+        route = ["N1", "N2", "N3", "N2", "N4"]
+        first = message(seq=1, released="N2"); first["nodes"] = route
+        receipt1 = self.inbox.accept(encode(first))
+        self.inbox.mark_completed("T1", 1, receipt1.digest, "N2", rear_clear_confirmed=True)
+        second = dict(first, seq=2)
+        receipt2 = self.inbox.accept(encode(second))
+        reopened = self.module.SimOrderInbox(self.path, "sim-r1", "layout@v1")
+        reopened.initialize()
+        with self.assertRaises(self.module.OrderRejected):
+            reopened.reconcile_completed("T1", 2, receipt2.digest, "N2", rear_clear_confirmed=True)
+        self.assertFalse(reopened.accept(encode(second)).new)
+        with self.assertRaises(self.module.OrderRejected):
+            reopened.accept(encode(dict(first, seq=3, released_until="N4")))
+
 
 if __name__ == "__main__":
     unittest.main()

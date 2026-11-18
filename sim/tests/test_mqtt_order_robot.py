@@ -16,7 +16,7 @@ from unittest.mock import patch
 from sim.mqtt_order_robot import SimMqttOrderRobot, MAX_QUEUED_ORDERS, _verify_no_proxy
 from sim.order_executor import SimOrderExecutor
 from sim.order_inbox import SimOrderInbox
-from sim.tests.test_order_executor import payload, test_map
+from sim.tests.test_order_executor import field_map, payload, test_map
 
 
 class FakePublish:
@@ -359,6 +359,77 @@ class MqttRobotTests(unittest.TestCase):
         self.executor.tick(0.1)
         self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
 
+    def test_recovery_checkpoint_detects_visit_and_field_guard_changes(self):
+        self.client.deliver(payload())
+        self.robot.tick(0.25)
+        checkpoint = self.robot.connected_recovery_checkpoint()
+        with self.executor._lock:
+            original = self.executor._waypoint_visits
+            self.executor._waypoint_visits = tuple(reversed(original)) + (999,)
+        self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
+        with self.executor._lock:
+            self.executor._waypoint_visits = original
+            self.executor._field_incoming_edge = 'tampered'
+        self.assertFalse(self.robot.check_recovery_checkpoint(checkpoint))
+
+    def test_event_rejects_a_stop_at_wrong_occurrence_of_same_node(self):
+        route = ['A', 'B', 'C', 'B']
+        self.client.deliver(payload(seq=1, stop='B', nodes=route))
+        self.robot.tick(2)
+        self.client.deliver(payload(seq=2, stop='B', nodes=route), mid=11)
+        stopped = self.robot.tick(2)
+        self.assertEqual((stopped['visit_index'], stopped['released_index']), (3, 3))
+        event = {'type': 'rear_clear', 'event_id': 'repeat-2', 'robot_session': 'boot',
+                 'order_id': stopped['receipt']['order_id'], 'seq': 2,
+                 'map_id': stopped['order']['map_id'], 'stopped_at': 'B', 'cleared_resources': []}
+        self.executor._visit_index = 1
+        with self.assertRaises(RuntimeError):
+            self.robot.publish_event(event)
+        self.assertEqual(self.client.publishes, [])
+
+    def test_field_checkpoint_and_event_reject_invalid_pose(self):
+        self.robot.stop()
+        inbox = SimOrderInbox(Path(self.tmp.name) / 'field.sqlite3', 'sim-r1', 'synthetic@v1')
+        inbox.initialize()
+        executor = SimOrderExecutor(inbox, field_map(), 'A', experimental_field_map=True,
+                                    field_incoming_edge='E0')
+        client = FakeClient()
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=client):
+            robot = SimMqttOrderRobot(executor, 19123).start()
+        self.addCleanup(robot.stop)
+        route = ['A', 'B', 'C', 'B', 'D']
+        client.deliver(payload(seq=1, stop='B', nodes=route))
+        robot.tick(.5)
+        checkpoint = robot.connected_recovery_checkpoint()
+        executor._x, executor._y = 5000.0, 5000.0
+        self.assertFalse(robot.check_recovery_checkpoint(checkpoint))
+        with self.assertRaises((RuntimeError, ValueError)):
+            robot.connected_recovery_checkpoint()
+        with self.assertRaises(RuntimeError):
+            robot.tick(1)
+        self.assertEqual(client.publishes, [])
+
+    def test_field_event_rejects_invalid_stopped_pose(self):
+        self.robot.stop()
+        inbox = SimOrderInbox(Path(self.tmp.name) / 'field-stop.sqlite3', 'sim-r1', 'synthetic@v1')
+        inbox.initialize()
+        executor = SimOrderExecutor(inbox, field_map(), 'A', experimental_field_map=True,
+                                    field_incoming_edge='E0')
+        client = FakeClient()
+        with patch('sim.mqtt_order_robot.mqtt.Client', return_value=client):
+            robot = SimMqttOrderRobot(executor, 19123).start()
+        self.addCleanup(robot.stop)
+        route = ['A', 'B', 'C', 'B', 'D']
+        client.deliver(payload(seq=1, stop='B', nodes=route))
+        stopped = robot.tick(2)
+        event = {'type': 'rear_clear', 'event_id': 'bad-pose', 'robot_session': 'boot',
+                 'order_id': stopped['receipt']['order_id'], 'seq': 1,
+                 'map_id': stopped['order']['map_id'], 'stopped_at': 'B', 'cleared_resources': []}
+        executor._x = 5000.0
+        with self.assertRaises(RuntimeError):
+            robot.publish_event(event)
+        self.assertEqual(client.publishes, [])
+
     def test_recovery_checkpoint_refuses_unprocessed_orders(self):
         self.client.deliver(payload())
         self.client.disconnect()
@@ -546,6 +617,70 @@ class MqttRobotTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class MqttRobotBrokerTest(unittest.TestCase):
+    def test_field_repeated_visits_follow_distinct_mqtt_sequences(self):
+        import paho.mqtt.client as mqtt
+        from server.tests.test_twin_broker_integration import (
+            BROKER, connect_publisher, free_port, loopback_environment, stop, wait_for_owned_broker,
+        )
+        port = free_port()
+        env = loopback_environment()
+        env['PYTHONPATH'] = os.environ['AMQTT_TEST_PATH']
+        python = getattr(sys, '_base_executable', sys.executable)
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        with tempfile.TemporaryDirectory(prefix='sim-field-repeat-') as folder, \
+                open(os.devnull, 'w', encoding='utf-8') as broker_log:
+            ready_file = str(Path(folder) / 'broker.ready')
+            broker = subprocess.Popen([python, '-c', BROKER, str(port), ready_file], env=env,
+                                      stdout=broker_log, stderr=broker_log, creationflags=flags)
+            robot = publisher = None
+            try:
+                wait_for_owned_broker(self, broker, ready_file)
+                inbox = SimOrderInbox(Path(folder) / 'robot.sqlite3', 'sim-r1', 'synthetic@v1')
+                inbox.initialize()
+                executor = SimOrderExecutor(inbox, field_map(), 'A', experimental_field_map=True,
+                                            field_incoming_edge='E0')
+                with patch('sim.mqtt_order_robot.read_mqtt_security', return_value=(None, None, None)), \
+                        patch.dict(os.environ, {'NO_PROXY': '127.0.0.1,localhost',
+                                                'no_proxy': '127.0.0.1,localhost'}):
+                    robot = SimMqttOrderRobot(executor, port).start()
+                    publisher = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
+                    events, subscribed = queue.Queue(), threading.Event()
+                    publisher.on_connect = lambda c, u, f, r, p: c.subscribe('agv/sim-r1/event', qos=1)
+                    publisher.on_subscribe = lambda *args: subscribed.set()
+                    publisher.on_message = lambda c, u, msg: events.put(json.loads(msg.payload))
+                    connect_publisher(publisher, port)
+                    publisher.loop_start()
+                    self.assertTrue(subscribed.wait(5))
+                    route = ['A', 'B', 'C', 'B', 'D']
+                    for seq, visit, destination in ((1, 1, 'B'), (2, 3, 'B'), (3, 4, 'D')):
+                        info = publisher.publish('agv/sim-r1/order', payload(seq=seq, stop=destination, nodes=route),
+                                                 qos=1, retain=False)
+                        info.wait_for_publish(timeout=5)
+                        self.assertTrue(info.is_published())
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            state = robot.tick(0)
+                            if state['order'] and state['order']['seq'] == seq:
+                                break
+                            time.sleep(.03)
+                        self.assertEqual(state['order']['seq'], seq)
+                        stopped = robot.tick(20)
+                        self.assertEqual((stopped['status'], stopped['current_node'], stopped['visit_index']),
+                                         ('stopped', destination, visit))
+                        event = {'type': 'rear_clear', 'event_id': 'event-%d' % seq,
+                                 'robot_session': 'boot', 'order_id': 'task-1', 'seq': seq,
+                                 'map_id': 'synthetic@v1', 'stopped_at': destination,
+                                 'cleared_resources': []}
+                        robot.publish_event(event)
+                        self.assertEqual(events.get(timeout=5), event)
+            finally:
+                if publisher is not None:
+                    publisher.disconnect()
+                    publisher.loop_stop()
+                if robot is not None:
+                    robot.stop()
+                stop(broker)
+
     def test_two_robots_use_distinct_broker_sessions_and_order_topics(self):
         import paho.mqtt.client as mqtt
         from server.tests.test_twin_broker_integration import (

@@ -58,10 +58,10 @@ def _decode(payload, robot_id, map_id):
             raise ValueError("order map does not match approved map")
         if type(order["seq"]) is not int or not 1 <= order["seq"] <= _MAX_SEQ:
             raise ValueError("order sequence must start at one")
-        if len(order["nodes"]) < 2 or len(set(order["nodes"])) != len(order["nodes"]):
-            raise ValueError("route must contain distinct nodes")
-        if order["released_until"] == order["nodes"][0]:
-            raise ValueError("released segment needs at least one edge")
+        if len(order["nodes"]) < 2 or any(a == b for a, b in zip(order["nodes"], order["nodes"][1:])):
+            raise ValueError("route must contain at least one edge and no adjacent duplicates")
+        if order["released_until"] not in order["nodes"][1:]:
+            raise ValueError("released segment needs an occurrence after the start")
         canonical = json.dumps(order, sort_keys=True, ensure_ascii=True,
                                allow_nan=False, separators=(",", ":"))
         return order, canonical, hashlib.sha256(canonical.encode("ascii")).hexdigest()
@@ -79,6 +79,40 @@ def _stored_order(payload, digest, robot_id, map_id, order_id, seq):
     if canonical != payload or computed != digest or order["order_id"] != order_id or order["seq"] != seq:
         raise OrderRejected("stored order content does not match its identity")
     return order
+
+
+def _validated_history(db, robot_id, map_id, order_id):
+    """Validate every saved command and derive its released visit index.
+
+    Stored data is not physical evidence and this does not authorize moving
+    after a reboot.  A missing prefix or non-completed prior order fails shut.
+    """
+    rows = db.execute("SELECT seq,payload,digest,state FROM sim_inbox_orders "
+                      "WHERE order_id=? ORDER BY seq", (order_id,)).fetchall()
+    if not rows:
+        raise OrderRejected("stored order history is missing")
+    indices, reference = [], None
+    previous_index = 0
+    for expected, (seq, payload, digest, state) in enumerate(rows, 1):
+        if type(seq) is not int or seq != expected or state not in ("accepted", "completed"):
+            raise OrderRejected("stored order sequence or state is inconsistent")
+        if expected < len(rows) and state != "completed":
+            raise OrderRejected("unfinished prior segment in stored history")
+        order = _stored_order(payload, digest, robot_id, map_id, order_id, seq)
+        action = json.dumps(order["action_at_end"], sort_keys=True, ensure_ascii=True,
+                            allow_nan=False, separators=(",", ":"))
+        identity = (order["order_id"], order["map_id"], order["nodes"], action)
+        if reference is None:
+            reference = identity
+        elif identity != reference:
+            raise OrderRejected("stored route or action changed")
+        index = next((i for i in range(previous_index + 1, len(order["nodes"]))
+                      if order["nodes"][i] == order["released_until"]), None)
+        if index is None:
+            raise OrderRejected("stored release has no later occurrence")
+        indices.append(index)
+        previous_index = index
+    return rows, indices
 
 
 class SimOrderInbox:
@@ -147,6 +181,7 @@ class SimOrderInbox:
                 existing = db.execute("SELECT digest,payload,state FROM sim_inbox_orders WHERE order_id=? AND seq=?",
                                       (order_id, seq)).fetchone()
                 if existing is not None:
+                    _validated_history(db, self.robot_id, self.map_id, order_id)
                     if existing[0] != digest or existing[1] != canonical:
                         raise OrderRejected("order ID and sequence were reused with different content")
                     if existing[2] not in ("accepted", "completed"):
@@ -160,16 +195,22 @@ class SimOrderInbox:
                     if latest[3] != "completed":
                         raise OrderRejected("previous order has not been confirmed complete")
                     previous = _stored_order(latest[2], latest[4], self.robot_id, self.map_id, latest[0], latest[1])
+                    history, indices = _validated_history(db, self.robot_id, self.map_id, latest[0])
+                    if history[-1][0] != latest[1]:
+                        raise OrderRejected("latest order and history disagree")
                     if latest[0] == order_id:
                         if seq != latest[1] + 1:
                             raise OrderRejected("sequence must advance by one")
-                        if any(order[key] != previous[key] for key in ("order_id", "map_id", "nodes", "action_at_end")):
+                        if any(order[key] != previous[key] for key in ("order_id", "map_id", "nodes")) or (
+                            json.dumps(order["action_at_end"], sort_keys=True, ensure_ascii=True, separators=(",", ":")) !=
+                            json.dumps(previous["action_at_end"], sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+                        ):
                             raise OrderRejected("the active route or end action changed")
-                        if order["nodes"].index(order["released_until"]) <= order["nodes"].index(previous["released_until"]):
+                        if order["released_until"] not in order["nodes"][indices[-1] + 1:]:
                             raise OrderRejected("released segment must advance")
                     else:
                         if (db.execute("SELECT 1 FROM sim_inbox_orders WHERE order_id=?", (order_id,)).fetchone()
-                                or seq != 1 or previous["released_until"] != previous["nodes"][-1]):
+                                or seq != 1 or indices[-1] != len(previous["nodes"]) - 1):
                             raise OrderRejected("cannot replace an unfinished route or reuse an old order ID")
                 db.execute("INSERT INTO sim_inbox_orders VALUES (?,?,?,?,?)",
                            (order_id, seq, digest, canonical, "accepted"))
@@ -193,8 +234,11 @@ class SimOrderInbox:
                 if row is None or row[0] != digest or row[2] not in ("accepted", "completed"):
                     raise OrderRejected("order identity or state is inconsistent")
                 order = _stored_order(row[1], row[0], self.robot_id, self.map_id, order_id, seq)
+                _validated_history(db, self.robot_id, self.map_id, order_id)
                 if order["released_until"] != stopped_at:
                     raise OrderRejected("confirmed node differs from released destination")
+                if recovery and row[2] == "accepted" and len(set(order["nodes"])) != len(order["nodes"]):
+                    raise OrderRejected("repeated route needs visit-index proof after reboot")
                 db.execute("UPDATE sim_inbox_orders SET state='completed' WHERE order_id=? AND seq=?",
                            (order_id, seq))
                 return Receipt(False, order_id, seq, digest, "completed")

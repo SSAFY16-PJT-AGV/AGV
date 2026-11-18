@@ -183,10 +183,19 @@ class SimMqttOrderRobot:
         # The caller holds the robot lock; the executor lock also prevents an
         # accidental direct tick from changing its cursor while copying it.
         with self.executor._lock:
+            self.executor._verify_field_execution()
             return (id(self), id(self.executor), id(self.executor._inbox),
                     json.dumps(self.executor.snapshot(), sort_keys=True, allow_nan=False,
                                separators=(',', ':')),
                     self.executor._waypoints, self.executor._next_waypoint,
+                    self.executor._waypoint_visits, self.executor._visit_index,
+                    self.executor._release_index, self.executor._segment_start_index,
+                    self.executor._field_incoming_edge, self.executor._field_guard_incoming,
+                    self.executor._field_order_entry,
+                    self.executor._field_map_canonical,
+                    self.executor._field_route_edges,
+                    json.dumps(self.executor._field_map, sort_keys=True, allow_nan=False,
+                               separators=(',', ':')),
                     frozenset(self._event_segments))
 
     def recovery_checkpoint(self):
@@ -213,8 +222,12 @@ class SimMqttOrderRobot:
     def check_recovery_checkpoint(self, checkpoint):
         """Compare a checkpoint while the caller keeps simulator ticks stopped."""
         with self._lock:
-            return (not self._stopped and not self._event_uncertain
-                    and self._queue.empty() and self._checkpoint() == checkpoint)
+            if self._stopped or self._event_uncertain or not self._queue.empty():
+                return False
+            try:
+                return self._checkpoint() == checkpoint
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                return False
 
     def reconnect(self, *, authorization_guard):
         """Reconnect the same simulated executor after a known MQTT disconnect.
@@ -334,9 +347,13 @@ class SimMqttOrderRobot:
                 raise RuntimeError('simulated MQTT robot is unavailable')
             try:
                 checked, encoded, _digest = _event(event)
-                state = self.executor.snapshot()
+                with self.executor._lock:
+                    self.executor._verify_field_execution()
+                    state = self.executor.snapshot()
                 receipt, order = state['receipt'], state['order']
                 if (state['status'] != 'stopped' or not receipt or not order
+                        or type(state.get('visit_index')) is not int
+                        or state.get('visit_index') != state.get('released_index')
                         or checked['order_id'] != receipt['order_id']
                         or checked['seq'] != receipt['seq']
                         or checked['map_id'] != order['map_id']
