@@ -96,7 +96,11 @@ def wait_for_demo(server, log_path, timeout=20):
 
 
 def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
-        state_dir=ROOT / 'data' / 'order-demo-state', field_config=None):
+        state_dir=ROOT / 'data' / 'order-demo-state', field_config=None, synthetic=False):
+    if synthetic and (editor is not None or project is not None or field_config is not None):
+        raise ValueError('synthetic mode cannot be combined with Unreal or field mapping')
+    if synthetic and Path(state_dir).exists():
+        raise ValueError('synthetic mode requires a new, nonexistent state directory')
     map_path, editor, project, ddc, broker_deps = validate_inputs(
         map_path, editor, project, ddc, broker_deps)
     if field_config is not None:
@@ -111,6 +115,8 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
     if field_config is not None:
         server_env['AGV_ORDER_FIELD_CONFIG'] = str(field_config)
     server_env['AGV_ORDER_PERSIST_DIR'] = str(Path(state_dir).resolve())
+    if synthetic:
+        server_env['AGV_ORDER_ACTION_SOURCE'] = 'synthetic'
     editor_env = clean_environment(os.environ)
     editor_env['AGV_TWIN_UNREAL_TOKEN'] = token
     base_python = getattr(sys, '_base_executable', sys.executable)
@@ -143,6 +149,8 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
                     print('Ctrl+C로 시연 서버와 브로커를 종료합니다. Unreal은 직접 닫으세요.', flush=True)
                     while True:
                         if server.poll() is not None:
+                            if synthetic:
+                                raise RuntimeError('합성 세계가 종료됐습니다. 이전 상태로 다시 시작할 수 없습니다')
                             print('시연 서버가 종료되어 저장된 상태로 재시작합니다.', flush=True)
                             server = subprocess.Popen([base_python, '-m', 'uvicorn', 'server.order_demo_app:app',
                                                        '--host', '127.0.0.1', '--port', str(SERVER_PORT),
@@ -188,12 +196,16 @@ def main():
     parser.add_argument('--field-config', help='explicit isolated team-map/Unreal correspondence JSON')
     parser.add_argument('--state-dir', default=None,
                         help='persistent isolated simulation state directory')
+    parser.add_argument('--synthetic', action='store_true',
+                        help='use a fresh in-process simulated world instead of Unreal')
     args = parser.parse_args()
     try:
+        if args.synthetic and not args.state_dir:
+            raise ValueError('--synthetic requires an explicit new --state-dir')
         state_dir = args.state_dir or ROOT / 'data' / (
             'field-order-demo-state' if args.field_config else 'order-demo-state')
         run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps, state_dir,
-            field_config=args.field_config)
+            field_config=args.field_config, synthetic=args.synthetic)
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         print('시연 실패: {}'.format(exc), file=sys.stderr)
         return 1

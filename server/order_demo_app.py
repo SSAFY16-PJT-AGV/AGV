@@ -11,6 +11,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import secrets
 import threading
 import time
 import tempfile
@@ -46,8 +47,9 @@ class ShelfFull(RuntimeError):
 class DemoRuntime:
     def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic,
                  auto_recovery=False, journal=None, recovery_blocked=False, pickup_store=None,
-                 field_mapping=None, products=None):
+                 field_mapping=None, products=None, action_source='unreal'):
         self.engine = engine
+        self._action_source = action_source
         self.field_mapping = field_mapping
         self.products = copy.deepcopy(products if products is not None else PRODUCTS)
         self.port = port
@@ -92,7 +94,8 @@ class DemoRuntime:
                                          on_prepare_action=self._pickup_action_prepare if pickup_store else None,
                                          on_action_result=self._pickup_action_result if pickup_store else None,
                                          on_detach=self._pickup_detach if pickup_store else None,
-                                         pose_transform=field_mapping.pose if field_mapping is not None else None)
+                                         pose_transform=field_mapping.pose if field_mapping is not None else None,
+                                         action_source=action_source)
         self.connected = threading.Event()
         self.stop_event = threading.Event()
         if journal is None:
@@ -450,6 +453,8 @@ class DemoRuntime:
         result['stale'] = stale
         result['connected'] = not stale and ready and self.connected.is_set() and not self.stop_event.is_set()
         result['unreal_connected'] = not stale and self.actions.available_fast()
+        if self._action_source == 'synthetic':
+            result['action_source'] = 'synthetic'
         if self.journal is not None:
             result['recovery_required'] = self._restart_blocked or not self._world_ready.is_set()
         if stale or not result['connected'] or not result['unreal_connected']:
@@ -738,6 +743,14 @@ async def lifespan(app):
             or os.environ.get('MQTT_HOST') != '127.0.0.1'
             or any(os.environ.get(key) for key in ('MQTT_USERNAME', 'MQTT_PASSWORD', 'MQTT_TLS_CA'))):
         raise RuntimeError('explicit isolated local demo configuration required')
+    action_source = os.environ.get('AGV_ORDER_ACTION_SOURCE', 'unreal')
+    if action_source not in ('unreal', 'synthetic'):
+        raise ValueError('invalid simulated action source')
+    if action_source == 'synthetic' and (os.environ.get('AGV_ORDER_FIELD_CONFIG')
+            or not os.environ.get('AGV_ORDER_PERSIST_DIR')
+            or any(os.environ.get(key) != '1' for key in
+                   ('AGV_ORDER_COORDINATED', 'AGV_ORDER_FLEET', 'AGV_ORDER_SHELF_SYNC'))):
+        raise ValueError('synthetic world requires a fresh fleet state path and no field mapping')
     port = int(os.environ['MQTT_PORT'])
     if not 1 <= port <= 65535:
         raise ValueError('invalid broker port')
@@ -780,14 +793,20 @@ async def lifespan(app):
                     raise ValueError('persistent demo requires fleet and shelf synchronization')
                 from server.order_persistence import PersistentOrderStore
                 folder = Path(persistent_dir).resolve()
-                folder.mkdir(parents=True, exist_ok=True)
+                if action_source == 'synthetic':
+                    # A previous in-memory world cannot be reconstructed from
+                    # the DB, even if the prior run appeared to complete.
+                    folder.mkdir(parents=False, exist_ok=False)
+                else:
+                    folder.mkdir(parents=True, exist_ok=True)
                 owner = _DatabaseOwner(folder / 'orders.sqlite3')
                 owner.acquire()
                 cleanup.callback(owner.release)
                 fingerprint = (field_mapping.identity if field_mapping is not None else
                                hashlib.sha256(json.dumps(sim_map, sort_keys=True, separators=(',', ':'),
                                                          allow_nan=False).encode('utf-8')).hexdigest())
-                journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, products)
+                journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, products,
+                                               action_source=action_source)
                 from server.order_pickup_inventory import PickupInventory
                 pickup_path = folder / 'pickup-inventory.sqlite3'
                 pickup_sources = {item['pickup_node']: item['product_type'] for item in products}
@@ -797,7 +816,8 @@ async def lifespan(app):
                 elif pickup_path.exists() or journal.simulation_id is not None:
                     raise RuntimeError('unbound pickup inventory requires manual recovery')
                 else:
-                    pickup_store = PickupInventory.create_new(pickup_path, pickup_sources)
+                    pickup_store = PickupInventory.create_new(pickup_path, pickup_sources,
+                                                              action_source=action_source)
                     journal.bind_pickup_id(pickup_store.creation_id)
                 journal.recover_interrupted()
                 saved_orders = journal.list_orders()
@@ -897,11 +917,19 @@ async def lifespan(app):
                            auto_recovery=(os.environ.get('AGV_ORDER_COORDINATED') == '1'
                                           and os.environ.get('AGV_ORDER_FLEET') == '1'),
                            journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store,
-                           field_mapping=field_mapping, products=products)
+                           field_mapping=field_mapping, products=products, action_source=action_source)
         app.state.mqtt_service = service
         try:
             demo.start()
             cleanup.callback(demo.stop)
+            if action_source == 'synthetic':
+                from server.synthetic_peer import SyntheticPeer
+                by_id = {node['id']: node for node in map_data['nodes']}
+                initial = {robot: {'agv_id': twin, 'x': by_id[node]['x'], 'y': by_id[node]['y'], 'yaw': 0.}
+                           for robot, twin, node in (('sim-r1', 'AGV_01', 'J01'), ('sim-r2', 'AGV_02', 'J05'))}
+                peer = SyntheticPeer(demo.actions, service, products, initial, secrets.token_hex(16))
+                peer.start()
+                cleanup.callback(peer.stop)
             app.state.demo = demo
             app.state.demo_actions = demo.actions
             app.state.field_twin_mapping = field_mapping

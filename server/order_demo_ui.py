@@ -344,6 +344,9 @@ HTML_PAGE = r'''<!doctype html>
       if (data.stale !== undefined && typeof data.stale !== 'boolean') throw new Error('invalid freshness');
       const stale = data.stale === true;
       const disconnected = data.connected === false || data.unreal_connected === false;
+      const synthetic = data.action_source === 'synthetic';
+      if (synthetic) document.querySelector('.intro').textContent =
+        '상품을 선택하면 서버가 경로를 계산합니다. 합성 세계에서 가상 운반을 시연합니다.';
       fleetMode = data.mode === 'fleet';
       document.getElementById('single-status').hidden = fleetMode;
       document.getElementById('fleet-status').hidden = !fleetMode;
@@ -375,8 +378,8 @@ HTML_PAGE = r'''<!doctype html>
         jobActive = stale || disconnected || unresolved || !canQueue;
         updateButton();
         message(statusFeedback, stale ? '표시된 내용은 최신 상태가 아닙니다. 새 주문은 잠시 기다려 주세요.'
-          : (disconnected ? '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.'
-            : (data.recovery_required ? '이전 작업 또는 Unreal 상태를 확인해야 합니다. 새 주문은 대기합니다.'
+          : (disconnected ? (synthetic ? '합성 시연이 중단됐습니다. 저장된 상태를 확인해 주세요.' : '서버 또는 Unreal 연결을 확인해 주세요. 새 주문은 잠시 기다려 주세요.')
+            : (data.recovery_required ? (synthetic ? '이전 가상 작업을 확인해야 합니다. 새 주문은 대기합니다.' : '이전 작업 또는 Unreal 상태를 확인해야 합니다. 새 주문은 대기합니다.')
             : (jobActive ? '현재 새로운 가상 주문을 받을 수 없습니다.' : ''))));
         return;
       }

@@ -1,0 +1,169 @@
+"""An in-process simulated world for the isolated web demo only.
+
+This does not connect to Unreal or any physical robot. Its memory is lost on
+process exit; a saved database must never be used to reconstruct this world.
+"""
+import copy
+import logging
+import math
+import threading
+import time
+
+
+class SyntheticPeer:
+    def __init__(self, actions, observer, products, initial_poses, world_id):
+        if (not isinstance(world_id, str) or len(world_id) != 32
+                or any(c not in '0123456789abcdef' for c in world_id)
+                or set(initial_poses) != {'sim-r1', 'sim-r2'}):
+            raise ValueError('a fresh isolated simulated world is required')
+        self.actions, self.observer, self.world_id = actions, observer, world_id
+        self._stop = threading.Event()
+        self._effect_lock = threading.Lock()
+        self._thread = None
+        self._robots, self._pose_at = {}, {}
+        self._mapping = {'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}
+        for robot, twin in self._mapping.items():
+            pose = initial_poses[robot]
+            if (not isinstance(pose, dict) or set(pose) != {'agv_id', 'x', 'y', 'yaw'}
+                    or pose['agv_id'] != twin
+                    or any(type(pose[k]) not in (int, float) or not math.isfinite(pose[k])
+                           for k in ('x', 'y', 'yaw'))):
+                raise ValueError('valid initial synthetic robot poses required')
+            self._robots[twin] = dict(pose, carrying=False, interpolating=False)
+            self._pose_at[twin] = 0.
+        self._products = {}
+        self._sources = {}
+        self._slots = {}
+        for item in products:
+            kind, source, shelf, size = (item['product_type'], item['pickup_node'],
+                                         item['shelf_id'], item['slot_count'])
+            if (kind in self._products or source in self._sources or shelf in self._slots
+                    or any(type(v) is not str or not v for v in (kind, source, shelf))
+                    or type(size) is not int or size != 6):
+                raise ValueError('unambiguous six-slot synthetic product catalog required')
+            self._products[kind], self._sources[source] = (source, shelf), kind
+            self._slots[shelf] = [False] * size
+        if not self._products:
+            raise ValueError('synthetic product catalog required')
+        self._stock = {source: 3 for source in self._sources}
+        self._carrying = {twin: None for twin in self._robots}
+        self._seen = set()
+
+    def _refresh_poses(self):
+        for robot, twin in self._mapping.items():
+            state = self.observer.twin_observation(robot)
+            seen = state.get('observation') if isinstance(state, dict) else None
+            live = seen.get('state') if isinstance(seen, dict) else None
+            pose = live.get('pose') if isinstance(live, dict) else None
+            received = state.get('received_at') if isinstance(state, dict) else None
+            if (not isinstance(state, dict) or state.get('connected') is not True
+                    or state.get('ready') is not True or not isinstance(seen, dict)
+                    or seen.get('state_received_live') is not True or not isinstance(live, dict)
+                    or live.get('map_id') != 'twin-validation-v1' or not isinstance(pose, dict)
+                    or type(received) not in (int, float)
+                    or not 0 <= time.monotonic() - received <= 1.
+                    or any(type(pose.get(k)) not in (int, float) or not math.isfinite(pose[k])
+                           for k in ('x', 'y', 'th'))):
+                self._pose_at[twin] = 0.
+                continue
+            self._robots[twin].update(x=pose['x'] / 1000, y=pose['y'] / 1000, yaw=pose['th'])
+            self._pose_at[twin] = received
+
+    def _snapshot(self, request_id):
+        return {'type': 'shelf.snapshot', 'data': {
+            'request_id': request_id, 'world_id': self.world_id,
+            'robots': copy.deepcopy(list(self._robots.values())),
+            'shelves': [{'shelf_id': shelf, 'product_type': kind, 'slots': list(self._slots[shelf])}
+                        for kind, (_, shelf) in self._products.items()],
+            'pickups': [{'source_id': source, 'product_type': kind, 'available': self._stock[source]}
+                        for source, kind in self._sources.items()]}}
+
+    def _apply(self, action):
+        if not isinstance(action, dict):
+            raise ValueError('invalid synthetic action')
+        name = action.get('action')
+        expected = {'order_id', 'action_id', 'agv_id', 'action', 'result', 'expected_x', 'expected_y'}
+        expected |= {'product_type'} if name == 'grab' else {'shelf_id', 'slot_index'} if name == 'place' else set()
+        if (name not in ('grab', 'place') or set(action) != expected
+                or action.get('result') != 'success'
+                or any(type(action.get(key)) is not str or not action[key] or len(action[key]) > 128
+                       for key in ('order_id', 'action_id', 'agv_id'))
+                or action['action_id'] in self._seen or action['agv_id'] not in self._robots
+                or any(type(action.get(k)) not in (int, float) or not math.isfinite(action[k])
+                       for k in ('expected_x', 'expected_y'))):
+            raise ValueError('invalid or duplicate synthetic action')
+        twin = action['agv_id']
+        robot = self._robots[twin]
+        if (not 0 <= time.monotonic() - self._pose_at[twin] <= 1.
+                or math.hypot(robot['x'] - action['expected_x'], robot['y'] - action['expected_y']) > .25):
+            raise ValueError('fresh synthetic position is unavailable')
+        if name == 'grab':
+            product = action['product_type']
+            if product not in self._products or self._carrying[twin] is not None:
+                raise ValueError('synthetic grab state differs')
+            source, _ = self._products[product]
+            if self._stock[source] < 1:
+                raise ValueError('synthetic pickup is empty')
+            self._seen.add(action['action_id'])
+            self._stock[source] -= 1
+            self._carrying[twin] = product
+            robot['carrying'] = True
+        else:
+            shelf, slot = action['shelf_id'], action['slot_index']
+            product = self._carrying[twin]
+            if (product not in self._products or shelf != self._products[product][1]
+                    or type(slot) is not int or not 0 <= slot < len(self._slots[shelf])
+                    or self._slots[shelf][slot]):
+                raise ValueError('synthetic place state differs')
+            self._seen.add(action['action_id'])
+            self._slots[shelf][slot] = True
+            self._carrying[twin] = None
+            robot['carrying'] = False
+        return {'type': 'robot.action.result', 'data': {
+            key: action[key] for key in ('order_id', 'action_id', 'agv_id', 'action')} | {'applied': True}}
+
+    def start(self):
+        if self._thread is not None or not self.actions.attach(self, True, source='synthetic'):
+            raise RuntimeError('synthetic owner could not attach')
+        self._thread = threading.Thread(target=self._run, name='synthetic-world', daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            self.actions.detach(self)
+            raise
+        return self
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                self._refresh_poses()
+                message = self.actions.poll(self)
+                if message is not None:
+                    kind, data = message.get('type'), message.get('data')
+                    if kind == 'shelf.snapshot.request':
+                        reply = self._snapshot(data['request_id'])
+                    elif kind == 'robot.action':
+                        # Admit a world effect only while the same owner is
+                        # still valid. stop() sets the signal first; an effect
+                        # already under this fence may finish before stop does.
+                        with self._effect_lock, self.actions.motion_guard() as available:
+                            if (self._stop.is_set() or not available or self.actions.can_dispatch() is not True
+                                    or self._stop.is_set()):
+                                break
+                            reply = self._apply(data)
+                    else:
+                        raise ValueError('unexpected synthetic request')
+                    if self._stop.is_set() or not self.actions.receive(self, reply):
+                        raise RuntimeError('synthetic reply was not accepted')
+                self._stop.wait(.05)
+        except Exception:
+            logging.getLogger(__name__).exception('synthetic world stopped; outcome may be unknown')
+        finally:
+            self.actions.invalidate_owner(self)
+            self.actions.detach(self)
+
+    def stop(self):
+        self._stop.set()
+        self.actions.invalidate_owner(self)
+        if self._thread is not None:
+            self._thread.join()
