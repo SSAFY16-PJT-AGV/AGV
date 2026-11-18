@@ -427,10 +427,18 @@ index 05e1abc..8e7a2d1 100644
                  for s in ("left", "right"):
                      f = br.get(s)
 diff --git a/agv/link/controller.py b/agv/link/controller.py
-index 3a11e31..e699ff9 100644
+index 3a11e31..195e04e 100644
 --- a/agv/link/controller.py
 +++ b/agv/link/controller.py
-@@ -57,6 +57,9 @@ class LinkController(object):
+@@ -16,6 +16,7 @@
+ 상태 값: IDLE(주문 없음·작업 끝) | MOVING | WAITING(해제 노드에서 다음 해제를 기다림) | ERROR(error에 이유).
+ 표준 라이브러리만 쓴다. Python 3.6 호환.
+ """
++import copy
+ import json
+ import math
+ import time
+@@ -57,6 +58,9 @@ class LinkController(object):
          self._last_status = None
          self.n_orders = 0
          self._anchor = None             # (노드, 경로 순번, odo): 마지막으로 선 해제 노드
@@ -441,7 +449,7 @@ index 3a11e31..e699ff9 100644
 +
      # ---------- 연결 ----------
      def attach(self, runner):
-@@ -69,15 +72,58 @@ class LinkController(object):
+@@ -69,15 +73,58 @@ class LinkController(object):
          if self._log is not None:
              self._log(msg, **kw)
 -
@@ -504,7 +512,7 @@ index 3a11e31..e699ff9 100644
          st = self.state(now)
          if (self._last_pub is None or now - self._last_pub >= self.state_period - 1e-6
                  or st["status"] != self._last_status):
-@@ -120,6 +166,18 @@ class LinkController(object):
+@@ -120,6 +167,18 @@ class LinkController(object):
          if d.kind == "duplicate":
              self._note("link_order_duplicate", order_id=o["order_id"], seq=o["seq"])
              return
@@ -523,7 +531,7 @@ index 3a11e31..e699ff9 100644
          if r is None or r.finished:
              self._reject(o, "robot stopped (%s)" % (r.finish_reason if r is not None else "not ready"))
              return
-@@ -134,6 +192,13 @@ class LinkController(object):
+@@ -134,25 +193,78 @@ class LinkController(object):
                  self.nav.hold_at_end = True       # 마지막 노드에 닿아도 끝내지 않고 다음 작업을 기다림
                  self.nav.set_route(o["nodes"], o["released_until"])
              else:
@@ -537,7 +545,69 @@ index 3a11e31..e699ff9 100644
                  self.nav.extend(o["released_until"])
          except (OrderRejected, ValueError) as e:
              self._reject(o, e.args[0] if e.args else str(e))
-@@ -153,6 +218,8 @@ class LinkController(object):
+             return
+-        self.book.commit(d)
++        strict = getattr(self.nav, "_strict_repeat", False)
++        if strict:
++            pending = getattr(self.link, "disconnect_pending", lambda: False)
++            def cancel(reason):
++                self.error = reason
++                if reason == "link_lost":
++                    self._strict_disconnect_latched = True
++                cancel_start = getattr(r, "cancel_unstarted_motion", None)
++                if cancel_start is not None:
++                    cancel_start(reason)
++                else:
++                    r.hold(reason)
++                self._reject(o, "repeated route start is uncertain")
++            if pending():
++                cancel("link_lost")
++                return
++            if r.state != "hold" or r.hold_reason not in ("wait_order", "nav_hold"):
++                cancel("order_unconfirmed")
++                return
++            snapshot = copy.deepcopy(self.book.__dict__)
++            try:
++                arm = getattr(r, "arm_unstarted_disconnect_guard", None)
++                if arm is not None:
++                    arm(pending)
++                if r.resume() is False or r.state == "hold":
++                    raise RuntimeError("runner could not resume")
++                if pending():
++                    self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
++                    cancel("link_lost")
++                    return
++                self.book.commit(d)
++                if (self.book.current != o or self.book.current_digest != d.digest
++                        or self.book.seen.get((o["order_id"], o["seq"])) != d.digest):
++                    raise RuntimeError("order commit did not match decision")
++                if pending():
++                    self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
++                    cancel("link_lost")
++                    return
++            except Exception:
++                self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
++                cancel("link_lost" if pending() else "order_unconfirmed")
++                return
++        else:
++            self.book.commit(d)
+         self.n_orders += 1
+         self.rejected = None
+         self._note("link_order", kind=d.kind, order_id=o["order_id"], seq=o["seq"],
+                    release=o["released_until"], nodes=o["nodes"])
+-        if r.state == "hold" and r.hold_reason in ("wait_order", "nav_hold"):
+-            r.resume()
+-        else:
+-            r.policy_changed()
++        if not strict:
++            if r.state == "hold" and r.hold_reason in ("wait_order", "nav_hold"):
++                r.resume()
++            else:
++                r.policy_changed()
+-
++
+     # ---------- 정지·끊김 ----------
+     def _watch_stop(self):
          r, b = self.runner, self.book
          if r is None or b.current is None:
              return
@@ -546,7 +616,7 @@ index 3a11e31..e699ff9 100644
          o = b.current
          key = (o["order_id"], o["seq"])
          release = o["released_until"]
-@@ -162,6 +229,16 @@ class LinkController(object):
+@@ -162,6 +274,16 @@ class LinkController(object):
          if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
                  or self.nav.at_node != release:
              return
@@ -563,7 +633,7 @@ index 3a11e31..e699ff9 100644
          self._stopped.add(key)
          self._anchor = (release, b.release_i, r.odo)
          self._event_n += 1
-@@ -169,7 +246,27 @@ class LinkController(object):
+@@ -169,7 +291,27 @@ class LinkController(object):
                "robot_session": self.session, "order_id": o["order_id"], "seq": o["seq"],
                "map_id": o["map_id"], "stopped_at": release,
                "cleared_resources": self.rules.cleared(o["nodes"], b.segment_start_i, b.release_i)}
@@ -592,7 +662,7 @@ index 3a11e31..e699ff9 100644
          final = b.at_final_release
          if final:
              b.mark_finished()
-@@ -194,9 +291,16 @@ class LinkController(object):
+@@ -194,9 +336,16 @@ class LinkController(object):
              return
          if self.error != "link_lost":
              return
@@ -611,7 +681,7 @@ index 3a11e31..e699ff9 100644
                  self._note("link_restored", resumed=True)
                  r.resume()
 diff --git a/agv/link/mqtt.py b/agv/link/mqtt.py
-index 8bb688f..2340845 100644
+index 8bb688f..b84fd91 100644
 --- a/agv/link/mqtt.py
 +++ b/agv/link/mqtt.py
 @@ -15,6 +15,7 @@ import json
@@ -761,7 +831,7 @@ index 8bb688f..2340845 100644
 +                remaining = deadline - time.monotonic()
 +                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
 +                    return False
-+            if not connected[0]:
++            if not connected[0] or self.disconnect_pending():
 +                return False
 +            info = client.publish(self.topic("event"), json.dumps(event, ensure_ascii=False, separators=(",", ":")),
 +                                  qos=1, retain=False)
@@ -795,10 +865,38 @@ index 8bb688f..2340845 100644
          self.events.append(event)
          return True
 diff --git a/agv/runner.py b/agv/runner.py
-index 669caa2..0e097e7 100644
+index 669caa2..02ecdc2 100644
 --- a/agv/runner.py
 +++ b/agv/runner.py
-@@ -483,6 +483,10 @@ class ExploreRunner(object):
+@@ -253,6 +253,7 @@ class ExploreRunner(object):
+         self._parked = None         # 스퍼 끝에 서 있음 {j, side} (재개하면 후진해 나옴)
+         self.hold_reason = None
+         self._stop_req = None       # 이동 정책이 요청한 정지 {pos, reason, hold, node}
++        self._unstarted_disconnect_guard = None
+         self._resume_split = None   # 갈림길 앞에서 대기 중이면 그 갈림길 시작 (t, odo)
+         self._resume_vee = None     # V자 앞에서 대기 중이면 그 판정
+         self.rc = dict(RECOVER_DEFAULT)
+@@ -465,6 +466,18 @@ class ExploreRunner(object):
+         self._do_stop({"reason": reason, "hold": True})
+         return True
+-
++
++    def arm_unstarted_disconnect_guard(self, guard):
++        """Fence the first step of an order accepted from a held state."""
++        self._unstarted_disconnect_guard = guard
++
++    def cancel_unstarted_motion(self, reason):
++        """Cancel only a newly resumed plan before its first motor output."""
++        self._unstarted_disconnect_guard = None
++        self._stop_req = self.v_plan = self._piv = self._rev = None
++        self._resume_split = self._resume_vee = None
++        self.choice = self.decision = None
++        self._do_stop({"reason": reason, "hold": True})
++
+     def resume(self):
+         """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
+         if self.state != "hold" or self.finished:
+@@ -483,6 +496,10 @@ class ExploreRunner(object):
          if hook is not None:
              hook()
          self.log.log("note", self._odo(), msg="resume")
@@ -809,7 +907,29 @@ index 669caa2..0e097e7 100644
          if self._resume_split is not None:
              onset, self._resume_split = self._resume_split, None
              self._decide_split(onset)
-@@ -725,6 +729,8 @@ class ExploreRunner(object):
+@@ -529,6 +546,20 @@ class ExploreRunner(object):
+-
++
+     # ---------- 한 스텝 ----------
+     def step(self, frame, dt):
++        """Fence a newly resumed plan before returning its first motor output."""
++        guard = self._unstarted_disconnect_guard
++        if guard is not None and guard():
++            self.cancel_unstarted_motion("link_lost")
++            return 0.0, 0.0
++        result = self._step_unfenced(frame, dt)
++        if guard is not None:
++            if guard():
++                self.cancel_unstarted_motion("link_lost")
++                return 0.0, 0.0
++            self._unstarted_disconnect_guard = None
++        return result
++
++    def _step_unfenced(self, frame, dt):
+         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
+         if self.finished:
+             return 0.0, 0.0
+@@ -725,6 +756,8 @@ class ExploreRunner(object):
          if suggestion is None:
              self._resume_split = onset
              self._poll_policy()
@@ -818,7 +938,7 @@ index 669caa2..0e097e7 100644
              if self.state != "hold":            # 정책이 정지를 안 줬으면 그냥 기본 방향
                  self._resume_split = None
                  suggestion = "left"
-@@ -757,7 +763,7 @@ class ExploreRunner(object):
+@@ -757,7 +790,7 @@ class ExploreRunner(object):
          if suggestion is None:
              self._resume_vee = raw_v
              self._poll_policy()
@@ -827,7 +947,7 @@ index 669caa2..0e097e7 100644
                  return
              self._resume_vee = None
              suggestion = "left"
-@@ -1021,6 +1027,9 @@ class ExploreRunner(object):
+@@ -1021,6 +1054,9 @@ class ExploreRunner(object):
          kind = self._piv.get("kind", "recover")
          self.choice = None
          self.split_onset = None

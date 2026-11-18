@@ -26,6 +26,7 @@ class Runner(object):
  state="hold"; hold_reason="wait_order"; finished=False; odo=0; resumes=0
  def hold(self, reason): self.state,self.hold_reason="hold",reason
  def resume(self): self.resumes+=1; self.state="running"
+ def cancel_unstarted_motion(self,reason): self.state,self.hold_reason="hold",reason
  def policy_changed(self): pass
 
 def order(seq,release):
@@ -44,6 +45,22 @@ class SequenceTests(unittest.TestCase):
    r._rejoin(SimpleNamespace(patch_fracs={}),10)
    self.assertEqual(r.split_as_tee,expected)
    self.assertEqual(r.choice,"right")
+ def test_runner_cancels_unstarted_pivot_before_first_motor_output(self):
+  for when in ("before","during"):
+   r=ExploreRunner.__new__(ExploreRunner); lost=threading.Event()
+   r._stop_req={"x":1}; r.v_plan={"x":1}; r._piv={"x":1}; r._rev={"x":1}
+   r._resume_split=(1,2); r._resume_vee=(1,2); r.choice="left"; r.decision={"x":1}
+   stops=[]; r._do_stop=lambda request:stops.append(request)
+   def output(_frame,_dt):
+    if when=="during": lost.set()
+    return 0.4,0.4
+   r._step_unfenced=output
+   r.arm_unstarted_disconnect_guard(lost.is_set)
+   if when=="before": lost.set()
+   self.assertEqual(r.step(None,.1),(0.0,0.0))
+   self.assertEqual(stops,[{"reason":"link_lost","hold":True}])
+   self.assertIsNone(r._piv); self.assertIsNone(r.v_plan)
+   self.assertIsNone(r._rev); self.assertIsNone(r._unstarted_disconnect_guard)
  def fresh(self):
   nav=Navigator(NavMap(DATA),start="A",hold_at_end=True)
   runner=Runner(); link=FakeLink("sim-r1"); ctl=LinkController(link,nav,DATA,start_node="A"); ctl.attach(runner)
@@ -308,6 +325,73 @@ class SequenceTests(unittest.TestCase):
   self.assertEqual(ctl.error,"event_unconfirmed")
   self.assertEqual(ctl._stopped,set())
   self.assertFalse(ctl.book.finished)
+ def test_disconnect_during_extend_or_resume_does_not_start_or_commit(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  for when in ("extend","resume"):
+   nav,runner,_fake,ctl=self.fresh()
+   link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+   link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+   ctl.link=link; ctl.step(now=100)
+   ctl._handle(json.dumps(order(1,"C")).encode())
+   nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+   nav.on_patch("red",200); nav.pop_stop()
+   runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+   before=runner.resumes
+   if when=="extend":
+    original=nav.extend
+    def interrupted(release):
+     original(release); link._disconnect_observed.set()
+    nav.extend=interrupted
+   else:
+    original=runner.resume
+    def interrupted():
+     original(); runner.state="pivot"; link._disconnect_observed.set()
+    runner.resume=interrupted
+   link._on_message(client,None,Msg()); ctl.step(now=100.1)
+   self.assertEqual(ctl.error,"link_lost",when)
+   self.assertEqual(ctl.book.current["seq"],1,when)
+   self.assertEqual((runner.state,runner.hold_reason),("hold","link_lost"),when)
+   if when=="extend": self.assertEqual(runner.resumes,before)
+ def test_failed_order_commit_cancels_new_motion_and_restores_book(self):
+  nav,runner,link,ctl=self.fresh()
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  commit=ctl.book.commit
+  def fail_after_commit(decision):
+   commit(decision)
+   raise RuntimeError("commit interrupted")
+  ctl.book.commit=fail_after_commit
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertNotIn(("T1",2),ctl.book.seen)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+ def test_inconsistent_order_commit_cancels_new_motion(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  ctl.book.commit=lambda _decision:None
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+ def test_resume_that_stays_held_does_not_commit(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  runner.resume=lambda:True
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
  def test_old_disconnect_requires_fresh_link_for_new_repeat_but_not_generic(self):
   class Client(object):
    def publish(self,*args,**kwargs): pass
@@ -354,6 +438,16 @@ class SequenceTests(unittest.TestCase):
   with mock_patch("agv.link.mqtt.mqtt",legacy_api):
    self.assertTrue(link.publish_event_once({"event_id":"legacy"}))
   self.assertEqual((legacy.connects,legacy.publishes,legacy.closed),(1,1,1))
+  interrupted=EventClient(True)
+  base_loop=interrupted.loop
+  def disconnect_before_publish(timeout=0):
+   result=base_loop(timeout)
+   if interrupted.loops==1: link._disconnect_observed.set()
+   return result
+  interrupted.loop=disconnect_before_publish
+  with mock_patch("agv.link.mqtt.mqtt.Client",return_value=interrupted):
+   self.assertFalse(link.publish_event_once({"event_id":"interrupted"}))
+  self.assertEqual(interrupted.publishes,0)
  def test_unexpected_dead_end_stops_repeat_sequence(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
   nav.on_dead_end("left",100); stop=nav.pop_stop()
