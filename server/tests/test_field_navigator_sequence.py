@@ -42,6 +42,7 @@ class TeamNavigatorSequenceTest(unittest.TestCase):
             self.assertIn('_strict_repeat', (target / 'agv/nav/navigator.py').read_text(encoding='utf-8'))
             self.assertIn('event_unconfirmed', (target / 'agv/link/controller.py').read_text(encoding='utf-8'))
             self.assertIn('process_if_current', (target / 'agv/link/mqtt.py').read_text(encoding='utf-8'))
+            self.assertIn('A pre-turn spur decision', (target / 'agv/runner.py').read_text(encoding='utf-8'))
             shutil.copyfile(CASES, target / 'agv/tests/test_sequence_visit_patch.py')
             env = os.environ.copy()
             env['PYTHONUTF8'] = '1'
@@ -49,7 +50,7 @@ class TeamNavigatorSequenceTest(unittest.TestCase):
             command = subprocess.run(
                 [sys.executable, '-m', 'unittest',
                  'agv.tests.test_sequence_visit_patch.SequenceTests',
-                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_revisit_completes_or_safely_stops_on_missed_observation', '-q'],
+                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_revisit_completes_with_observed_split', '-q'],
                 cwd=target, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=180)
             self.assertEqual(command.returncode, 0, command.stdout + '\n' + command.stderr)
 

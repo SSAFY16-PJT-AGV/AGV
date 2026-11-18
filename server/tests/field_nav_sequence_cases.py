@@ -3,8 +3,10 @@ import io
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from agv.link import FakeLink, LinkController, MqttLink
 from agv.nav import NavMap, Navigator
+from agv.runner import ExploreRunner
 from agv.tests.test_link import TestSimServe
 
 DATA = {"map_id":"m", "version":1, "nodes":[
@@ -27,6 +29,18 @@ def order(seq,release):
  return {"order_id":"T1","seq":seq,"map_id":"m@v1","nodes":ROUTE,"released_until":release,"action_at_end":{"type":"none"}}
 
 class SequenceTests(unittest.TestCase):
+ def test_uturn_clears_stale_spur_marker_without_affecting_recovery(self):
+  for kind,expected in (("uturn",None),("recover","left")):
+   r=ExploreRunner.__new__(ExploreRunner)
+   r.follow=SimpleNamespace(); r.junc=SimpleNamespace(); r.tee=SimpleNamespace()
+   r.patch=SimpleNamespace(); r.cfg={"patch":{"off_frac":0.1}}
+   r.rc={"suppress_mm":20}; r.odo=100; r.t=5; r.mode="drive"
+   r._piv={"kind":kind,"prefer":"right"}; r.split_as_tee="left"
+   r.log=SimpleNamespace(log=lambda *args,**kwargs:None)
+   r.ex=SimpleNamespace(); r._poll_policy=lambda:None
+   r._rejoin(SimpleNamespace(patch_fracs={}),10)
+   self.assertEqual(r.split_as_tee,expected)
+   self.assertEqual(r.choice,"right")
  def fresh(self):
   nav=Navigator(NavMap(DATA),start="A",hold_at_end=True)
   runner=Runner(); link=FakeLink("sim-r1"); ctl=LinkController(link,nav,DATA,start_node="A"); ctl.attach(runner)
@@ -164,7 +178,7 @@ class SequenceTests(unittest.TestCase):
   ctl.step(now=100); self.assertEqual(runner.resumes,0); self.assertIsNone(ctl.book.current); self.assertEqual(runner.state,"hold")
 
 class SequenceMatTests(TestSimServe):
- def test_team_mat_revisit_completes_or_safely_stops_on_missed_observation(self):
+ def test_team_mat_revisit_completes_with_observed_split(self):
   route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
   for seed in (2,3,5):
    pending={0:self._o(1,"P_purple",route),1:self._o(2,"P_orange",route)}; sent=set()
@@ -175,14 +189,16 @@ class SequenceMatTests(TestSimServe):
     if n==2 and state["status"]=="IDLE": runner.stop("test_done")
     if n==1 and state["status"]=="ERROR" and ctl.error=="nav_off_route": runner.stop("expected_hold")
    link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
-   if gt["finish_reason"] not in ("test_done","expected_hold"):
+   if gt["finish_reason"] != "test_done":
     with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
      tail=[x.strip() for x in f.readlines() if "nav_sequence_ambiguous" in x or "nav_off_route" in x or '"type": "' in x][-12:]
     self.fail(repr((seed,[x for x in notes if x[0] != "link_order"],tail)))
    observed=[(e["seq"],e["stopped_at"]) for e in link.events]
-   if gt["finish_reason"] == "expected_hold":
-    self.assertEqual(observed,[(1,"P_purple")]); self.assertEqual(ctl.error,"nav_off_route")
-   else:
-    self.assertEqual(observed,[(1,"P_purple"),(2,"P_orange")])
+   self.assertEqual(observed,[(1,"P_purple"),(2,"P_orange")])
+   with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
+    events=[json.loads(line) for line in f]
+   turn=next(i for i,e in enumerate(events) if e.get("msg")=="uturn_done")
+   split=next(e for e in events[turn+1:] if e.get("type") in ("split","merge","patch"))
+   self.assertEqual((split["type"],split.get("choice")),("split","right"))
 
 if __name__=="__main__": unittest.main()

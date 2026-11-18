@@ -421,3 +421,16 @@ diff --git a/agv/link/mqtt.py b/agv/link/mqtt.py
  
      def publish_state(self, state):
          if self.connected:
+diff --git a/agv/runner.py b/agv/runner.py
+--- a/agv/runner.py
++++ b/agv/runner.py
+@@ -1021,6 +1021,9 @@
+         kind = self._piv.get("kind", "recover")
+         self.choice = None
+         self.split_onset = None
++        if kind == "uturn":
++            # A pre-turn spur decision cannot describe a post-turn junction.
++            self.split_as_tee = None
+         if self._piv.get("prefer") in ("left", "right"):
+             # 회전 직후 바로 앞 갈림길: 이미 갈라져 보여 판정을 못 하니 그 가지를 고른 채로 따라간다
+             self.choice = self._piv["prefer"]
