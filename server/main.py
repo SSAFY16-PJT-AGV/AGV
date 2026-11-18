@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import json
+import math
 import os
 from pathlib import Path
 
@@ -104,3 +105,47 @@ def robot_observations(request: Request):
             detail="MQTT observations unavailable",
             headers={"Cache-Control": "no-store"},
         ) from None
+
+
+@app.get("/robots/battery")
+def robot_battery_observations(request: Request):
+    """Summarize reported battery data without treating it as live evidence."""
+    try:
+        data = request.app.state.mqtt_service.snapshot()
+        if (not isinstance(data, dict)
+                or type(data.get("connected")) is not bool
+                or type(data.get("ready")) is not bool
+                or not isinstance(data.get("robots"), dict)
+                or (data["ready"] and not data["connected"])):
+            raise ValueError("invalid observation snapshot")
+        robots = {}
+        for robot_id, observation in data["robots"].items():
+            if (not isinstance(robot_id, str) or not isinstance(observation, dict)
+                    or type(observation.get("state_received_live")) is not bool
+                    or type(observation.get("connection_received_live")) is not bool
+                    or observation.get("connection_report") not in (None, "online", "offline")):
+                raise ValueError("invalid robot observation")
+            state = observation.get("state")
+            if state is None:
+                status, value = "no_state", None
+            elif not isinstance(state, dict):
+                raise ValueError("invalid robot state")
+            elif "battery" not in state:
+                status, value = "not_reported", None
+            elif state["battery"] is None:
+                status, value = "unknown", None
+            elif (type(state["battery"]) is int
+                  or (type(state["battery"]) is float and math.isfinite(state["battery"]))):
+                status, value = "reported", state["battery"]
+            else:
+                status, value = "invalid", None
+            robots[robot_id] = {"status": status, "value": value,
+                                "ratio_range": 0 <= value <= 1 if status == "reported" else None,
+                                "state_received_live": observation["state_received_live"],
+                                "connection_report": observation["connection_report"],
+                                "connection_received_live": observation["connection_received_live"]}
+        return JSONResponse(content={"connected": data["connected"], "ready": data["ready"],
+                                     "robots": robots}, headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(status_code=503, detail="MQTT observations unavailable",
+                            headers={"Cache-Control": "no-store"}) from None
