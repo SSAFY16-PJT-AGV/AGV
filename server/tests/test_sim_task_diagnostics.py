@@ -427,34 +427,75 @@ class SimulationTaskDiagnosticsTests(unittest.TestCase):
             self.runtime.task_diagnostics(huge_task)
 
     def test_database_reads_remain_one_snapshot_under_concurrent_commits(self):
-        started = threading.Event()
+        first_read, committed = threading.Event(), threading.Event()
         failures = []
+        original_connect = sqlite3.connect
+        with closing(original_connect(self.path)) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower(), 'wal')
+
+        class ObservedConnection(sqlite3.Connection):
+            def execute(self, sql, *args):
+                cursor = super().execute(sql, *args)
+                if 'FROM tasks WHERE task_id=' in sql:
+                    first_read.set()
+                    if not committed.wait(5):
+                        raise RuntimeError('writer did not commit during diagnostic snapshot')
+                return cursor
+
+        def connect(*args, **kwargs):
+            if threading.current_thread() is threading.main_thread():
+                kwargs['factory'] = ObservedConnection
+            return original_connect(*args, **kwargs)
 
         def writer():
             try:
-                with closing(sqlite3.connect(self.path, timeout=10)) as db:
-                    started.set()
-                    for i in range(60):
-                        db.execute('BEGIN IMMEDIATE')
-                        status, state = ('ASSIGNED', 'uncertain') if i % 2 else ('PENDING', 'pending')
-                        db.execute('UPDATE tasks SET status=? WHERE task_id=?', (status, 'T1'))
-                        db.execute('UPDATE allocation_outbox SET state=? WHERE task_id=?', (state, 'T1'))
-                        db.commit()
+                if not first_read.wait(5):
+                    raise RuntimeError('diagnostic did not read task')
+                with closing(original_connect(self.path, timeout=5)) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute("UPDATE tasks SET status='PENDING' WHERE task_id='T1'")
+                    db.execute("UPDATE allocation_outbox SET state='pending' WHERE task_id='T1'")
+                    db.commit()
             except Exception as exc:
                 failures.append(exc)
+            finally:
+                committed.set()
 
         thread = threading.Thread(target=writer)
         thread.start()
-        self.assertTrue(started.wait(5))
         try:
-            for _ in range(60):
+            with patch('server.sim_runtime.sqlite3.connect', side_effect=connect):
                 snapshot = self.runtime.task_diagnostics('T1')['database_snapshot']
-                self.assertIn((snapshot['status'], snapshot['orders'][0]['state']),
-                              {('ASSIGNED', 'uncertain'), ('PENDING', 'pending')})
         finally:
-            thread.join(15)
+            thread.join(10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(failures, [])
+        self.assertEqual((snapshot['status'], snapshot['orders'][0]['state']), ('ASSIGNED', 'uncertain'))
+        with closing(original_connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT status FROM tasks WHERE task_id=?', ('T1',)).fetchone(), ('PENDING',))
+            self.assertEqual(db.execute('SELECT state FROM allocation_outbox WHERE task_id=?', ('T1',)).fetchone(),
+                             ('pending',))
+
+    def test_busy_database_diagnostic_returns_generic_503_and_releases_pin(self):
+        app = FastAPI()
+        app.include_router(router)
+        app.state.sim_runtime = self.runtime
+        app.state.sim_api_token = 'secret-token'
+        original_connect = sqlite3.connect
+        def no_wait(*args, **kwargs):
+            kwargs['timeout'] = 0
+            return original_connect(*args, **kwargs)
+        with closing(original_connect(self.path, isolation_level=None)) as blocker:
+            blocker.execute('BEGIN EXCLUSIVE')
+            try:
+                with patch('server.sim_runtime.sqlite3.connect', side_effect=no_wait):
+                    code, body, headers = asyncio.run(request(
+                        app, 'GET', '/simulation/tasks/T1/diagnostics', token='Bearer secret-token'))
+                self.assertEqual((code, body), (503, {'detail': 'simulation unavailable'}))
+                self.assertEqual(headers[b'cache-control'], b'no-store')
+                self.assertEqual(self.runtime._reference_operations, 0)
+            finally:
+                blocker.execute('ROLLBACK')
 
     def test_api_requires_loopback_and_token_and_hides_errors(self):
         app = FastAPI()

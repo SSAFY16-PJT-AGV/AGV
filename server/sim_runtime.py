@@ -330,7 +330,7 @@ class SimRuntime:
                 workflow.stop()
                 self._close_client(client)
                 raise
-            return self.status()
+        return self.status()
 
     def status(self):
         with self._lock:
@@ -519,9 +519,7 @@ class SimRuntime:
 
     def pending_events(self):
         """List bounded metadata even when the broker is disconnected."""
-        with self._lock:
-            if not self._started or self._stopped:
-                raise RuntimeError('simulation runtime is not started')
+        with self._runtime_read_operation():
             with closing(sqlite3.connect(self.path)) as db:
                 db.execute('CREATE TEMP TABLE allowed(robot_id TEXT, task_id TEXT, PRIMARY KEY(robot_id,task_id))')
                 db.executemany('INSERT INTO allowed VALUES (?,?)',
@@ -534,9 +532,7 @@ class SimRuntime:
 
     def task_status(self, task_id):
         """Read a bounded, consistent allocation snapshot; never authorize movement."""
-        with self._lock:
-            if not self._started or self._stopped:
-                raise RuntimeError('simulation runtime is not started')
+        with self._runtime_read_operation():
             if task_id not in self._tasks:
                 raise ValueError('task is not configured')
             with closing(sqlite3.connect(self.path)) as db:
@@ -562,23 +558,30 @@ class SimRuntime:
                     'occupancy_truncated': len(resources) > 500}
 
     @contextmanager
-    def _reference_operation(self):
+    def _runtime_read_operation(self):
         # Pin the DB owner across I/O without blocking unrelated runtime reads.
         # stop() closes admission before waiting for the last pinned operation.
         with self._reference_condition:
-            if not self._started or self._stopped or self.investigation_notes is None:
-                raise RuntimeError('simulation reference recording unavailable')
+            if not self._started or self._stopped:
+                raise RuntimeError('simulation runtime is not started')
             self._reference_operations += 1
             self._reference_local.depth = getattr(self._reference_local, 'depth', 0) + 1
-            notes = self.investigation_notes
         try:
-            yield notes
+            yield
         finally:
             with self._reference_condition:
                 self._reference_local.depth -= 1
                 self._reference_operations -= 1
                 if not self._reference_operations:
                     self._reference_condition.notify_all()
+
+    @contextmanager
+    def _reference_operation(self):
+        with self._runtime_read_operation():
+            notes = self.investigation_notes
+            if notes is None:
+                raise RuntimeError('simulation reference recording unavailable')
+            yield notes
 
     def record_investigation_note(self, task_id, request_id, category):
         """Store an untrusted reference; never change control or recovery state."""
@@ -600,9 +603,7 @@ class SimRuntime:
         No result from this function authenticates a robot, verifies its
         physical position, or authorizes an order or reservation release.
         """
-        with self._lock:
-            if not self._started or self._stopped:
-                raise RuntimeError('simulation runtime is not started')
+        with self._runtime_read_operation():
             if task_id not in self._tasks:
                 raise ValueError('task is not configured')
             try:
