@@ -92,6 +92,56 @@ class RoutingTests(unittest.TestCase):
                 with self.assertRaises(self.routing.InvalidMapError):
                     self.routing.MapGraph(invalid)
 
+    def test_robot_map_route_is_rejected_without_heading_or_turn_constraints(self):
+        data = example_map()
+        # Team agv-map-v1 includes U-turn, crossing and travel-direction rules.
+        # The existing node-only search cannot faithfully apply those rules.
+        data['schema'] = 'agv-map-v1'
+        graph = self.routing.MapGraph(data)
+        with self.assertRaisesRegex(ValueError, 'heading|direction'):
+            graph.shortest_path('N1', 'N3')
+        # Looking up the same node does not authorize movement.
+        self.assertEqual(graph.shortest_path('N1', 'N1').nodes, ('N1',))
+
+    def test_robot_navigation_fields_without_schema_also_block_routing(self):
+        for fields in ({'crossing': True}, {'through': [['E8', 'E9']]},
+                       {'uturn': True}, {'kind': 'via'}, {'via_of': 'E16'},
+                       {'branches': {}}, {'inputs': {}}, {'spur': {}}):
+            data = example_map()
+            data['nodes'][1].update(fields)
+            with self.subTest(fields=fields):
+                graph = self.routing.MapGraph(data)
+                with self.assertRaisesRegex(ValueError, 'heading|direction'):
+                    graph.shortest_path('N1', 'N3')
+
+    def test_crossing_pair_is_not_silently_replaced_by_shortest_turn(self):
+        # Mirrors mat_ssafy_v2: entering P_yellow on E8 can continue to X1
+        # on E9, not turn onto E17 to X2.  There is no safe route planner
+        # for the robot yet, even though the geometry has a short path.
+        data = {
+            'map_id': 'crossing', 'version': 0, 'unit': 'mm',
+            'nodes': [
+                {'id': 'S3', 'pos': [0, 0]},
+                {'id': 'P_yellow', 'pos': [1, 0], 'crossing': True,
+                 'through': [['E8', 'E9'], ['E16b', 'E17']]},
+                {'id': 'X1', 'pos': [2, 0]},
+                {'id': 'V_E16', 'pos': [1, -1]},
+                {'id': 'X2', 'pos': [1, 1]},
+            ],
+            'edges': [
+                {'id': 'E8', 'from': 'S3', 'to': 'P_yellow',
+                 'shape': [[0, 0], [1, 0]], 'bidirectional': True},
+                {'id': 'E9', 'from': 'P_yellow', 'to': 'X1',
+                 'shape': [[1, 0], [2, 0]], 'bidirectional': True},
+                {'id': 'E16b', 'from': 'V_E16', 'to': 'P_yellow',
+                 'shape': [[1, -1], [1, 0]], 'bidirectional': True},
+                {'id': 'E17', 'from': 'P_yellow', 'to': 'X2',
+                 'shape': [[1, 0], [1, 1]], 'bidirectional': True},
+            ],
+        }
+        with self.assertRaises(self.routing.UnsupportedRobotRoutingError):
+            self.routing.MapGraph(data).shortest_path('S3', 'X2')
+
 
 if __name__ == "__main__":
     unittest.main()

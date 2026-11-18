@@ -2,6 +2,7 @@ import copy
 import unittest
 
 from server.order_sim_map import make_order_sim_map
+from server.order_demo_engine import OrderDemoEngine
 from server.routing import MapGraph
 from server.segments import plan_segment
 
@@ -17,6 +18,21 @@ def unreal_map():
 
 
 class SimMapTest(unittest.TestCase):
+    def test_rejects_robot_navigation_metadata_before_conversion(self):
+        # Conversion drops metadata, so validate the source before converting.
+        variants = [({'schema': 'agv-map-v1'}, {}),
+                    ({}, {'crossing': True, 'through': [['E8', 'E9']]}),
+                    ({}, {'uturn': True}), ({}, {'kind': 'via'})]
+        for map_fields, node_fields in variants:
+            data = unreal_map()
+            data.update(map_fields)
+            data['nodes'][1].update(node_fields)
+            for converter in (make_order_sim_map, OrderDemoEngine):
+                with self.subTest(map_fields=map_fields, node_fields=node_fields,
+                                  converter=converter.__name__):
+                    with self.assertRaisesRegex(ValueError, 'heading|direction'):
+                        converter(data)
+
     def test_converts_nodes_curve_and_version_without_mutating_input(self):
         data = unreal_map()
         original = copy.deepcopy(data)

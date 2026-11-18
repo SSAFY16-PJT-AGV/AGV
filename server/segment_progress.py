@@ -13,7 +13,7 @@ from contextlib import closing, contextmanager
 
 from server.allocation_store import AllocationConflict, InvalidAllocation, _id, _validate_json
 from server.order_publisher import validate_order
-from server.routing import MapGraph
+from server.routing import MapGraph, UnsupportedRobotRoutingError
 from server.segments import plan_segment
 
 
@@ -72,6 +72,13 @@ class SegmentProgress:
         self._map = copy.deepcopy(map_data)
         self._fingerprint = hashlib.sha256(_canonical(self._map)).hexdigest()
         graph = MapGraph(self._map)
+        # A restored allocation can bypass the route search performed during
+        # initial assignment. Never advance it on a map whose vehicle-heading
+        # and turn rules are not supported by the simulation planner.
+        if graph.requires_robot_navigation:
+            raise UnsupportedRobotRoutingError(
+                'robot heading and direction-aware turn constraints are required'
+            )
         if '@' in graph.map_id or graph.map_id != graph.map_id.strip():
             raise ValueError('invalid map id')
         self._map_id = '{}@v{}'.format(graph.map_id, graph.version)

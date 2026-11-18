@@ -8,7 +8,7 @@ Callers must serialize access to each engine instance.
 import math
 import uuid
 
-from server.routing import MapGraph
+from server.routing import MapGraph, UnsupportedRobotRoutingError, requires_robot_navigation
 
 
 SPEED_MM_PER_SECOND = 1000.0
@@ -36,6 +36,12 @@ def _point(item):
 def _convert_map(data):
     if not isinstance(data, dict) or data.get('coordinate_unit') != 'meter':
         raise ValueError('a metre-based Unreal map is required')
+    # Conversion below discards robot-specific fields. Check the original map
+    # before that happens so it cannot bypass the route-planning guard.
+    if requires_robot_navigation(data):
+        raise UnsupportedRobotRoutingError(
+            'robot heading and direction-aware turn constraints are required'
+        )
     nodes = data.get('nodes')
     edges = data.get('edges')
     if not isinstance(nodes, list) or not nodes or not isinstance(edges, list):

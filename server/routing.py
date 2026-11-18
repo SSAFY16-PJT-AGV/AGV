@@ -24,7 +24,32 @@ class NoRouteError(ValueError):
     """The directed graph has no path between the requested nodes."""
 
 
+class UnsupportedRobotRoutingError(InvalidMapError):
+    """A map needs robot heading/turn rules that this planner cannot enforce."""
+
+
 Route = namedtuple("Route", ["nodes", "distance_mm"])
+
+
+def requires_robot_navigation(data):
+    """Recognize source robot maps before any conversion strips constraints.
+
+    This is a conservative denylist, not proof that an unmarked map is safe.
+    Structural map validation remains the responsibility of the caller.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get('schema') == 'agv-map-v1':
+        return True
+    nodes = data.get('nodes')
+    if not isinstance(nodes, list):
+        return False
+    fields = frozenset(('crossing', 'through', 'uturn', 'via_of',
+                        'branches', 'inputs', 'spur'))
+    kinds = frozenset(('patch', 'split', 'merge', 'cross', 'tee', 'spur_end', 'via'))
+    return any(isinstance(node, dict) and (fields.intersection(node)
+               or (isinstance(node.get('kind'), str) and node['kind'] in kinds))
+               for node in nodes)
 
 
 def _number(value):
@@ -118,12 +143,21 @@ class MapGraph:
         self.map_id = map_id
         self.version = version
         self._adjacency = adjacency
+        # Team navigation maps carry route semantics (entry direction,
+        # crossing pairs, U-turns and spurs) that node-only Dijkstra cannot
+        # honor. Keep geometry and reservation-resource inspection available,
+        # but never silently return a purportedly drivable route for them.
+        self.requires_robot_navigation = requires_robot_navigation(data)
 
     def shortest_path(self, start, target):
         if not isinstance(start, str) or not isinstance(target, str):
             raise UnknownNodeError("start and target must be node ids")
         if start not in self._adjacency or target not in self._adjacency:
             raise UnknownNodeError("start or target is not in the map")
+        if self.requires_robot_navigation and start != target:
+            raise UnsupportedRobotRoutingError(
+                "robot heading and direction-aware turn constraints are required"
+            )
         distances = {start: 0.0}
         previous = {}
         counter = itertools.count()
