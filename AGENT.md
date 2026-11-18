@@ -64,7 +64,6 @@ git show origin/docs/project-plan:docs/design.md
 | `D:\관통\AGV-analysis` | 저장소. `git log`와 `server/docs/`에서 커밋 이력·관련 안내를 확인한다. |
 | [서버·통신 브랜치 커밋](https://github.com/SSAFY16-PJT-AGV/AGV/commits/feature/server-communication) · [팀 공유 이슈 #43](https://github.com/SSAFY16-PJT-AGV/AGV/issues/43) · [이전 이슈 #38](https://github.com/SSAFY16-PJT-AGV/AGV/issues/38) | GitHub에 남은 커밋과 팀 공유 기록. |
 | `D:\관통\AGV-analysis\.venv\` | 이 PC에 남은 격리 시험 결과·로그. Git 추적 대상이 아니므로 다른 PC에는 자동으로 제공되지 않는다. |
-| `D:\관통\제출물\` | 이 PC에 보관된 과거 과제 제출물. 저장 당시의 자료이므로 현재 상태와 별도로 확인한다. |
 
 `D:\관통` 경로는 이 PC 기준이다. 다른 PC에서는 저장소를 클론한 위치를
 사용한다. 로컬 시험 로그·데이터베이스·Unreal 빌드와 이 PC의 상위 인계
