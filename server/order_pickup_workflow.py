@@ -13,6 +13,7 @@ from server.allocation_store import _id
 from server.order_publisher import validate_order, _topic
 from server.sim_handoff_store import SimResourceBusy, SimHandoffCoordinatorStore
 from server.segments import plan_segment
+from server.route_occurrence import plan_occurrence_segment
 
 
 class PickupWorkflow:
@@ -69,6 +70,7 @@ class PickupWorkflow:
         self._robot_state = None
         self._expected_seq = 1
         self._segment_start = None
+        self._segment_start_index = 0
         self._waiting = None
         self._next_retry = None
         self._finished_evidence = None
@@ -168,10 +170,19 @@ class PickupWorkflow:
 
     def _prepare_once(self):
         try:
-            allocation = self.runtime.prepare(
-                self.task_id, self._pickup,
-                [{'robot_id': self.ROBOT, 'node': self._segment_start, 'available': True}],
-                copy.deepcopy(self.action_at_end), **self.prepare_options)
+            if getattr(self.runtime, '_field_simulation', False) is True:
+                node, incoming = self.robot.executor.field_stop_direction()
+                if node != self._segment_start:
+                    raise ValueError('field stop direction does not match position')
+                allocation = self.runtime.prepare_field(
+                    self.task_id, self._pickup,
+                    [{'robot_id': self.ROBOT, 'node': node, 'incoming_edge': incoming, 'available': True}],
+                    copy.deepcopy(self.action_at_end), **self.prepare_options)
+            else:
+                allocation = self.runtime.prepare(
+                    self.task_id, self._pickup,
+                    [{'robot_id': self.ROBOT, 'node': self._segment_start, 'available': True}],
+                    copy.deepcopy(self.action_at_end), **self.prepare_options)
         except SimResourceBusy:
             adapter = self.prepare_options.get('handoff_store')
             valid_handoff = (set(self.prepare_options) == {'handoff_store'}
@@ -241,6 +252,8 @@ class PickupWorkflow:
         if result.get('status') != 'advanced' or result.get('next_seq') != self._expected_seq + 1:
             raise ValueError('invalid subsequent simulated progress')
         self._segment_start = waiting['stop']
+        if 'end_index' in waiting:
+            self._segment_start_index = waiting['end_index']
         self._expected_seq += 1
         self._waiting = None
         self._status = 'awaiting_order'
@@ -252,14 +265,21 @@ class PickupWorkflow:
                 or order['seq'] != self._expected_seq):
             raise ValueError('simulated stop not independently confirmed')
         path, stop = order['nodes'], order['released_until']
-        start_index = path.index(self._segment_start)
-        segment = plan_segment(self.map, path[start_index:])
+        field = getattr(self.runtime, '_field_simulation', False) is True
+        start_index = self._segment_start_index if field else path.index(self._segment_start)
+        if path[start_index] != self._segment_start:
+            raise ValueError('simulated visit cursor differs from stop')
+        segment = (plan_occurrence_segment(self.map, path, start_index) if field
+                   else plan_segment(self.map, path[start_index:]))
         if segment.released_until != stop:
             raise ValueError('stop exceeds reserved segment')
-        end_index = path.index(stop)
+        end_index = segment.end_index if field else path.index(stop)
+        if field and state.get('visit_index') != end_index:
+            raise ValueError('simulated stopped visit differs from reservation')
         final = end_index == len(path) - 1
         keep = ({('node', stop)} if final
-                else set(plan_segment(self.map, path[end_index:]).resources))
+                else set((plan_occurrence_segment(self.map, path, end_index) if field
+                          else plan_segment(self.map, path[end_index:])).resources))
         cleared = sorted(set(segment.resources) - keep)
         challenge = self.runtime.begin(self.task_id, self.session)['challenge']
         self.runtime.complete(self.task_id, self.session, challenge, self.ROBOT, self.task_id,
@@ -274,6 +294,8 @@ class PickupWorkflow:
                     'map_id': order['map_id'], 'digest': receipt['digest']}
         self._waiting = {'event_id': event_id, 'stop': stop, 'final': final,
                          'evidence': evidence}
+        if field:
+            self._waiting['end_index'] = end_index
         self._next_retry = self.clock() + .25
         self._status = 'waiting_progress'
         self._reset_deadline()
@@ -323,7 +345,13 @@ class PickupWorkflow:
                     return self.snapshot()
                 if order['seq'] != self._expected_seq:
                     raise ValueError('unexpected simulated order sequence')
-                segment = plan_segment(self.map, order['nodes'][order['nodes'].index(self._segment_start):])
+                if getattr(self.runtime, '_field_simulation', False) is True:
+                    nodes = order['nodes']
+                    if nodes[self._segment_start_index] != self._segment_start:
+                        raise ValueError('simulated visit cursor differs from stop')
+                    segment = plan_occurrence_segment(self.map, nodes, self._segment_start_index)
+                else:
+                    segment = plan_segment(self.map, order['nodes'][order['nodes'].index(self._segment_start):])
                 if order['released_until'] != segment.released_until:
                     raise ValueError('simulated release differs from reservation')
                 if state.get('status') == 'moving':

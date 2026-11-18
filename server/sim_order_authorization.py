@@ -54,6 +54,9 @@ class SimOrderAuthorizer:
                             # Validate all field allocations in this same read
                             # transaction before accepting any robot's order.
                             _verify_field_global(db, field_required=progress._field_required)
+                            verify_fleet = getattr(runtime.store, '_verify_field_fleet', None)
+                            if progress._field_required and callable(verify_fleet):
+                                verify_fleet(db)
                             parsed, canonical, digest = _decode(payload, self.robot_id, progress._map_id)
                             task = parsed['order_id']
                             mapping = runtime._tasks.get(task)

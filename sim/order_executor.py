@@ -294,6 +294,14 @@ class SimOrderExecutor:
                     self._status = 'stopped'
             return self.snapshot()
 
+    def field_stop_direction(self):
+        """Return checked synthetic direction only while the simulator is stopped."""
+        with self._lock:
+            if self._field_map is None or self._status not in ('idle', 'stopped'):
+                raise OrderRejected('field direction requires a stopped field simulation')
+            self._verify_field_execution()
+            return self._current_node, self._field_incoming_edge
+
     def snapshot(self):
         with self._lock:
             result = {'status': self._status, 'current_node': self._current_node,
@@ -307,13 +315,33 @@ class SimOrderExecutor:
                 result['recovered'] = True
             return result
 
-    def _restore_completed(self, order, digest, evidence):
+    def _restore_completed(self, order, digest, evidence, *, field_entry=None, field_history=None):
         """Install already validated historical stop; never execute an order."""
         with self._lock:
             if self._status != 'idle' or self._order is not None or self._receipt is not None:
                 raise OrderRejected('executor is not fresh and idle')
+            self._verify_field_execution()
+            field_route = field_segment_start = None
             if self._field_map is not None:
-                raise OrderRejected('field-map restart restore needs an independently verified direction')
+                from server.route_occurrence import visit_indices_from_orders, plan_occurrence_segment
+                try:
+                    indices = visit_indices_from_orders(field_history)
+                    if field_history[-1] != order or indices[-1] != len(order['nodes']) - 1:
+                        raise ValueError('field completed order history does not reach the final occurrence')
+                    field_route = plan_field_route(self._field_map, map_ref=self._inbox.map_id,
+                                                   incoming_edge=field_entry, goal=order['nodes'][-1])
+                    if field_route.nodes != tuple(order['nodes']) or not field_route.edge_ids:
+                        raise ValueError('field completed path differs from verified route')
+                    start = 0
+                    for index in indices:
+                        if plan_occurrence_segment(self._field_map, order['nodes'], start).end_index != index:
+                            raise ValueError('field completed history skipped a stop occurrence')
+                        start = index
+                    field_segment_start = 0 if len(indices) == 1 else indices[-2]
+                except (ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
+                    raise OrderRejected('field completed route proof is invalid') from exc
+            elif field_entry is not None or field_history is not None:
+                raise OrderRejected('field proof cannot restore a generic simulation')
             node = order['released_until']
             if node != order['nodes'][-1]:
                 raise OrderRejected('only a finished route can be restored')
@@ -325,7 +353,7 @@ class SimOrderExecutor:
             nodes = order.get('nodes')
             if not isinstance(nodes, list) or len(nodes) < 2:
                 raise OrderRejected('finished route geometry is unavailable')
-            if len(set(nodes)) != len(nodes):
+            if self._field_map is None and len(set(nodes)) != len(nodes):
                 raise OrderRejected('repeated route restore requires visit-index proof')
             points = self._shapes.get((nodes[-2], nodes[-1]))
             if not points or len(points) < 2:
@@ -347,9 +375,24 @@ class SimOrderExecutor:
             self._receipt = Receipt(False, order['order_id'], order['seq'], digest, 'completed')
             self._release_index = len(nodes) - 1
             self._visit_index = self._release_index
-            self._segment_start_index = None
+            self._segment_start_index = field_segment_start
+            if field_route is not None:
+                waypoints, visits = [], []
+                for visit, (source, target) in enumerate(zip(nodes[field_segment_start:-1],
+                                                               nodes[field_segment_start + 1:]),
+                                                        field_segment_start + 1):
+                    for index, (x, y) in enumerate(self._shapes[(source, target)][1:], 1):
+                        final = index == len(self._shapes[(source, target)]) - 1
+                        waypoints.append((x, y, target if final else None))
+                        visits.append(visit if final else None)
+                self._waypoints, self._waypoint_visits = tuple(waypoints), tuple(visits)
+                self._next_waypoint = len(waypoints)
+                self._field_order_entry = field_entry
+                self._field_route_edges = field_route.edge_ids
+                self._field_incoming_edge = self._field_guard_incoming = field_route.edge_ids[-1]
             self._recovery_evidence = copy.deepcopy(evidence)
             self._status = 'stopped'
+            self._verify_field_execution()
 
     def matches_recovered(self, evidence):
         """Accept only this executor's validated, still-current historical stop."""

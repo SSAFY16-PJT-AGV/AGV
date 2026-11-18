@@ -81,7 +81,13 @@ class FleetProductControlEngine:
                 if not self._available(state):
                     continue
                 try:
-                    route = self.graph.shortest_path(state['current_node'], pickup)
+                    engine = self.engines[robot_id]
+                    if getattr(getattr(engine, 'runtime', None), '_field_simulation', False) is True:
+                        route = engine._field_route_to(pickup)
+                        if route.nodes[0] != state['current_node']:
+                            raise ValueError('field route does not match observed simulated node')
+                    else:
+                        route = self.graph.shortest_path(state['current_node'], pickup)
                     if len(route.nodes) >= 2:
                         # If a completed robot holds the destination node, it
                         # must depart for the pickup before another can enter.

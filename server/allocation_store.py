@@ -429,6 +429,8 @@ class AllocationStore:
         if not isinstance(expected_payload, str) or not isinstance(allocation, dict):
             raise AllocationConflict('invalid expected allocation or payload')
         with self._write() as db:
+            if self._field_required and callable(getattr(self, '_verify_field_fleet', None)):
+                self._verify_field_fleet(db)
             _verify_field_global(db, field_required=self._field_required)
             row = db.execute(
                 'SELECT t.status,j.robot_id,j.map_id,j.nodes_json,j.released_until,o.payload,o.state '
@@ -476,6 +478,8 @@ class AllocationStore:
             if updated.rowcount != 1:
                 raise AllocationConflict('outbox state changed before transition')
             _verify_field_global(db, field_required=self._field_required)
+            if self._field_required and callable(getattr(self, '_verify_field_fleet', None)):
+                self._verify_field_fleet(db)
 
     def mark_attempted(self, task_id, expected_payload, expected_allocation, expected_resources):
         """Atomically verify intended order and occupancy before marking uncertain."""

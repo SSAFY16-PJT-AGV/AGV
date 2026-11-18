@@ -69,11 +69,12 @@ class _DatabaseOwner:
 class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
-                 field_simulation=False):
+                 field_simulation=False, field_initial_positions=None):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
-        if field_simulation and simulation_store is not None:
-            raise ValueError('field simulation does not support the web handoff store')
+        if field_initial_positions is not None and not field_simulation:
+            raise ValueError('field initial positions require field simulation')
+        self._field_initial_positions = copy.deepcopy(field_initial_positions)
         self._field_simulation = field_simulation
         if host != '127.0.0.1':
             raise ValueError('simulation broker must use explicit IPv4 loopback')
@@ -176,8 +177,15 @@ class SimRuntime:
                     # Repeat after the process-wide lock: a validated file may
                     # have been replaced or modified while ownership was pending.
                     self.store.validate_bound(self.path, check_schema=True)
+                    if self._field_simulation:
+                        self.store.bind_field_robots(tuple(self._sessions), self._field_initial_positions)
+                        self.store._field_required = True
+                        with closing(self.store._connect()) as db:
+                            db.execute('BEGIN')
+                            self.store._verify_field_fleet(db)
                 if self._simulation_store is not None and self.store.reopened:
-                    expected = SegmentProgress(self.store, self.map_data, simulation_enabled=True)
+                    expected = SegmentProgress(self.store, self.map_data, simulation_enabled=True,
+                                               field_simulation=self._field_simulation)
                     with closing(sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
                         tasks = {row[0] for row in db.execute('SELECT task_id FROM tasks')}
                         jobs = db.execute('SELECT task_id,robot_id,map_id FROM allocation_jobs').fetchall()
@@ -331,6 +339,10 @@ class SimRuntime:
                 raise ValueError('a fresh idle simulation executor is required')
             with self.gate.transaction() as db:
                 self.progress._check_database(db)
+                if self._field_simulation:
+                    from server.allocation_store import _verify_field_global
+                    self.store._verify_field_fleet(db)
+                    _verify_field_global(db, field_required=True)
                 robot_id, route, stopped = self.progress._job(db, task_id, robot)
                 seq, payload, state, order = self.progress._latest(db, task_id, robot_id, route, stopped)
                 parsed, canonical, digest = _decode(payload.encode('utf-8'), robot, self.progress._map_id)
@@ -372,7 +384,21 @@ class SimRuntime:
                 evidence = {'task_id': task_id, 'session': session, 'robot_id': robot, 'seq': seq,
                             'stopped_at': stopped, 'event_id': event_id,
                             'map_id': self.progress._map_id, 'digest': digest}
-                executor._restore_completed(order, digest, evidence)
+                options = {}
+                if self._field_simulation:
+                    canonical_map = json.dumps(self.map_data, sort_keys=True, ensure_ascii=True,
+                                               allow_nan=False, separators=(',', ':'))
+                    if executor._field_map_canonical != canonical_map:
+                        raise ValueError('executor field map differs from the saved simulation map')
+                    provenance = db.execute('SELECT incoming_edge FROM field_route_provenance WHERE task_id=?',
+                                            (task_id,)).fetchone()
+                    history = db.execute('SELECT payload FROM progress_orders WHERE task_id=? ORDER BY seq',
+                                         (task_id,)).fetchall()
+                    if provenance is None or not history:
+                        raise ValueError('field route provenance or visit history is missing')
+                    options = {'field_entry': provenance[0],
+                               'field_history': [json.loads(row[0]) for row in history]}
+                executor._restore_completed(order, digest, evidence, **options)
                 return copy.deepcopy(evidence)
 
     def reconcile_moving(self, robot_id, task_id, session, robot, checkpoint):
@@ -552,7 +578,7 @@ class SimRuntime:
             self._prepared[task_id] = (coordinator, client, generation)
             return result
 
-    def prepare_field(self, task_id, destination, candidates, action):
+    def prepare_field(self, task_id, destination, candidates, action, *, handoff_store=None):
         """Prepare a team-map order in the explicitly enabled simulation only."""
         with self._lock:
             self._ready()
@@ -561,6 +587,16 @@ class SimRuntime:
             robot, _session = self._tasks.get(task_id, (None, None))
             if robot is None or not isinstance(candidates, list) or not candidates:
                 raise ValueError('mapped task and candidates required')
+            if handoff_store is not None:
+                from server.sim_handoff_store import SimHandoffCoordinatorStore
+                if (type(handoff_store) is not SimHandoffCoordinatorStore
+                        or self._simulation_store is None or self.store is not self._simulation_store
+                        or handoff_store._store is not self.store or handoff_store._target != task_id
+                        or handoff_store._robot != robot or handoff_store._context['gate'] is not self.gate
+                        or handoff_store._context['progress'] is not self.progress
+                        or handoff_store._context['receiver'] is not self.receiver):
+                    raise ValueError('handoff store does not match this simulation task and runtime')
+                self._simulation_store.validate_bound(self.path)
             checked = []
             for item in candidates:
                 if (not isinstance(item, dict)
@@ -571,7 +607,7 @@ class SimRuntime:
                                               item['incoming_edge'], item['available']))
             client, publisher = self._connect_publisher()
             try:
-                coordinator = Coordinator(self.store, self.map_data, publisher,
+                coordinator = Coordinator(handoff_store or self.store, self.map_data, publisher,
                                           ack_timeout=self.ack_timeout, field_simulation=True)
                 with self.receiver._dispatch_lock, self.gate.serialized():
                     self._ready()

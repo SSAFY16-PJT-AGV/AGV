@@ -114,7 +114,12 @@ class SegmentProgress:
             raise RuntimeError('simulation progress is disabled or not reconciled')
         with self._gate.transaction() as db:
             self._check_database(db)
+            verify_fleet = getattr(self.store, '_verify_field_fleet', None)
+            if self._field_required and callable(verify_fleet):
+                verify_fleet(db)
             yield db
+            if self._field_required and callable(verify_fleet):
+                verify_fleet(db)
 
     def _check_database(self, db):
         if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
@@ -408,6 +413,9 @@ class SegmentProgress:
             raise ValueError('invalid order transition')
         expected = set(copy.deepcopy(expected_resources))
         self._check_database(db)
+        verify_fleet = getattr(self.store, '_verify_field_fleet', None)
+        if self._field_required and callable(verify_fleet):
+            verify_fleet(db)
         _verify_field_global(db, field_required=self._field_required)
         robot, path, stop = self._job(db, task_id)
         current_seq, payload, state, order = self._latest(db, task_id, robot, path, stop)

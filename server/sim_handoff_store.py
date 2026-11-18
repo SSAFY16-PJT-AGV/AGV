@@ -16,9 +16,13 @@ import sqlite3
 import threading
 from contextlib import closing
 
-from server.allocation_store import AllocationStore, AllocationConflict, InvalidAllocation, _fingerprint, _id, _input
+from server.allocation_store import (AllocationStore, AllocationConflict, InvalidAllocation, _fingerprint,
+                                     _id, _input, _field_route, _verify_field_global)
 from server.order_publisher import _topic, validate_order
 from server.segments import plan_segment
+from server.route_occurrence import plan_occurrence_segment
+from server.field_robot_contract import validate_field_robot_order
+from server.field_map_planner import plan_field_route
 from server.segment_progress import _resources
 from sim.event_inbox import _event
 from sim.event_receiver import SimEventReceiver
@@ -63,6 +67,8 @@ class SimHandoffStore(AllocationStore):
         os.close(descriptor)
         store = cls(name, _key=_CONSTRUCTION_KEY)
         store._idle_enabled = idle_positions is not None
+        store._field_expected_robots = frozenset(idle_positions) if idle_positions is not None else None
+        store._field_initial_positions = copy.deepcopy(idle_positions)
         store._reopened = False
         store._created_path = os.path.normcase(os.path.realpath(name))
         store._creation_id = secrets.token_hex(32)
@@ -145,12 +151,64 @@ class SimHandoffStore(AllocationStore):
             raise ValueError('existing simulation database unavailable') from exc
         store = cls(name, _key=_CONSTRUCTION_KEY)
         store._idle_enabled = expected_idle_enabled
+        store._field_expected_robots = None
+        store._field_initial_positions = None
         store._reopened = True
         store._created_path = os.path.normcase(os.path.realpath(name))
         store._creation_id = expected_creation_id
         store._creation_file = (stat.st_dev, stat.st_ino)
         store.validate_bound(name, check_schema=True)
         return store
+
+    def bind_field_robots(self, robot_ids, initial_positions=None):
+        """Bind the expected isolated fleet from configuration, never from DB rows."""
+        if not self._idle_enabled or not isinstance(robot_ids, (set, frozenset, tuple, list)) or not robot_ids:
+            raise ValueError('field simulation requires an explicit idle fleet')
+        expected = frozenset(robot_ids)
+        if len(expected) != len(robot_ids):
+            raise ValueError('field simulation robot identities must be unique')
+        for robot in expected:
+            _topic(robot)
+            if not robot.startswith('sim-') or not robot[4:].strip():
+                raise ValueError('field fleet is restricted to simulated robots')
+        if self._field_expected_robots is not None and self._field_expected_robots != expected:
+            raise ValueError('field simulation fleet differs from its creation configuration')
+        if initial_positions is not None:
+            if not isinstance(initial_positions, dict) or set(initial_positions) != expected:
+                raise ValueError('field simulation start positions differ from configured fleet')
+            for node in initial_positions.values():
+                _id(node, 'field initial node')
+            if len(set(initial_positions.values())) != len(initial_positions):
+                raise ValueError('field initial nodes must be distinct')
+            if (self._field_initial_positions is not None
+                    and self._field_initial_positions != initial_positions):
+                raise ValueError('field simulation start positions differ from creation configuration')
+            self._field_initial_positions = copy.deepcopy(initial_positions)
+        if self._field_initial_positions is None:
+            raise ValueError('field restart requires independently configured initial positions')
+        self._field_expected_robots = expected
+
+    def _verify_field_fleet(self, db):
+        """Require every configured virtual AGV to be idle XOR active."""
+        expected = self._field_expected_robots
+        if not self._idle_enabled or not expected:
+            raise AllocationConflict('configured field fleet is unavailable')
+        idle = db.execute('SELECT robot_id,node FROM sim_idle_robots').fetchall()
+        active = db.execute('SELECT a.robot_id,a.task_id,j.robot_id,t.status '
+                            'FROM sim_active_robots a LEFT JOIN allocation_jobs j ON j.task_id=a.task_id '
+                            'LEFT JOIN tasks t ON t.task_id=a.task_id').fetchall()
+        idle_ids = {row[0] for row in idle}
+        active_ids = {row[0] for row in active}
+        idle_nodes = {row[1] for row in idle}
+        active_nodes = {row[0] for row in db.execute(
+            "SELECT resource_id FROM allocation_occupancy WHERE kind='node'").fetchall()}
+        if (len(idle_ids) != len(idle) or len(active_ids) != len(active) or idle_ids & active_ids
+                or idle_ids | active_ids != expected
+                or idle_nodes & active_nodes
+                or self._field_initial_positions is None
+                or any(self._field_initial_positions.get(robot) != node for robot, node in idle)
+                or any(robot != job_robot or status != 'ASSIGNED' for robot, _task, job_robot, status in active)):
+            raise AllocationConflict('configured field robot ownership is inconsistent')
 
     def validate_bound(self, path, *, check_schema=False):
         """Fail closed if the exclusively created simulation DB was replaced."""
@@ -191,15 +249,32 @@ class SimHandoffStore(AllocationStore):
         except (OSError, sqlite3.Error) as exc:
             raise ValueError('fresh simulation database is unavailable') from exc
 
-    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint):
+    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint,
+                 release_index=None, field_context=None):
         _topic(robot_id)
         if self._idle_enabled:
             self.validate_bound(self.path)
             _fingerprint(map_fingerprint)
             nodes, resources, action_at_end = copy.deepcopy((nodes, resources, action_at_end))
-            checked, payload = _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end)
+            checked, payload = _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end,
+                                      release_index=release_index)
+            if self._field_required and field_context is None:
+                raise AllocationConflict('field route provenance is required')
+            field_json = None
+            if field_context is not None:
+                field_context = copy.deepcopy(field_context)
+                field_json = _field_route(field_context, map_id, nodes, map_fingerprint)
+                validate_field_robot_order(json.loads(payload))
+                self._field_required = True
+                segment = plan_occurrence_segment(field_context['map_data'], nodes, 0)
+                if (segment.released_until != released_until or set(segment.resources) != checked
+                        or (release_index is not None and release_index != segment.end_index)):
+                    raise InvalidAllocation('field first segment differs from route')
             try:
                 with self._write() as db:
+                    if field_json is not None or self._field_required:
+                        self._verify_field_fleet(db)
+                    _verify_field_global(db, field_required=self._field_required)
                     if db.execute('SELECT status FROM tasks WHERE task_id=?', (task_id,)).fetchone() != ('PENDING',):
                         raise AllocationConflict('task is missing or not pending')
                     idle = db.execute('SELECT node FROM sim_idle_robots WHERE robot_id=?', (robot_id,)).fetchone()
@@ -213,6 +288,14 @@ class SimHandoffStore(AllocationStore):
                         db.execute('INSERT INTO allocation_meta(key,value) VALUES (?,?)', ('map_fingerprint', map_fingerprint))
                     elif active != (map_id,) or fingerprint != (map_fingerprint,):
                         raise AllocationConflict('map or fingerprint differs from the persistent active map')
+                    mode = db.execute("SELECT value FROM allocation_meta WHERE key='field_route_mode'").fetchone()
+                    if field_json is not None:
+                        if mode is None and not has_jobs:
+                            db.execute("INSERT INTO allocation_meta VALUES ('field_route_mode','required')")
+                        elif mode != ('required',):
+                            raise AllocationConflict('cannot mix field and legacy route provenance')
+                    elif mode is not None:
+                        raise AllocationConflict('field route provenance is required')
                     if db.execute('SELECT 1 FROM sim_active_robots WHERE robot_id=?', (robot_id,)).fetchone():
                         raise AllocationConflict('robot is already active')
                     self._check_resource_availability(db, checked, ignore_idle_robot=robot_id)
@@ -221,15 +304,24 @@ class SimHandoffStore(AllocationStore):
                         raise AllocationConflict('idle ownership changed')
                     db.execute('INSERT INTO allocation_jobs VALUES (?,?,?,?,?)',
                                (task_id, robot_id, map_id, json.dumps(nodes, ensure_ascii=False), released_until))
+                    if release_index is not None:
+                        db.execute('INSERT INTO occurrence_allocations VALUES (?,?)', (task_id, release_index))
+                    if field_json is not None:
+                        db.execute('INSERT INTO field_route_provenance VALUES (?,?,?,?)',
+                                   (task_id, field_json, field_context['incoming_edge'], field_context['goal']))
                     db.executemany('INSERT INTO allocation_occupancy VALUES (?,?,?)',
                                    [(kind, key, task_id) for kind, key in sorted(checked)])
                     db.execute('INSERT INTO allocation_outbox VALUES (?,?,?)', (task_id, payload, 'pending'))
                     db.execute("UPDATE tasks SET status='ASSIGNED' WHERE task_id=?", (task_id,))
+                    _verify_field_global(db, field_required=self._field_required)
+                    if field_json is not None or self._field_required:
+                        self._verify_field_fleet(db)
             except sqlite3.IntegrityError as exc:
                 raise AllocationConflict('robot or resource already allocated') from exc
             return self.get_allocation(task_id)
         return super().allocate(task_id, robot_id, map_id, nodes, released_until, resources,
-                                action_at_end, map_fingerprint=map_fingerprint)
+                                action_at_end, map_fingerprint=map_fingerprint,
+                                release_index=release_index, field_context=field_context)
 
     def _check_resource_availability(self, db, resources, *, ignore_task=None, ignore_idle_robot=None):
         """Check under the caller's write transaction; only known occupancy is retryable."""
@@ -257,7 +349,8 @@ class SimHandoffStore(AllocationStore):
     def handoff_allocate(self, *, task_id, robot_id, map_id, nodes, released_until,
                          resources, action_at_end, map_fingerprint, source_task_id,
                          robot_session, seq, stopped_at, event_id, action_ack,
-                         expected_twin_id, gate, progress, receiver, simulation_enabled=False):
+                         expected_twin_id, gate, progress, receiver, simulation_enabled=False,
+                         release_index=None, field_context=None):
         """Atomically transfer the source stop into an entirely reserved new leg.
 
         action_ack is a caller-verified Unreal simulation acknowledgement. This
@@ -276,8 +369,16 @@ class SimHandoffStore(AllocationStore):
         _topic(robot_id)
         _fingerprint(map_fingerprint)
         nodes, resources, action_at_end, action_ack = copy.deepcopy((nodes, resources, action_at_end, action_ack))
-        checked, payload = _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end)
+        checked, payload = _input(task_id, robot_id, map_id, nodes, released_until, resources, action_at_end,
+                                  release_index=release_index)
         validate_order(robot_id, json.loads(payload))
+        field_json = None
+        if field_context is not None:
+            field_context = copy.deepcopy(field_context)
+            field_json = _field_route(field_context, map_id, nodes, map_fingerprint)
+            validate_field_robot_order(json.loads(payload))
+        if progress._field_required != (field_context is not None):
+            raise ValueError('handoff and progress field modes differ')
         ack_keys = {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
         if (not isinstance(action_ack, dict) or set(action_ack) != ack_keys
                 or action_ack['order_id'] != source_task_id or action_ack['agv_id'] != expected_twin_id
@@ -294,17 +395,32 @@ class SimHandoffStore(AllocationStore):
                 or receiver.robot_sessions.get(robot_id, {}).get(source_task_id) != robot_session
                 or receiver.robot_sessions.get(robot_id, {}).get(task_id) != robot_session):
             raise ValueError('receiver must bind both legs to the same simulated robot session')
-        segment = plan_segment(progress._map, nodes)
-        if segment.released_until != released_until or set(segment.resources) != checked or nodes[0] != stopped_at:
+        segment = (plan_occurrence_segment(progress._map, nodes, 0) if field_json is not None
+                   else plan_segment(progress._map, nodes))
+        if (segment.released_until != released_until or set(segment.resources) != checked or nodes[0] != stopped_at
+                or (release_index is not None and release_index != segment.end_index)):
             raise ValueError('target leg must reserve its exact first segment from the stopped node')
         try:
             with receiver._dispatch_lock, gate.transaction() as db:
                 if not receiver.ready:
                     raise RuntimeError('simulation receiver is not ready')
                 progress._check_database(db)
+                if progress._field_required:
+                    self._verify_field_fleet(db)
+                _verify_field_global(db, field_required=progress._field_required)
                 gate.require_reconciled(db, source_task_id, robot_session,
                                         expected_seq=seq, expected_stopped_at=stopped_at)
                 prior_robot, prior_path, prior_stop = progress._job(db, source_task_id, robot_id)
+                if field_context is not None:
+                    row = db.execute('SELECT incoming_edge FROM field_route_provenance WHERE task_id=?',
+                                     (source_task_id,)).fetchone()
+                    if row is None:
+                        raise AllocationConflict('source direction provenance is missing')
+                    source_route = plan_field_route(progress._map, map_ref=map_id,
+                                                    incoming_edge=row[0], goal=prior_path[-1])
+                    if (tuple(prior_path) != source_route.nodes or not source_route.edge_ids
+                            or field_context['incoming_edge'] != source_route.edge_ids[-1]):
+                        raise AllocationConflict('handoff incoming direction differs from finished route')
                 latest_seq, _prior_payload, prior_state, _order = progress._latest(
                     db, source_task_id, prior_robot, prior_path, prior_stop)
                 if (prior_robot != robot_id or prior_stop != stopped_at or prior_path[-1] != stopped_at
@@ -328,7 +444,7 @@ class SimHandoffStore(AllocationStore):
                     raise AllocationConflict('applied final event not found')
                 event, canonical, digest = _event(row[0].encode('ascii'))
                 result = json.loads(row[6]) if row[6] else None
-                expected_cleared = set(progress._segment(prior_path, stopped_at).resources) - {('node', stopped_at)}
+                expected_cleared = set(progress._segment_for_task(db, source_task_id, prior_path, stopped_at).resources) - {('node', stopped_at)}
                 if (canonical != row[0] or digest != row[1] or digest != row[7]
                         or row[2:6] != (robot_session, source_task_id, seq, 'applied')
                         or row[8:12] != (source_task_id, seq, None, 'finished')
@@ -351,6 +467,11 @@ class SimHandoffStore(AllocationStore):
                     raise AllocationConflict('active ownership changed')
                 db.execute('INSERT INTO allocation_jobs VALUES (?,?,?,?,?)',
                            (task_id, robot_id, map_id, json.dumps(nodes, ensure_ascii=False), released_until))
+                if release_index is not None:
+                    db.execute('INSERT INTO occurrence_allocations VALUES (?,?)', (task_id, release_index))
+                if field_json is not None:
+                    db.execute('INSERT INTO field_route_provenance VALUES (?,?,?,?)',
+                               (task_id, field_json, field_context['incoming_edge'], field_context['goal']))
                 if db.execute("UPDATE allocation_occupancy SET task_id=? WHERE task_id=? AND kind='node' AND resource_id=?",
                               (task_id, source_task_id, stopped_at)).rowcount != 1:
                     raise AllocationConflict('source stopped node changed')
@@ -362,6 +483,9 @@ class SimHandoffStore(AllocationStore):
                 if db.execute("UPDATE tasks SET status='DONE' WHERE task_id=? AND status='ASSIGNED'", (source_task_id,)).rowcount != 1:
                     raise AllocationConflict('source task changed')
                 db.execute("UPDATE recovery_challenges SET status='revoked' WHERE task_id=?", (source_task_id,))
+                _verify_field_global(db, field_required=progress._field_required)
+                if progress._field_required:
+                    self._verify_field_fleet(db)
         except sqlite3.IntegrityError as exc:
             raise AllocationConflict('robot, action or segment is already allocated') from exc
         return self.get_allocation(task_id)
@@ -389,7 +513,8 @@ class SimHandoffCoordinatorStore:
         self._lock = threading.Lock()
         self._used = False
 
-    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint):
+    def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint,
+                 release_index=None, field_context=None):
         with self._lock:
             if self._used:
                 raise AllocationConflict('simulation handoff adapter has already been used')
@@ -399,7 +524,8 @@ class SimHandoffCoordinatorStore:
         try:
             return self._store.handoff_allocate(task_id=task_id, robot_id=robot_id, map_id=map_id,
                         nodes=nodes, released_until=released_until, resources=resources,
-                        action_at_end=action_at_end, map_fingerprint=map_fingerprint, **self._context)
+                        action_at_end=action_at_end, map_fingerprint=map_fingerprint,
+                        release_index=release_index, field_context=field_context, **self._context)
         except SimResourceBusy:
             # This exception is raised inside the write transaction before
             # mutation and only after ownership and proof checks. Its rollback

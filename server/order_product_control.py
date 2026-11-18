@@ -11,6 +11,7 @@ import uuid
 from server.order_pickup_workflow import PickupWorkflow
 from server.allocation_store import _id
 from server.routing import MapGraph
+from server.field_map_planner import plan_field_route
 from server.sim_handoff_store import SimHandoffCoordinatorStore
 
 
@@ -178,6 +179,26 @@ class ProductControlEngine:
     def create_order(self, pickup_node, destination_node):
         raise RuntimeError('direct node orders are not supported in reservation mode')
 
+    def _field_route_to(self, node):
+        current, incoming = self.robot.executor.field_stop_direction()
+        route = plan_field_route(self.map, map_ref='{}@v{}'.format(self.graph.map_id, self.graph.version),
+                                 incoming_edge=incoming, goal=node)
+        if route.nodes[0] != current:
+            raise ValueError('field direction differs from simulated current node')
+        return route
+
+    def _plan_product_legs(self, current, pickup, destination):
+        if getattr(self.runtime, '_field_simulation', False) is True:
+            first = self._field_route_to(pickup)
+            if first.nodes[0] != current or not first.edge_ids:
+                raise ValueError('field pickup route must start at a verified stop')
+            second = plan_field_route(self.map, map_ref='{}@v{}'.format(self.graph.map_id, self.graph.version),
+                                      incoming_edge=first.edge_ids[-1], goal=destination)
+            if not second.nodes or second.nodes[0] != pickup:
+                raise ValueError('field delivery direction differs from pickup')
+            return first, second
+        return self.graph.shortest_path(current, pickup), self.graph.shortest_path(pickup, destination)
+
     def create_product_order(self, product_type, pickup, destination, shelf, slot):
         with self.lock:
             if self._status not in ('idle', 'completed') or self._cycle >= self.MAX_ORDERS:
@@ -212,13 +233,12 @@ class ProductControlEngine:
                     self._mark_unknown()
                     raise RuntimeError('previous simulated stop cannot be confirmed') from None
             try:
-                first = self.graph.shortest_path(state['current_node'], pickup).nodes
-                second = self.graph.shortest_path(pickup, destination).nodes
-                if len(first) < 2 or len(second) < 2:
+                first, second = self._plan_product_legs(state['current_node'], pickup, destination)
+                if len(first.nodes) < 2 or len(second.nodes) < 2:
                     raise ValueError('each simulated leg must contain an edge')
             except ValueError:
                 raise
-            self._route = list(first) + list(second[1:])
+            self._route = list(first.nodes) + list(second.nodes[1:])
             self._cycle += 1
             prefix = self.task_prefix if self._cycle == 1 else '{}-{}'.format(self.task_prefix, self._cycle)
             self._pickup_task = '{}-pickup'.format(prefix)
