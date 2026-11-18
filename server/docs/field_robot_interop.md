@@ -126,6 +126,9 @@ DB에 순번을 저장하거나 물리적 이탈을 확인하지 않는다. 현�
 호출자가 제공한 값으로 로봇 인증, 현재 위치, 주문 수신이나 정지의 증거가
 아니다. 기존 주문·예약 DB나 MQTT 발행과 한 트랜잭션으로 묶여 있지 않으므로
 이를 서버 재시작 후 자동 주행 또는 기존 구간 점유 복구에 사용하면 안 된다.
+방문 순번·점유·후속 주문을 한 DB 트랜잭션에서 다루는 별도 실험은
+[반복 방문 구간 SQLite 시험](occurrence_allocation_lab.md)을 참고한다. 이 역시
+기존 워크플로에 연결되지 않으며 실제 AGV 운행에 사용할 수 없다.
 
 ```powershell
 .\.venv\Scripts\python -m unittest server.tests.test_occurrence_journal server.tests.test_occurrence_journal_faults -v
