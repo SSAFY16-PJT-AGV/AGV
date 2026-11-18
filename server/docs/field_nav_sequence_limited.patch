@@ -1,5 +1,5 @@
 diff --git a/agv/nav/navigator.py b/agv/nav/navigator.py
-index 05e1abc..53e801e 100644
+index 05e1abc..8e7a2d1 100644
 --- a/agv/nav/navigator.py
 +++ b/agv/nav/navigator.py
 @@ -87,6 +87,8 @@ class Navigator(object):
@@ -217,7 +217,7 @@ index 05e1abc..53e801e 100644
                  for f in nexts:
                      if f in self.m.edges and not self.m.edges[f]["spur"]:
                          stack.append((f, L2, c + SKIP_COST[k], dep + step))
-@@ -488,6 +626,13 @@ class Navigator(object):
+@@ -488,9 +626,18 @@ class Navigator(object):
          want = NODE_OF_EVENT[kind]
          cands = []
          for h in self.hyps:
@@ -229,9 +229,16 @@ index 05e1abc..53e801e 100644
 +                        cands.append(h._replace(s0=odo))
 +                continue
              if kind in SPURIOUS_COST:
-                 c = 0.0 if self._absorbed(h, kind, odo) else SPURIOUS_COST[kind]
-                 cands.append(h._replace(cost=h.cost + c))
-@@ -501,13 +646,48 @@ class Navigator(object):
+-                c = 0.0 if self._absorbed(h, kind, odo) else SPURIOUS_COST[kind]
+-                cands.append(h._replace(cost=h.cost + c))
++                absorbed = self._absorbed(h, kind, odo)
++                if absorbed or not self._strict_repeat:
++                    c = 0.0 if absorbed else SPURIOUS_COST[kind]
++                    cands.append(h._replace(cost=h.cost + c))
+             d = None if h.s0 is None else odo - h.s0
+             for e, node, L, sc in self._walk(h):
+                 n = self.m.nodes[node]
+@@ -501,13 +648,48 @@ class Navigator(object):
                      succ = [br[side]] if side in br else []
                  else:
                      succ = self.m.next_edges(e)
@@ -280,7 +287,7 @@ index 05e1abc..53e801e 100644
              if kind == "patch" and color in self.m.by_color:
                  p = self.m.by_color[color]
                  self.hyps = [Hyp(f, odo, 0.0, p) for f in self.m.out[p]]    # 방향도 모름
-@@ -534,6 +714,8 @@ class Navigator(object):
+@@ -534,6 +716,8 @@ class Navigator(object):
      def on_patch_early(self, color, pos):
          """runner가 교차 판정 때문에 패치 기록을 보류할 때 부른다. 목표 패치면 정지 위치만 먼저 정한다.
          패치 색은 맵에 하나씩이라 색만으로 목표인지 안다. 스퍼 끝 목표면 그 부모 패치에서 무장한다."""
@@ -289,7 +296,7 @@ index 05e1abc..53e801e 100644
          par = self._approach(self.target)
          if par is not None and par != self.target and self.spur is None \
                  and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color \
-@@ -564,8 +746,16 @@ class Navigator(object):
+@@ -564,8 +748,16 @@ class Navigator(object):
          best = self._best()
          par = self._approach(self.target)
          just = best and all(h.s0 == odo for h in best) and len(set(h.last for h in best)) == 1
@@ -306,7 +313,7 @@ index 05e1abc..53e801e 100644
          if self._via_stop():
              return
          if par != self.target:
-@@ -620,12 +810,24 @@ class Navigator(object):
+@@ -620,12 +812,24 @@ class Navigator(object):
  
      def on_dead_end(self, side, odo):
          """고른 갈림길이 사실은 스퍼였다: 갈림길 직전 가설로 돌아간다(되돌아 나와 원래 선을 탄다)."""
@@ -331,7 +338,7 @@ index 05e1abc..53e801e 100644
          self.hyps = self._unknown()
  
      def known_dead(self):
-@@ -635,5 +837,24 @@ class Navigator(object):
+@@ -635,5 +839,24 @@ class Navigator(object):
      def choose_split(self, odo):
          """갈림길(또는 V자)을 앞에서 봤을 때 갈 쪽. 목표 갈림길 앞에서 대기해야 하면 None."""
 +        if self._strict_repeat and self._sequence_resume_split:
@@ -356,7 +363,7 @@ index 05e1abc..53e801e 100644
          sp = self.spur
          if sp is not None and sp["state"] == "armed" and odo - sp["pos"] < SPUR_WINDOW_MM:
              self._enter_spur("split", odo)          # 스퍼가 갈림길로 보임: 스퍼 쪽으로
-@@ -659,9 +880,48 @@ class Navigator(object):
+@@ -659,9 +882,48 @@ class Navigator(object):
                      interps.append((h.cost + sc, "spur", self.m.spur_side_at(node, ed), None))
          if not interps:
              self._note("nav_split_unknown")
@@ -405,7 +412,7 @@ index 05e1abc..53e801e 100644
          if self.target is not None and all(i[1] == "split" and i[2] == self.target for i in best):
              self._note("nav_hold_before_split", node=self.target)
              self._request_stop(None, self.target)
-@@ -674,6 +934,13 @@ class Navigator(object):
+@@ -674,6 +936,13 @@ class Navigator(object):
                  v[a] = SPUR_PENALTY
              else:
                  br = self.m.branches_seen(a, self.m.dir(_e))
@@ -420,7 +427,7 @@ index 05e1abc..53e801e 100644
                  for s in ("left", "right"):
                      f = br.get(s)
 diff --git a/agv/link/controller.py b/agv/link/controller.py
-index 3a11e31..e1b6e52 100644
+index 3a11e31..818ac86 100644
 --- a/agv/link/controller.py
 +++ b/agv/link/controller.py
 @@ -74,8 +74,15 @@ class LinkController(object):
@@ -508,8 +515,17 @@ index 3a11e31..e1b6e52 100644
          final = b.at_final_release
          if final:
              b.mark_finished()
-@@ -196,7 +233,7 @@ class LinkController(object):
+@@ -194,9 +231,16 @@ class LinkController(object):
              return
+         if self.error != "link_lost":
+             return
++        if getattr(self.nav, "_strict_repeat", False):
++            # Keep the disconnect latched even if the link returns during a
++            # pivot/reverse/park action that cannot stop immediately. As soon
++            # as the runner can hold, stop it and require manual recovery.
++            if r.state != "hold" and r.hold("link_lost"):
++                self._note("link_lost_hold")
++            return
          if r.state == "hold" and r.hold_reason == "link_lost":
              # 구간 가운데에 섰음: 남은 구간을 이어 갈지는 재동기화 규약이 정할 일(기본: 그대로 섬)
 -            if self.resume_after_reconnect:

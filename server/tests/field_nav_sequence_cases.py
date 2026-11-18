@@ -86,6 +86,14 @@ class SequenceTests(unittest.TestCase):
   resumes=runner.resumes; ctl._handle(payload); self.assertEqual(runner.resumes,resumes)
   nav.on_gap(); stop=nav.pop_stop(); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
   self.assertIsNone(nav.at_node)
+ def test_unexpected_cross_or_tee_in_repeat_segment_stops(self):
+  for event in ("cross","tee"):
+   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+   nav.on_patch("orange",0); nav.pop_stop()
+   getattr(nav,"on_"+event)(50); stop=nav.pop_stop()
+   self.assertIsNotNone(stop,event)
+   self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+   self.assertEqual(nav._route_pos,0); self.assertIsNone(nav.at_node)
  def test_wrong_branch_after_uturn_stops_without_skipping_visit(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
   self.assertIsNone(ctl.rejected)
@@ -187,6 +195,21 @@ class SequenceTests(unittest.TestCase):
   ctl.resume_after_reconnect=True; ctl.error="link_lost"; runner.state="hold"; runner.hold_reason="link_lost"
   resumes=runner.resumes; ctl._watch_link(100)
   self.assertEqual(ctl.error,"link_lost"); self.assertEqual(runner.resumes,resumes)
+ def test_link_loss_during_pivot_remains_latched_after_reconnect(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+  self.assertIsNone(ctl.rejected); runner.state="pivot"
+  def hold_when_possible(reason):
+   if runner.state!="follow": return False
+   runner.state="hold"; runner.hold_reason=reason
+   return True
+  runner.hold=hold_when_possible
+  link.connected=False; link.disconnected_at=100; ctl._watch_link(110)
+  self.assertEqual(ctl.error,"link_lost"); self.assertEqual(runner.state,"pivot")
+  link.connected=True; ctl._watch_link(111)
+  self.assertEqual(ctl.error,"link_lost")
+  runner.state="follow"; ctl._watch_link(112)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","link_lost"))
+  ctl._watch_link(113); self.assertEqual(ctl.error,"link_lost")
  def test_unexpected_dead_end_stops_repeat_sequence(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
   nav.on_dead_end("left",100); stop=nav.pop_stop()
