@@ -4,8 +4,10 @@ This is an unapproved proposal, not physical robot authorization. Neither the
 Bearer token nor a loopback address proves robot identity or physical state.
 """
 import hmac
+import json
+import re
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, Security
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -71,6 +73,37 @@ def _invoke(runtime, method, *args):
         raise HTTPException(status_code=503, detail="simulation unavailable") from None
 
 
+async def _investigation_body(request: Request):
+    """Bound and strictly decode category-only JSON, without retaining input."""
+    data = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 512:
+                raise HTTPException(status_code=413, detail="simulation request too large")
+            data.extend(chunk)
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError('duplicate key')
+                result[key] = value
+            return result
+        def invalid_constant(_value):
+            raise ValueError('invalid JSON constant')
+        body = json.loads(data.decode('utf-8'), object_pairs_hook=pairs, parse_constant=invalid_constant)
+        if (not isinstance(body, dict) or set(body) != {'request_id', 'category'}
+                or not isinstance(body['request_id'], str)
+                or re.fullmatch('[0-9a-f]{32}', body['request_id']) is None
+                or not isinstance(body['category'], str)
+                or body['category'] not in ('position', 'connection', 'action', 'other')):
+            raise ValueError('invalid input')
+        return body['request_id'], body['category']
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid simulation request") from None
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -134,6 +167,17 @@ def task_status(task_id: str, runtime=Depends(_runtime)):
 @router.get("/tasks/{task_id}/diagnostics")
 def task_diagnostics(task_id: str, runtime=Depends(_runtime)):
     return _invoke(runtime, "task_diagnostics", task_id)
+
+
+@router.post("/tasks/{task_id}/investigation-notes")
+def record_investigation_note(task_id: str, runtime=Depends(_runtime), body=Depends(_investigation_body)):
+    return _invoke(runtime, "record_investigation_note", task_id, body[0], body[1])
+
+
+@router.get("/tasks/{task_id}/investigation-notes")
+def list_investigation_notes(task_id: str, after_id: int = Query(0, ge=0, le=9223372036854775807),
+                             limit: int = Query(20, ge=1, le=20), runtime=Depends(_runtime)):
+    return _invoke(runtime, "list_investigation_notes", task_id, after_id, limit)
 
 
 @router.post("/tasks/{task_id}/prepare")

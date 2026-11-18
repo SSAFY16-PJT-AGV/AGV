@@ -69,16 +69,20 @@ class _DatabaseOwner:
 class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
-                 field_simulation=False, field_initial_positions=None, command_observations=False):
+                 field_simulation=False, field_initial_positions=None, command_observations=False,
+                 investigation_notes=False):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
         if type(command_observations) is not bool or (command_observations and not field_simulation):
             raise ValueError('command observations require explicit field simulation')
+        if type(investigation_notes) is not bool:
+            raise ValueError('investigation notes must be boolean')
         if field_initial_positions is not None and not field_simulation:
             raise ValueError('field initial positions require field simulation')
         self._field_initial_positions = copy.deepcopy(field_initial_positions)
         self._field_simulation = field_simulation
         self._command_observations_enabled = command_observations
+        self._investigation_notes_enabled = investigation_notes
         if host != '127.0.0.1':
             raise ValueError('simulation broker must use explicit IPv4 loopback')
         if type(port) is not int or not 1 <= port <= 65535:
@@ -114,12 +118,18 @@ class SimRuntime:
         self.client_id, self.connect_timeout, self.ack_timeout = client_id, float(connect_timeout), float(ack_timeout)
         self._mqtt_security = read_mqtt_security()
         self._lock = threading.RLock()
+        self._reference_condition = threading.Condition(self._lock)
+        self._reference_operations = 0
+        self._reference_local = threading.local()
+        self._shutdown_running = False
+        self._shutdown_error = None
         self._owner = _DatabaseOwner(self.path)
         self._started = False
         self._stopped = False
         self._prepared = {}
         self.store = self.gate = self.progress = self.inbox = self.receiver = self.workflow = self._client = None
         self.command_observations = self.command_observation_receiver = None
+        self.investigation_notes = None
 
     def _new_client(self, *, client_id='', persistent=False):
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id,
@@ -225,6 +235,12 @@ class SimRuntime:
                     options['field_simulation'] = True
                 self.progress = SegmentProgress(self.store, self.map_data, **options)
                 self.progress.initialize()
+                if self._investigation_notes_enabled:
+                    from server.sim_investigation_notes import SimInvestigationNotes
+                    self.investigation_notes = SimInvestigationNotes(
+                        self.progress, {robot: tuple(tasks) for robot, tasks in self._sessions.items()},
+                        simulation=True)
+                    self.investigation_notes.initialize()
                 if self._command_observations_enabled:
                     from server.sim_command_observations import SimCommandObservations
                     from server.sim_command_observation_receiver import SimCommandObservationReceiver
@@ -544,6 +560,39 @@ class SimRuntime:
                     'orders': orders, 'orders_truncated': len(later) > 99,
                     'occupancy': [list(row) for row in resources[:500]],
                     'occupancy_truncated': len(resources) > 500}
+
+    @contextmanager
+    def _reference_operation(self):
+        # Pin the DB owner across I/O without blocking unrelated runtime reads.
+        # stop() closes admission before waiting for the last pinned operation.
+        with self._reference_condition:
+            if not self._started or self._stopped or self.investigation_notes is None:
+                raise RuntimeError('simulation reference recording unavailable')
+            self._reference_operations += 1
+            self._reference_local.depth = getattr(self._reference_local, 'depth', 0) + 1
+            notes = self.investigation_notes
+        try:
+            yield notes
+        finally:
+            with self._reference_condition:
+                self._reference_local.depth -= 1
+                self._reference_operations -= 1
+                if not self._reference_operations:
+                    self._reference_condition.notify_all()
+
+    def record_investigation_note(self, task_id, request_id, category):
+        """Store an untrusted reference; never change control or recovery state."""
+        with self._reference_operation() as notes:
+            note = notes.record(task_id, request_id, category)
+            return {'scope': 'isolated_simulation', 'kind': 'unverified_reference',
+                    'control_effect': 'none', 'identity': 'shared_token_not_person', 'note': note}
+
+    def list_investigation_notes(self, task_id, after_id=0, limit=20):
+        """Read simulated references even when the MQTT receiver is offline."""
+        with self._reference_operation() as notes:
+            page = notes.list(task_id, after_id=after_id, limit=limit)
+            return {'scope': 'isolated_simulation', 'kind': 'unverified_reference',
+                    'control_effect': 'none', 'identity': 'shared_token_not_person', **page}
 
     def task_diagnostics(self, task_id):
         """Read one task's simulated DB snapshot and separate live observations.
@@ -867,28 +916,58 @@ class SimRuntime:
             return {'task_id': task_id, 'seq': seq, 'queued': True}
 
     def _shutdown(self):
-        self._stopped = True
-        errors = []
-        actions = []
-        if self.command_observation_receiver is not None:
-            actions.append(self.command_observation_receiver.stop)
+        # Fence the workflow before exposing shutdown or waiting on any I/O.
+        # A publish which already passed its workflow check remains in flight.
         if self.workflow is not None:
-            actions.append(self.workflow.stop)
-        if self._client is not None:
-            actions.append(lambda: self._close_client(self._client))
-        actions.extend(lambda client=client: self._close_client(client)
-                       for _coordinator, client, _generation in self._prepared.values())
-        self._prepared.clear()
-        for action in actions:
+            with self.workflow._lock:
+                self.workflow._stopping = True
+        self._stopped = True
+        self._shutdown_running = True
+        try:
+            errors = []
+            actions = []
+            if self.workflow is not None:
+                actions.append(self.workflow.stop)
+            if self._client is not None:
+                actions.append(lambda: self._close_client(self._client))
+            if self.command_observation_receiver is not None:
+                actions.append(self.command_observation_receiver.stop)
+            actions.extend(lambda client=client: self._close_client(client)
+                           for _coordinator, client, _generation in self._prepared.values())
+            self._prepared.clear()
+            # Network shutdown may itself wait on SQLite. Let admitted
+            # references finish and let other callers observe _stopped.
+            self._reference_condition.release()
             try:
-                action()
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise RuntimeError('simulation runtime cleanup failed') from errors[0]
-        self._owner.release()
+                for action in actions:
+                    try:
+                        action()
+                    except Exception as exc:
+                        errors.append(exc)
+            finally:
+                self._reference_condition.acquire()
+            # Stop intake/publication first; keep the owner until every
+            # reference which was admitted before shutdown has completed.
+            while self._reference_operations:
+                self._reference_condition.wait()
+            if errors:
+                raise RuntimeError('simulation runtime cleanup failed') from errors[0]
+            self._owner.release()
+        except BaseException as exc:
+            self._shutdown_error = exc
+            raise
+        finally:
+            self._shutdown_running = False
+            self._reference_condition.notify_all()
 
     def stop(self):
-        with self._lock:
+        if getattr(self._reference_local, 'depth', 0):
+            raise RuntimeError('cannot stop from a reference operation')
+        with self._reference_condition:
             if not self._stopped:
                 self._shutdown()
+            else:
+                while self._shutdown_running:
+                    self._reference_condition.wait()
+                if self._shutdown_error is not None:
+                    raise RuntimeError('simulation runtime cleanup failed') from self._shutdown_error

@@ -139,29 +139,31 @@ class SimInvestigationNotes:
 
     @contextmanager
     def _transaction(self, *, write):
-        with self._gate._operation_lock:
-            if getattr(self._gate._local, 'db', None) is not None:
-                raise InvestigationConflict('nested recovery transaction is not supported')
-            self._check_file()
-            uri = Path(self.path).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro')
-            try:
-                with closing(sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)) as db:
+        # Notes cannot authorize control. Do not hold the gate operation lock
+        # while SQLite waits: a disconnect must be able to block locally first.
+        if (getattr(self._gate._local, 'db', None) is not None
+                or getattr(self._gate._local, 'serializing', False)):
+            raise InvestigationConflict('nested recovery transaction is not supported')
+        self._check_file()
+        uri = Path(self.path).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro')
+        try:
+            with closing(sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)) as db:
+                self._check_file()
+                db.execute('PRAGMA foreign_keys=ON')
+                db.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+                try:
+                    self._progress._check_database(db)
+                    self._gate._active(db)
+                    yield db
+                    self._gate._active(db)
                     self._check_file()
-                    db.execute('PRAGMA foreign_keys=ON')
-                    db.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
-                    try:
-                        self._progress._check_database(db)
-                        self._gate._active(db)
-                        yield db
-                        self._gate._active(db)
-                        self._check_file()
-                        db.execute('COMMIT')
-                    except BaseException:
-                        if db.in_transaction:
-                            db.execute('ROLLBACK')
-                        raise
-            except sqlite3.Error:
-                raise InvestigationConflict('simulation reference database unavailable') from None
+                    db.execute('COMMIT')
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute('ROLLBACK')
+                    raise
+        except sqlite3.Error:
+            raise InvestigationConflict('simulation reference database unavailable') from None
 
     @staticmethod
     def _check_schema(db):

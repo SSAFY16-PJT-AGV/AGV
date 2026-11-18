@@ -138,6 +138,94 @@ class InvestigationNotesTests(unittest.TestCase):
         with self.gate.transaction():
             with self.assertRaises(ValueError):
                 notes.record('T1', '9' * 32, 'other')
+        with self.gate.serialized():
+            with self.assertRaises(ValueError):
+                notes.list('T1')
+
+    def test_epoch_change_while_write_waits_rejects_stale_record(self):
+        notes = self.notes()
+        entered = threading.Event()
+        errors = []
+        original_connect = sqlite3.connect
+        class ObservedConnection(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'BEGIN IMMEDIATE':
+                    entered.set()
+                return super().execute(sql, *args)
+        def connect(*args, **kwargs):
+            if threading.current_thread().name == 'notes-writer':
+                kwargs['factory'] = ObservedConnection
+            return original_connect(*args, **kwargs)
+        def record():
+            try:
+                notes.record('T1', '8' * 32, 'other')
+            except BaseException as exc:
+                errors.append(exc)
+        with closing(original_connect(self.path, isolation_level=None)) as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE recovery_runtime SET epoch=? WHERE singleton=1', ('new-epoch',))
+            with patch('server.sim_investigation_notes.sqlite3.connect', side_effect=connect):
+                writer = threading.Thread(target=record, name='notes-writer')
+                writer.start()
+                try:
+                    self.assertTrue(entered.wait(3))
+                finally:
+                    db.execute('COMMIT')
+                    writer.join(10)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        with closing(original_connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM sim_investigation_notes').fetchone()[0], 0)
+
+    def test_waiting_writer_does_not_delay_other_task_local_invalidation(self):
+        notes = self.notes()
+        waiting, blocked = threading.Event(), threading.Event()
+        errors = []
+        original_connect = sqlite3.connect
+        original_block = self.gate._block_many
+        class ObservedConnection(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'BEGIN IMMEDIATE':
+                    waiting.set()
+                return super().execute(sql, *args)
+        def connect(*args, **kwargs):
+            if threading.current_thread().name == 'notes-writer':
+                kwargs['factory'] = ObservedConnection
+            return original_connect(*args, **kwargs)
+        def block(tasks):
+            result = original_block(tasks)
+            blocked.set()
+            return result
+        def record():
+            try:
+                notes.record('T1', '7' * 32, 'connection')
+            except BaseException as exc:
+                errors.append(exc)
+        def invalidate():
+            try:
+                self.gate.invalidate('T2')
+            except BaseException as exc:
+                errors.append(exc)
+        with closing(original_connect(self.path, isolation_level=None)) as db:
+            db.execute('BEGIN IMMEDIATE')
+            with patch('server.sim_investigation_notes.sqlite3.connect', side_effect=connect), \
+                 patch.object(self.gate, '_block_many', side_effect=block):
+                writer = threading.Thread(target=record, name='notes-writer')
+                invalidator = threading.Thread(target=invalidate)
+                writer.start()
+                try:
+                    self.assertTrue(waiting.wait(3))
+                    invalidator.start()
+                    self.assertTrue(blocked.wait(1), 'local invalidation waited for notes database I/O')
+                    self.assertIn('T2', self.gate._blocked)
+                finally:
+                    db.execute('ROLLBACK')
+                    for thread in (writer, invalidator):
+                        if thread.ident is not None:
+                            thread.join(10)
+        self.assertFalse(writer.is_alive() or invalidator.is_alive())
+        self.assertEqual(errors, [])
 
     def test_failure_after_insert_rolls_back_transaction(self):
         from server.sim_investigation_notes import InvestigationConflict
