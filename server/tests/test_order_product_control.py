@@ -347,6 +347,17 @@ class ProductControlBrokerTests(unittest.TestCase):
                     finally:
                         runtime.stop()
                         robot.stop()
-                    self.assertEqual(receiver_errors, ['simulation MQTT disconnected; recovery proof revoked'])
+                    self.assertEqual(receiver_errors, ['simulation runtime stopped'])
+                    self.assertFalse(runtime.status()['ready'])
+                    self.assertFalse(runtime.receiver.ready)
+                    self.assertTrue(runtime.receiver._closed)
+                    self.assertTrue({'web-pickup', 'web-delivery', 'web-2-pickup',
+                                     'web-2-delivery'}.issubset(runtime.gate._blocked))
+                    with closing(sqlite3.connect(path)) as db:
+                        challenges = db.execute('SELECT status FROM recovery_challenges').fetchall()
+                        self.assertTrue(challenges)
+                        self.assertTrue(all(status == 'revoked' for (status,) in challenges))
+                    with self.assertRaises(RuntimeError):
+                        runtime.submit('web-2-delivery', 1, 'demo-session')
             finally:
                 stop(broker)
