@@ -65,14 +65,37 @@ class SequenceTests(unittest.TestCase):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
   old=set(nav.allowed); ctl._handle(json.dumps(order(2,"D")).encode())
   self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(nav.allowed,old)
- def test_repeat_inside_one_segment_is_rejected_without_start(self):
+ def test_repeat_inside_one_segment_visits_each_node_before_destination(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
-  self.assertIsNotNone(ctl.rejected); self.assertEqual(runner.resumes,0); self.assertIsNone(ctl.book.current)
+  self.assertIsNone(ctl.rejected); self.assertEqual(runner.resumes,1)
+  nav.on_patch("orange",0); nav.pop_stop()
+  nav.on_merge(100); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("red",200); turn=nav.pop_stop()
+  self.assertEqual(turn["type"],"uturn")
+  nav.uturned(220)
+  side=nav.choose_split(240); self.assertEqual(side,"left")
+  nav.on_split(side,250); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("blue",350); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("D","nav_hold"))
+  self.assertEqual(nav._route_pos,4)
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=350
+  ctl._watch_stop()
+  self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"D")])
  def test_gap_stops_and_duplicate_does_not_restart(self):
   nav,runner,link,ctl=self.fresh(); payload=json.dumps(order(1,"C")).encode(); ctl._handle(payload)
   resumes=runner.resumes; ctl._handle(payload); self.assertEqual(runner.resumes,resumes)
   nav.on_gap(); stop=nav.pop_stop(); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
   self.assertIsNone(nav.at_node)
+ def test_wrong_branch_after_uturn_stops_without_skipping_visit(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+  self.assertIsNone(ctl.rejected)
+  nav.on_patch("orange",0); nav.pop_stop()
+  nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); self.assertEqual(nav.pop_stop()["type"],"uturn")
+  nav.uturned(220)
+  nav.on_split("right",250); stop=nav.pop_stop()
+  self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+  self.assertLess(nav._route_pos,3); self.assertIsNone(nav.at_node)
  def test_unexpected_visit_after_target_does_not_move_cursor(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
   nav._route_advance("D"); stop=nav.pop_stop()
@@ -81,14 +104,29 @@ class SequenceTests(unittest.TestCase):
   data=json.loads(json.dumps(DATA)); data["nodes"][2]["kind"]="via"
   nav=Navigator(NavMap(data),start="A")
   with self.assertRaises(ValueError): nav.set_route(ROUTE,release="C")
- def test_same_node_repeat_within_one_release_is_rejected_at_hold(self):
+ def test_same_node_repeat_within_one_release_requires_a_real_loop(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"B")).encode())
   nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100)
   self.assertEqual(nav.pop_stop()["reason"],"nav_hold")
   runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=100; ctl._watch_stop()
   ctl._handle(json.dumps(order(2,"B")).encode())
-  self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1)
-  self.assertEqual(runner.resumes,1)
+  self.assertIsNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],2)
+  self.assertEqual(nav._target_i,3); self.assertEqual(nav._route_pos,1)
+  self.assertIsNone(nav.pop_stop())
+  nav.resumed(); nav.on_patch("red",200); turn=nav.pop_stop()
+  self.assertEqual(turn["type"],"uturn")
+  nav.uturned(220)
+  self.assertIsNone(nav.choose_split(240)); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("B","nav_hold"))
+  self.assertEqual(nav._route_pos,3)
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=250; ctl._watch_stop()
+  self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"B"),(2,"B")])
+  ctl._handle(json.dumps(order(3,"D")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],3)
+  nav.resumed(); side=nav.choose_split(260); self.assertEqual(side,"left")
+  nav.on_split(side,260); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("blue",350); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("D","nav_hold"))
  def test_team_map_out_and_back_in_separate_confirmed_segments(self):
   root=os.path.abspath(os.path.join(os.path.dirname(__file__),"..",".."))
   with io.open(os.path.join(root,"maps","sim_ssafy_v2.json"),encoding="utf-8") as f: raw=json.load(f)
@@ -178,6 +216,42 @@ class SequenceTests(unittest.TestCase):
   ctl.step(now=100); self.assertEqual(runner.resumes,0); self.assertIsNone(ctl.book.current); self.assertEqual(runner.state,"hold")
 
 class SequenceMatTests(TestSimServe):
+ def test_team_mat_repeated_release_never_fakes_a_missed_junction(self):
+  route=["P_orange","S1","M1","P_purple","M1"]
+  for seed in (2,3,5):
+   pending={0:self._o(1,"M1",route),1:self._o(2,"M1",route)}; sent=set()
+   def script(link,ctl,runner,t,state):
+    n=len(link.events)
+    if n in pending and n not in sent and (n==0 or state["status"]=="WAITING"):
+     sent.add(n); link.send(pending[n])
+    if n==2 and state["status"]=="IDLE": runner.stop("test_done")
+    if state["status"]=="ERROR": runner.stop("test_error")
+   link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
+   if gt["finish_reason"]=="test_error":
+    # Pending observations can arrive only after the requested M1 stop;
+    # an observed later patch is not evidence that the robot stopped at M1.
+    self.assertEqual(ctl.error,"nav_off_route")
+    self.assertEqual(link.events,[])
+   else:
+    self.assertEqual(gt["finish_reason"],"test_done",repr((seed,ctl.error,notes[-10:])))
+    self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"M1"),(2,"M1")])
+ def test_team_mat_single_release_revisits_each_junction(self):
+  route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
+  for seed in (2,3,5):
+   sent=set()
+   def script(link,ctl,runner,t,state):
+    if not sent:
+     sent.add(1); link.send(self._o(1,"P_orange",route))
+    if len(link.events)==1 and state["status"]=="IDLE": runner.stop("test_done")
+    if state["status"]=="ERROR": runner.stop("test_error")
+   link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
+   self.assertEqual(gt["finish_reason"],"test_done",repr((seed,ctl.error,notes[-10:])))
+   self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"P_orange")])
+   with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
+    events=[json.loads(line) for line in f]
+   turn=next(i for i,e in enumerate(events) if e.get("msg")=="uturn_done")
+   split=next(e for e in events[turn+1:] if e.get("type") in ("split","merge","patch"))
+   self.assertEqual((split["type"],split.get("choice")),("split","right"))
  def test_team_mat_revisit_completes_with_observed_split(self):
   route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
   for seed in (2,3,5):

@@ -50,7 +50,9 @@ class TeamNavigatorSequenceTest(unittest.TestCase):
             command = subprocess.run(
                 [sys.executable, '-m', 'unittest',
                  'agv.tests.test_sequence_visit_patch.SequenceTests',
-                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_revisit_completes_with_observed_split', '-q'],
+                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_revisit_completes_with_observed_split',
+                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_single_release_revisits_each_junction',
+                 'agv.tests.test_sequence_visit_patch.SequenceMatTests.test_team_mat_repeated_release_never_fakes_a_missed_junction', '-q'],
                 cwd=target, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=180)
             self.assertEqual(command.returncode, 0, command.stdout + '\n' + command.stderr)
 
