@@ -1,0 +1,14 @@
+diff --git a/agv/nav/navigator.py b/agv/nav/navigator.py
+--- a/agv/nav/navigator.py
++++ b/agv/nav/navigator.py
+@@ -143,6 +143,10 @@ class Navigator(object):
+             raise ValueError(u"빈 경로")
+         for n in nodes:
+             self._check_node(n)
++        # Until navigation hypotheses track route occurrences, the route's
++        # edge set cannot guarantee the order of repeated node visits.
++        if len(set(nodes)) != len(nodes):
++            raise ValueError("repeated route nodes are not supported")
+         release = release or nodes[-1]
+         if release not in nodes:
+             raise ValueError(u"해제 노드가 경로에 없어요: %s" % release)
