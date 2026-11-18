@@ -73,3 +73,56 @@
 `Cache-Control: no-store`가 적용된다. 이 API에도 인증·인가가 없으므로 로컬
 개발 환경에서만 사용한다. Unreal에서의 미측정 표시는 클라이언트와 별도 협의가
 필요하며 이 API 추가로 해결되는 것은 아니다.
+
+## `GET /robots/diagnostics`
+
+기존 두 응답 형식은 그대로 두고, MQTT 관측기의 **서버 수신 처리 경과시간**과
+입력 거부 건수를 별도로 조회한다. 상태·연결 메시지 각각 마지막으로 유효한
+메시지를 처리한 단조 시계 시점부터 조회 시점까지의 초가 `age_seconds`다.
+아직 받지 않았거나 시계가 역행하는 등 계산할 수 없으면 `null`이다. 재시작
+전의 시각은 보존·비교하지 않는다. 수신 본문과 배터리값은 반환하지 않지만,
+`robots`에는 마지막으로 관측한 **로봇 ID**가 표시된다.
+
+```json
+{
+  "connected": true,
+  "ready": true,
+  "robots": {
+    "robot1": {
+      "state": {"age_seconds": 2.4, "last_delivery": "non_retained"},
+      "connection": {"age_seconds": null, "last_delivery": "not_received"}
+    }
+  },
+  "dropped": {"invalid_topic": 0, "invalid_size": 0, "invalid_payload": 1,
+              "robot_limit": 0, "disconnected": 0}
+}
+```
+
+`last_delivery`는 이 서버가 마지막으로 받은 메시지의 RETAIN 플래그에 따라
+`retained` 또는 `non_retained`이며, 받지 않았으면 `not_received`다. 단절
+후에도 마지막 전달 종류와 경과시간은 남고 최상위 `connected`는 false다.
+`non_retained`는 원래 발행자가 retain을 설정하지 않았다는 증거가 아니다.
+경과시간은 서버가 수신한 뒤 흐른 시간일 뿐 원본 생성 시각·실제 장치의
+신선도·장치 신원·연결 상태·물리 정지나 운행 허가를 증명하지 않는다.
+오래된 상태의 수신이나 MQTT 연결만으로 주행을 허용하지 않는다.
+
+`dropped`는 수신 콜백이 거부한 메시지를 고정된 다섯 범주로 집계한다.
+토픽 구조 오류, ID 또는 payload 크기 초과, 내용/형식 오류, 단절된 서비스로
+도착한 유효 메시지, 새 로봇 ID 수 상한 초과 순서로 판정한다. 각 건은
+한 범주에만 더하며 본문·토픽·ID별 오류 내용은 저장하거나 내보내지 않는다.
+카운터는 각각 2,147,483,647에서 포화되고 프로세스에서만 유지된다.
+브로커에 도달하지 않았거나 구독에 전달되지 않은 메시지는 집계하지 못한다.
+로봇 수는 기존 관측기 상한인 128개이며, 누락된 로봇의 존재는 확인하지 않는다.
+거부된 메시지는 마지막 유효 수신 시각을 갱신하지 않는다.
+
+기존 `/robots`와 마찬가지로 이 API는 인증·인가가 없으므로 로컬 개발 환경에서만
+사용한다. 내부 오류에는 일반 503, 모든 응답에는 `Cache-Control: no-store`를
+사용한다. 테스트 소유 루프백 브로커에서만 실행하는 회귀:
+
+```powershell
+$env:TEMP = (Resolve-Path .venv).Path
+$env:TMP = $env:TEMP
+$env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
+$env:PYTHON_DOTENV_DISABLED = '1'
+.\.venv\Scripts\python.exe -m unittest server.tests.test_mqtt_observation_diagnostics server.tests.test_mqtt_observation_diagnostics_integration -v
+```

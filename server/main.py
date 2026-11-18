@@ -156,3 +156,14 @@ def robot_battery_observations(request: Request):
     except Exception:
         raise HTTPException(status_code=503, detail="MQTT observations unavailable",
                             headers={"Cache-Control": "no-store"}) from None
+
+
+@app.get("/robots/diagnostics")
+def robot_observation_diagnostics(request: Request):
+    """Report local receive timing, not physical status or permission."""
+    try:
+        result = request.app.state.mqtt_service.observation_diagnostics()
+        return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(status_code=503, detail="MQTT observations unavailable",
+                            headers={"Cache-Control": "no-store"}) from None

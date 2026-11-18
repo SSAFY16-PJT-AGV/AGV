@@ -21,6 +21,7 @@ MAX_PAYLOAD_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 32
 MAX_ROBOT_ID_BYTES = 128
 MAX_ROBOTS = 128
+MAX_DIAGNOSTIC_DROPS = 2 ** 31 - 1
 
 
 def _unique_pairs(pairs):
@@ -77,7 +78,7 @@ def _strings_are_utf8(value):
 class MqttService:
     """Background MQTT receiver; snapshots are copies protected by a lock."""
 
-    def __init__(self, host, port, client=None):
+    def __init__(self, host, port, client=None, *, clock=None):
         self.host = host
         self.port = port
         self.client = client if client is not None else mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -93,6 +94,12 @@ class MqttService:
         self._robots = {}
         self._twin_revisions = {}
         self._twin_received_at = {}
+        if clock is not None and not callable(clock):
+            raise ValueError('clock must be callable')
+        self._clock = clock or time.monotonic
+        self._diagnostic_receipts = {}
+        self._diagnostic_drops = dict.fromkeys(
+            ('invalid_topic', 'invalid_size', 'invalid_payload', 'robot_limit', 'disconnected'), 0)
 
     def start(self):
         with self._lock:
@@ -122,6 +129,35 @@ class MqttService:
         with self._lock:
             return copy.deepcopy({'connected': self._connected, 'ready': self._ready,
                                   'robots': self._robots})
+
+    def observation_diagnostics(self):
+        """Return bounded receipt ages and drop counts, never message contents."""
+        def receipt(meta, kind, now):
+            saved = meta.get(kind)
+            if saved is None:
+                return {'age_seconds': None, 'last_delivery': 'not_received'}
+            received, retained = saved
+            age = None
+            if (type(now) in (int, float) and type(received) in (int, float)
+                    and math.isfinite(now) and math.isfinite(received) and now >= received):
+                age = now - received
+                if not math.isfinite(age):
+                    age = None
+            return {'age_seconds': age,
+                    'last_delivery': 'retained' if retained else 'non_retained'}
+
+        with self._lock:
+            now = self._clock()
+            robots = {robot: {'state': receipt(meta, 'state', now),
+                              'connection': receipt(meta, 'connection', now)}
+                      for robot, meta in self._diagnostic_receipts.items()}
+            return {'connected': self._connected, 'ready': self._ready,
+                    'robots': robots, 'dropped': dict(self._diagnostic_drops)}
+
+    def _diagnostic_drop(self, category):
+        with self._lock:
+            self._diagnostic_drops[category] = min(
+                MAX_DIAGNOSTIC_DROPS, self._diagnostic_drops[category] + 1)
 
     def twin_observation(self, robot_id):
         """Return a copied observation and its receive revision for the local twin."""
@@ -172,13 +208,19 @@ class MqttService:
                 print('[MQTT] subscription rejected', flush=True)
 
     def _on_message(self, client, userdata, message):
+        if not isinstance(message.topic, str):
+            self._diagnostic_drop('invalid_topic')
+            return
         parts = message.topic.split('/')
         if len(parts) != 3 or parts[0] != 'agv' or not parts[1] or parts[2] not in ('state', 'conn'):
+            self._diagnostic_drop('invalid_topic')
             return
         try:
             if len(parts[1].encode('utf-8')) > MAX_ROBOT_ID_BYTES or len(message.payload) > MAX_PAYLOAD_BYTES:
+                self._diagnostic_drop('invalid_size')
                 return
         except UnicodeEncodeError:
+            self._diagnostic_drop('invalid_topic')
             return
         try:
             text = message.payload.decode('utf-8')
@@ -187,26 +229,36 @@ class MqttService:
                                    parse_float=_finite_float)
                 if (not isinstance(value, dict) or not _within_json_depth(value)
                         or not _strings_are_utf8(value)):
+                    self._diagnostic_drop('invalid_payload')
                     return
             else:
                 value = text
                 if value not in ('online', 'offline'):
+                    self._diagnostic_drop('invalid_payload')
                     return
         except (UnicodeDecodeError, ValueError, RecursionError):
+            self._diagnostic_drop('invalid_payload')
             return
         with self._lock:
             if not self._connected:
+                self._diagnostic_drop('disconnected')
                 return
             if parts[1] not in self._robots and len(self._robots) >= MAX_ROBOTS:
+                self._diagnostic_drop('robot_limit')
                 return
             observation = self._robots.setdefault(parts[1], {
                 'state': None, 'state_received_live': False,
                 'connection_report': None, 'connection_received_live': False,
             })
+            received = self._clock()
+            meta = self._diagnostic_receipts.setdefault(parts[1], {})
+            meta['state' if parts[2] == 'state' else 'connection'] = (received, bool(message.retain))
             if parts[2] == 'state':
                 observation['state'] = value
                 observation['state_received_live'] = not message.retain
                 self._twin_revisions[parts[1]] = self._twin_revisions.get(parts[1], 0) + 1
+                # Twin consumers compare against the process monotonic clock;
+                # the diagnostic test clock is an independent time domain.
                 self._twin_received_at[parts[1]] = time.monotonic()
             else:
                 observation['connection_report'] = value
