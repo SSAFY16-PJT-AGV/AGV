@@ -117,7 +117,7 @@ def _allowed_origin(headers):
             and secrets.compare_digest(configured, supplied[0]))
 
 
-def _message(robot_id, observation):
+def _message(robot_id, observation, *, field_mapping=None):
     if not isinstance(observation, dict) or not observation.get('state_received_live'):
         return None
     state = observation.get('state')
@@ -134,7 +134,15 @@ def _message(robot_id, observation):
     if set(data) != {'agv_id', 'current_node', 'status', 'battery'}:
         return None
     pose_map_id = os.getenv('AGV_TWIN_POSE_MAP_ID', '')
-    if pose_map_id:
+    if field_mapping is not None:
+        if state.get('map_id') != field_mapping.map_ref:
+            return None
+        try:
+            converted = field_mapping.pose(state.get('pose'))
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return None
+        data.update(converted)
+    elif pose_map_id:
         # This mapping is only calibrated for the isolated validation map.
         if pose_map_id != _VALIDATION_MAP_ID or state.get('map_id') != pose_map_id:
             return None
@@ -203,7 +211,8 @@ async def digital_twin(websocket: WebSocket):
                 if (not snapshot['connected'] or not snapshot['ready'] or received_at is None
                         or not 0 <= time.monotonic() - received_at <= MAX_OBSERVATION_AGE_SECONDS):
                     continue
-                payload = _message(robot_id, snapshot['observation'])
+                payload = _message(robot_id, snapshot['observation'],
+                                   field_mapping=getattr(websocket.app.state, 'field_twin_mapping', None))
                 if payload is not None:
                     payload['data']['agv_id'] = twin_id
                     await websocket.send_json(payload)

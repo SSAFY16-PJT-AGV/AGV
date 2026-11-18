@@ -45,8 +45,11 @@ class ShelfFull(RuntimeError):
 
 class DemoRuntime:
     def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic,
-                 auto_recovery=False, journal=None, recovery_blocked=False, pickup_store=None):
+                 auto_recovery=False, journal=None, recovery_blocked=False, pickup_store=None,
+                 field_mapping=None, products=None):
         self.engine = engine
+        self.field_mapping = field_mapping
+        self.products = copy.deepcopy(products if products is not None else PRODUCTS)
         self.port = port
         self._nodes = nodes
         self.observer = observer
@@ -88,7 +91,8 @@ class DemoRuntime:
                                          on_snapshot_request=self._pickup_snapshot_request if pickup_store else None,
                                          on_prepare_action=self._pickup_action_prepare if pickup_store else None,
                                          on_action_result=self._pickup_action_result if pickup_store else None,
-                                         on_detach=self._pickup_detach if pickup_store else None)
+                                         on_detach=self._pickup_detach if pickup_store else None,
+                                         pose_transform=field_mapping.pose if field_mapping is not None else None)
         self.connected = threading.Event()
         self.stop_event = threading.Event()
         if journal is None:
@@ -190,9 +194,11 @@ class DemoRuntime:
                     raise ValueError('Unreal robot does not match the saved stopped position')
                 # Unreal normalizes rotations to [-180, 180]; compare on a
                 # circle so +180 and -180 describe the same direction.
-                yaw_difference = abs((seen['yaw'] - pose['th'] + 180.0) % 360.0 - 180.0)
+                transformed = (self.field_mapping.pose(pose) if self.field_mapping is not None else
+                               {'x': pose['x'] / 1000, 'y': pose['y'] / 1000, 'yaw': pose['th']})
+                yaw_difference = abs((seen['yaw'] - transformed['yaw'] + 180.0) % 360.0 - 180.0)
                 mismatch |= (seen['interpolating'] or
-                             math.hypot(seen['x'] - pose['x'] / 1000, seen['y'] - pose['y'] / 1000) > .25 or
+                             math.hypot(seen['x'] - transformed['x'], seen['y'] - transformed['y']) > .25 or
                              yaw_difference > 1.0)
             if mismatch:
                 # A pristine synthetic world needs an initial placement: the
@@ -206,7 +212,8 @@ class DemoRuntime:
                 self._validated_bootstrap = True
         self._validated_world = world_id
         if self.pickup_store is not None:
-            self._validated_pickups = data['pickups']
+            self._validated_pickups = (self.field_mapping.pickups_to_field(data['pickups'])
+                                       if self.field_mapping is not None else data['pickups'])
 
     def _accept_world(self):
         try:
@@ -276,7 +283,8 @@ class DemoRuntime:
                     if item['status'] != 'idle':
                         self._restart_blocked = True
                         return
-                    payload = {'map_id': 'twin-validation-v1', 'last_node': item['current_node'],
+                    payload = {'map_id': self.field_mapping.map_ref if self.field_mapping is not None else 'twin-validation-v1',
+                               'last_node': item['current_node'],
                                'status': 'IDLE', 'battery': item['battery'], 'pose': item['pose']}
                     self.client.publish('agv/{}/state'.format(item['robot_id']), json.dumps(payload), qos=0, retain=False)
                 now = self.clock()
@@ -478,7 +486,7 @@ class DemoRuntime:
             self.lock.release()
 
     def create_product_order(self, product_id):
-        product = next((item for item in PRODUCTS if item['id'] == product_id), None)
+        product = next((item for item in self.products if item['id'] == product_id), None)
         if product is None:
             raise ValueError('unknown product')
         self.lock.acquire()
@@ -505,7 +513,7 @@ class DemoRuntime:
         return self.admission.submit(operation, fingerprint, request_key=request_key)
 
     def submit_product_order(self, product_id, request_key=None):
-        if not any(item['id'] == product_id for item in PRODUCTS):
+        if not any(item['id'] == product_id for item in self.products):
             raise ValueError('unknown product')
         if self.journal is not None:
             return self.admission.submit_product(product_id, request_key)
@@ -523,7 +531,7 @@ class DemoRuntime:
 
     def _wait_for_product_order(self, product_id, owner):
         """Wait outside the control lock until an admitted fleet order can start."""
-        product = next(item for item in PRODUCTS if item['id'] == product_id)
+        product = next(item for item in self.products if item['id'] == product_id)
         while not self.stop_event.is_set():
             with self.lock:
                 if (owner is None or self.actions.owner is not owner
@@ -667,7 +675,7 @@ class DemoRuntime:
                             any(item.get('robot_id') not in ('sim-r1', 'sim-r2') for item in states)):
                         raise ValueError('invalid isolated robot states')
                     for item in states:
-                        payload = {'map_id': 'twin-validation-v1',
+                        payload = {'map_id': self.field_mapping.map_ref if self.field_mapping is not None else 'twin-validation-v1',
                                    'last_node': item['current_node'],
                                    'status': SIMULATION_STATUS.get(item['status'], 'ERROR'),
                                    'battery': item['battery'], 'pose': item['pose']}
@@ -737,7 +745,15 @@ async def lifespan(app):
     if len(raw) > 4 * 1024 * 1024:
         raise ValueError('demo map too large')
     map_data = json.loads(raw.decode('utf-8'))
-    nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in map_data['nodes']]
+    field_mapping = field_map = None
+    if os.environ.get('AGV_ORDER_FIELD_CONFIG'):
+        if os.environ.get('AGV_ORDER_COORDINATED') != '1' or os.environ.get('AGV_ORDER_FLEET') != '1':
+            raise ValueError('field mapping requires the isolated coordinated fleet')
+        from server.field_twin_mapping import load_field_twin_mapping
+        field_map, field_mapping = load_field_twin_mapping(os.environ['AGV_ORDER_FIELD_CONFIG'], map_data)
+    products = field_mapping.products if field_mapping is not None else PRODUCTS
+    node_map = field_map if field_mapping is not None else map_data
+    nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in node_map['nodes']]
     with ExitStack() as cleanup:
         journal = None
         pickup_store = None
@@ -756,7 +772,7 @@ async def lifespan(app):
             from sim.order_inbox import SimOrderInbox
             from sim.order_executor import SimOrderExecutor
             from sim.mqtt_order_robot import SimMqttOrderRobot
-            sim_map = make_order_sim_map(map_data)
+            sim_map = field_map if field_mapping is not None else make_order_sim_map(map_data)
             fleet_enabled = os.environ.get('AGV_ORDER_FLEET') == '1'
             persistent_dir = os.environ.get('AGV_ORDER_PERSIST_DIR')
             if persistent_dir:
@@ -768,12 +784,13 @@ async def lifespan(app):
                 owner = _DatabaseOwner(folder / 'orders.sqlite3')
                 owner.acquire()
                 cleanup.callback(owner.release)
-                fingerprint = hashlib.sha256(json.dumps(sim_map, sort_keys=True, separators=(',', ':'),
-                                                        allow_nan=False).encode('utf-8')).hexdigest()
-                journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, PRODUCTS)
+                fingerprint = (field_mapping.identity if field_mapping is not None else
+                               hashlib.sha256(json.dumps(sim_map, sort_keys=True, separators=(',', ':'),
+                                                         allow_nan=False).encode('utf-8')).hexdigest())
+                journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, products)
                 from server.order_pickup_inventory import PickupInventory
                 pickup_path = folder / 'pickup-inventory.sqlite3'
-                pickup_sources = {item['pickup_node']: item['product_type'] for item in PRODUCTS}
+                pickup_sources = {item['pickup_node']: item['product_type'] for item in products}
                 if journal.pickup_id is not None:
                     pickup_store = PickupInventory.open_existing(pickup_path, pickup_sources,
                                                                  expected_creation_id=journal.pickup_id)
@@ -804,7 +821,8 @@ async def lifespan(app):
                 folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
                 db_path = folder / 'server.sqlite3'
             if fleet_enabled:
-                starts = {'sim-r1': 'J01', 'sim-r2': 'J05'}
+                starts = ({robot: row['node'] for robot, row in field_mapping.robots.items()}
+                          if field_mapping is not None else {'sim-r1': 'J01', 'sim-r2': 'J05'})
                 if not set(starts.values()).issubset({node['id'] for node in sim_map['nodes']}):
                     raise ValueError('fleet demo start nodes are absent from the map')
                 if journal is not None and journal.simulation_id is not None:
@@ -831,18 +849,23 @@ async def lifespan(app):
                     task_ids.extend(('{}-{}-pickup'.format(prefix, index), '{}-{}-delivery'.format(prefix, index)))
                 sessions[robot_id] = {task: session_names[robot_id] for task in task_ids}
             runtime = SimRuntime(db_path, sim_map, sessions, port=port,
-                                 client_id='web-order-workflow', simulation_store=store)
+                                 client_id='web-order-workflow', simulation_store=store,
+                                 **({'field_simulation': True, 'field_initial_positions': starts}
+                                    if field_mapping is not None else {}))
             runtime.start()
             cleanup.callback(runtime.stop)
             map_id = '{}@v{}'.format(sim_map['map_id'], sim_map['version'])
-            product_lookup = {item['product_type']: dict(item) for item in PRODUCTS}
+            product_lookup = {item['product_type']: dict(item) for item in products}
             engines = {}
             for robot_id, start in starts.items():
                 filename = '{}.sqlite3'.format(robot_id) if fleet_enabled else 'robot.sqlite3'
                 inbox = SimOrderInbox(folder / filename, robot_id, map_id)
                 inbox.initialize()
                 authorizer = SimOrderAuthorizer(runtime, robot_id=robot_id)
-                robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, start),
+                executor_options = ({'experimental_field_map': True,
+                                     'field_incoming_edge': field_mapping.robots[robot_id]['incoming_edge']}
+                                    if field_mapping is not None else {})
+                robot = SimMqttOrderRobot(SimOrderExecutor(inbox, sim_map, start, **executor_options),
                                           port, authorization_guard=authorizer.guard)
                 engines[robot_id] = ProductControlEngine(
                     runtime, robot, sim_map, product_lookup, robot_id=robot_id,
@@ -862,7 +885,7 @@ async def lifespan(app):
                             logging.getLogger(__name__).exception('saved simulated stop could not be verified')
                 robot.start()
                 cleanup.callback(robot.stop)
-            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in PRODUCTS}, store=journal)
+            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in products}, store=journal)
                          if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
             engine = FleetProductControlEngine(engines, sim_map, inventory=inventory) if fleet_enabled else engines['sim-r1']
         else:
@@ -873,15 +896,18 @@ async def lifespan(app):
         demo = DemoRuntime(engine, port, nodes, service,
                            auto_recovery=(os.environ.get('AGV_ORDER_COORDINATED') == '1'
                                           and os.environ.get('AGV_ORDER_FLEET') == '1'),
-                           journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store)
+                           journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store,
+                           field_mapping=field_mapping, products=products)
         app.state.mqtt_service = service
         try:
             demo.start()
             cleanup.callback(demo.stop)
             app.state.demo = demo
             app.state.demo_actions = demo.actions
+            app.state.field_twin_mapping = field_mapping
             yield
         finally:
+            app.state.field_twin_mapping = None
             app.state.demo = None
             app.state.demo_actions = None
 
@@ -937,7 +963,7 @@ def products(request: Request):
     demo = _demo(request)
     automatic = getattr(getattr(demo, 'engine', None), 'inventory', None) is not None
     journal = getattr(demo, 'journal', None)
-    catalog = journal.products.values() if journal is not None else PRODUCTS
+    catalog = journal.products.values() if journal is not None else getattr(demo, 'products', PRODUCTS)
     return {'products': [{key: value for key, value in product.items()
                           if not automatic or key != 'slot_index'} for product in catalog]}
 
