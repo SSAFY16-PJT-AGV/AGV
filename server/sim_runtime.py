@@ -69,13 +69,16 @@ class _DatabaseOwner:
 class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
-                 field_simulation=False, field_initial_positions=None):
+                 field_simulation=False, field_initial_positions=None, command_observations=False):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
+        if type(command_observations) is not bool or (command_observations and not field_simulation):
+            raise ValueError('command observations require explicit field simulation')
         if field_initial_positions is not None and not field_simulation:
             raise ValueError('field initial positions require field simulation')
         self._field_initial_positions = copy.deepcopy(field_initial_positions)
         self._field_simulation = field_simulation
+        self._command_observations_enabled = command_observations
         if host != '127.0.0.1':
             raise ValueError('simulation broker must use explicit IPv4 loopback')
         if type(port) is not int or not 1 <= port <= 65535:
@@ -116,6 +119,7 @@ class SimRuntime:
         self._stopped = False
         self._prepared = {}
         self.store = self.gate = self.progress = self.inbox = self.receiver = self.workflow = self._client = None
+        self.command_observations = self.command_observation_receiver = None
 
     def _new_client(self, *, client_id='', persistent=False):
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id,
@@ -221,6 +225,19 @@ class SimRuntime:
                     options['field_simulation'] = True
                 self.progress = SegmentProgress(self.store, self.map_data, **options)
                 self.progress.initialize()
+                if self._command_observations_enabled:
+                    from server.sim_command_observations import SimCommandObservations
+                    from server.sim_command_observation_receiver import SimCommandObservationReceiver
+                    self.command_observations = SimCommandObservations(self.progress, self._sessions, simulation=True)
+                    self.command_observations.initialize()
+                    if read_mqtt_security() != self._mqtt_security:
+                        raise RuntimeError('simulation MQTT security configuration changed')
+                    self.command_observation_receiver = SimCommandObservationReceiver(
+                        self.command_observations, list(self._sessions), self.port,
+                        simulation=True, timeout=self.connect_timeout)
+                    if read_mqtt_security() != self._mqtt_security:
+                        raise RuntimeError('simulation MQTT security configuration changed')
+                    self.command_observation_receiver.start()
                 mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
                 self.inbox = SimEventInbox(self.path, robot_tasks=mapping, simulation_enabled=True)
                 self.inbox.initialize()
@@ -301,9 +318,16 @@ class SimRuntime:
 
     def status(self):
         with self._lock:
-            return {'ready': bool(self._started and not self._stopped and self.receiver and self.receiver.ready),
-                    'simulation_only': True,
-                    'last_workflow_error': self.workflow.last_error if self.workflow else None}
+            result = {'ready': bool(self._started and not self._stopped and self.receiver and self.receiver.ready),
+                      'simulation_only': True,
+                      'last_workflow_error': self.workflow.last_error if self.workflow else None}
+            enabled = self._command_observations_enabled
+            observer = self.command_observation_receiver if self._started and not self._stopped else None
+        # Observer callbacks can wait for SQLite while holding their own lock.
+        # Never hold the runtime lock while sampling this separate observation.
+        if enabled:
+            result['command_observation_ready'] = bool(observer and observer.ready)
+        return result
 
     def restore_completed_executor(self, executor, *, task_id, session, event_id,
                                    action_ack, expected_twin_id):
@@ -789,6 +813,8 @@ class SimRuntime:
         self._stopped = True
         errors = []
         actions = []
+        if self.command_observation_receiver is not None:
+            actions.append(self.command_observation_receiver.stop)
         if self.workflow is not None:
             actions.append(self.workflow.stop)
         if self._client is not None:
