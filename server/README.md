@@ -64,6 +64,8 @@ TLS만 쓴다면 사용자명과 비밀번호 설정을 모두 제거한다. 인
 팀 맵의 반복 방문 경로를 기존 서버 예약·MQTT 흐름에 연결한 격리 가상
 시험의 실행 조건과 웹 주문·실물 연동의 미완료 범위는
 [팀 맵 서버 연동 시험](docs/field_runtime_simulation.md)을 참고한다.
+팀 맵을 사용하는 격리 웹 주문·Unreal 실행 설정은
+[팀 맵 웹·Unreal 시연](docs/field_web_unreal_demo.md)을 참고한다.
 
 팀의 최신 로봇 MQTT 구현과 서버의 주문·상태·이벤트 차이, 시험용 주문
 사전검증과 실물 연동의 남은 조건은 [팀 로봇 연동 대조](docs/field_robot_interop.md)를

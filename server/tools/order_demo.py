@@ -96,14 +96,20 @@ def wait_for_demo(server, log_path, timeout=20):
 
 
 def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
-        state_dir=ROOT / 'data' / 'order-demo-state'):
+        state_dir=ROOT / 'data' / 'order-demo-state', field_config=None):
     map_path, editor, project, ddc, broker_deps = validate_inputs(
         map_path, editor, project, ddc, broker_deps)
+    if field_config is not None:
+        from server.field_twin_mapping import load_field_twin_mapping
+        field_config = Path(field_config).resolve()
+        load_field_twin_mapping(field_config, json.loads(map_path.read_text(encoding='utf-8')))
     broker_port = _select_broker_port()
     token = secrets.token_urlsafe(32)
     broker_env = clean_environment(os.environ)
     broker_env['PYTHONPATH'] = str(broker_deps)
     server_env = make_server_environment(os.environ, broker_port, token, map_path)
+    if field_config is not None:
+        server_env['AGV_ORDER_FIELD_CONFIG'] = str(field_config)
     server_env['AGV_ORDER_PERSIST_DIR'] = str(Path(state_dir).resolve())
     editor_env = clean_environment(os.environ)
     editor_env['AGV_TWIN_UNREAL_TOKEN'] = token
@@ -179,11 +185,15 @@ def main():
     parser.add_argument('--ddc-path', help='optional existing Unreal derived data cache directory')
     parser.add_argument('--broker-deps', default=str(ROOT / '.venv' / 'broker-deps'),
                         help='directory containing separately installed aMQTT')
-    parser.add_argument('--state-dir', default=str(ROOT / 'data' / 'order-demo-state'),
+    parser.add_argument('--field-config', help='explicit isolated team-map/Unreal correspondence JSON')
+    parser.add_argument('--state-dir', default=None,
                         help='persistent isolated simulation state directory')
     args = parser.parse_args()
     try:
-        run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps, args.state_dir)
+        state_dir = args.state_dir or ROOT / 'data' / (
+            'field-order-demo-state' if args.field_config else 'order-demo-state')
+        run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps, state_dir,
+            field_config=args.field_config)
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         print('시연 실패: {}'.format(exc), file=sys.stderr)
         return 1

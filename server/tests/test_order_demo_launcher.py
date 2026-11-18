@@ -14,6 +14,33 @@ def sample_map():
 
 
 class OrderDemoLauncherTests(unittest.TestCase):
+    def test_explicit_field_config_is_validated_and_passed_to_isolated_server(self):
+        from server.tests.test_field_twin_mapping import fixture
+        field, unreal, config = fixture()
+        unreal['edges'] = [{'from': 'U_A', 'to': 'U_C', 'points': []}]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            map_file, field_file, config_file = root / 'map.json', root / 'field.json', root / 'field-config.json'
+            map_file.write_text(json.dumps(unreal), encoding='utf-8')
+            field_file.write_text(json.dumps(field), encoding='utf-8')
+            config['field_map_file'] = field_file.name
+            config_file.write_text(json.dumps(config), encoding='utf-8')
+            deps = root / 'deps'
+            (deps / 'amqtt').mkdir(parents=True)
+            broker, server = Mock(pid=101), Mock(pid=102)
+            broker.poll.return_value = server.poll.return_value = None
+            with patch.object(tool, '_select_broker_port', return_value=18832), \
+                    patch.object(tool, 'wait_for_ready_log'), patch.object(tool, 'wait_for_demo'), \
+                    patch.object(tool.subprocess, 'Popen', side_effect=[broker, server]) as popen, \
+                    patch.object(tool, 'stop_process'), patch.object(tool.time, 'sleep', side_effect=KeyboardInterrupt), \
+                    patch('builtins.print'):
+                tool.run(map_file, broker_deps=deps, state_dir=root / 'state', field_config=config_file)
+            self.assertEqual(popen.call_args_list[1].kwargs['env']['AGV_ORDER_FIELD_CONFIG'], str(config_file.resolve()))
+            config['field_map_sha256'] = '0' * 64
+            config_file.write_text(json.dumps(config), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                tool.run(map_file, broker_deps=deps, state_dir=root / 'state', field_config=config_file)
+
     def test_environment_cannot_inherit_real_broker_or_order_settings(self):
         source = {'MQTT_HOST': 'physical', 'MQTT_PASSWORD': 'secret',
                   'AGV_ORDER_DEMO_MAP': 'real-map', 'AGV_OTHER': 'x',

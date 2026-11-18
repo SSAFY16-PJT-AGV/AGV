@@ -1,0 +1,41 @@
+{
+  "field_map_file": "mat_ssafy_v2_simulated_waits.json",
+  "field_map_sha256": "925e65eba9e66907b68bf07cb1dfe57bde8eaf729f8f8ee621bf149200c88e20",
+  "unreal_map_id": "warehouse_01",
+  "anchors": [
+    {
+      "field_node": "P_orange",
+      "unreal_node": "D01"
+    },
+    {
+      "field_node": "P_purple",
+      "unreal_node": "D04"
+    }
+  ],
+  "reflect_y": false,
+  "tolerance_m": 0.001,
+  "robots": {
+    "sim-r1": {
+      "node": "P_blue",
+      "incoming_edge": "E12"
+    },
+    "sim-r2": {
+      "node": "P_green",
+      "incoming_edge": "E6"
+    }
+  },
+  "products": [
+    {
+      "id": "red",
+      "label": "빨간 상품",
+      "product_type": "Red",
+      "pickup_node": "P_orange",
+      "destination_node": "P_purple",
+      "unreal_pickup_node": "D01",
+      "unreal_destination_node": "D04",
+      "shelf_id": "SHELF_RED",
+      "slot_index": 0,
+      "slot_count": 6
+    }
+  ]
+}
