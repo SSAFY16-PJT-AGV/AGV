@@ -32,13 +32,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def fixtures(folder, source, *, repeat=False):
-    data = json.loads((source / 'maps/mat_ssafy_v2.json').read_text(encoding='utf-8'))
+    path = (source / 'maps/mat_ssafy_v2.json' if source is not None
+            else ROOT / 'server/examples/mat_ssafy_v2_simulated_waits.json')
+    data = json.loads(path.read_text(encoding='utf-8'))
     data = copy.deepcopy(data)
+    if repeat:
+        data['zones'] = [z for z in data['zones'] if z['id'] != 'test-wait-P_red']
     # Exclusively synthetic waiting points for this isolated test.
     for node in ('P_blue', 'P_orange', 'P_purple', 'P_green', 'P_yellow', 'P_red', 'M3', 'M1'):
         if repeat and node == 'P_red':
             continue  # Exercise M3 -> P_red -> M3 within one authorized segment.
-        data['zones'].append({'id': 'test-wait-' + node, 'type': 'waiting', 'node': node})
+        if not any(zone['id'] == 'test-wait-' + node for zone in data['zones']):
+            data['zones'].append({'id': 'test-wait-' + node, 'type': 'waiting', 'node': node})
     field_path = folder / 'field.json'
     field_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     digest = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True,
@@ -78,8 +83,7 @@ def fixtures(folder, source, *, repeat=False):
     return unreal_path, config_path, products, positions
 
 
-@unittest.skipUnless(os.getenv('AMQTT_TEST_PATH') and os.getenv('AGV_FIELD_REPO'),
-                     'requires aMQTT and a copy of the team field-run source')
+@unittest.skipUnless(os.getenv('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class FieldWebUnrealIntegration(unittest.TestCase):
     def test_two_web_orders_use_team_map_and_transformed_unreal_actions(self):
         self._exercise(False)
@@ -95,7 +99,8 @@ class FieldWebUnrealIntegration(unittest.TestCase):
         flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
         with tempfile.TemporaryDirectory(prefix='field-web-unreal-') as temp, ExitStack() as cleanup:
             folder = Path(temp)
-            unreal_map, config, products, positions = fixtures(folder, Path(os.environ['AGV_FIELD_REPO']), repeat=repeat)
+            source = Path(os.environ['AGV_FIELD_REPO']) if os.getenv('AGV_FIELD_REPO') else None
+            unreal_map, config, products, positions = fixtures(folder, source, repeat=repeat)
             broker_env = isolated_environment(os.environ)
             broker_env['PYTHONPATH'] = os.environ['AMQTT_TEST_PATH']
             broker_log = cleanup.enter_context(open(os.devnull, 'w'))

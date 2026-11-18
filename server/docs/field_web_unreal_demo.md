@@ -70,7 +70,7 @@ Unreal에서 `Content → AGV → NewMap`을 열고 플레이한 다음
 
 ## 시험
 
-아래 통합 시험은 팀 소스 사본과 별도 MQTT, Unreal **대역**을 사용한다.
+아래 통합 시험은 포함된 팀 맵 사본과 별도 MQTT, Unreal **대역**을 사용한다.
 실제 Unreal 렌더링·실물 주행 시험이 아니다.
 
 별도 실험에서 위와 같은 두 점 대응과 가상 대기점을 사용해 실제 UE 5.7
@@ -83,10 +83,9 @@ Unreal에서 `Content → AGV → NewMap`을 열고 플레이한 다음
 ```powershell
 $env:PYTHON_DOTENV_DISABLED = '1'
 $env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
-$env:AGV_FIELD_REPO = 'C:\경로\팀-field-run-소스'
 .\.venv\Scripts\python -m unittest server.tests.test_field_twin_mapping `
   server.tests.test_field_web_handoff server.tests.test_field_web_unreal_integration -v
 ```
 
-독립 팀 소스가 없는 다른 PC에서는 예제 맵 자체를 사용해 매핑을 확인할 수
-있다. 팀 소스가 필요한 종단 시험은 해당 소스를 별도로 준비해야 한다.
+다른 팀 맵 원본으로 검증하려면 `AGV_FIELD_REPO`를 해당 소스 사본으로
+지정한다. 로봇 패치를 적용하는 별도 시험은 팀 소스 사본이 필요하다.
