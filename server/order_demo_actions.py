@@ -56,7 +56,10 @@ class DemoActionSession:
                  on_change=None, pause_on_unavailable=False, inventory=None,
                  validate_snapshot=None, on_snapshot=None, on_invalidate=None, can_send_state=None,
                  on_snapshot_request=None, on_prepare_action=None, on_action_result=None, on_detach=None,
-                 pose_transform=None):
+                 pose_transform=None, action_source='unreal'):
+        if type(action_source) is not str or action_source not in ('unreal', 'synthetic'):
+            raise ValueError('invalid simulated action source')
+        self._action_source = action_source
         self.engine = engine
         self.lock = lock
         self.settle_seconds = settle_seconds
@@ -102,9 +105,10 @@ class DemoActionSession:
                 # invalidation callback fails, the fast view fails closed.
                 self._owner_available.clear()
 
-    def attach(self, client, authenticated):
+    def attach(self, client, authenticated, *, source='unreal'):
         with self.lock:
-            if not authenticated or self.owner is not None:
+            if (type(source) is not str or source != self._action_source
+                    or not authenticated or self.owner is not None):
                 return False
             if self.inventory is not None:
                 self._shelf_request_id = self.inventory.begin_session(client)

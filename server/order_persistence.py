@@ -18,6 +18,7 @@ import uuid
 
 _APPLICATION_ID = 0x41475653
 _SCHEMA_VERSION = 2
+_SYNTHETIC_SCHEMA_VERSION = 3
 
 
 def _json(value):
@@ -34,7 +35,12 @@ def _text(value, label, limit=256):
 class PersistentOrderStore:
     """A file-backed journal. Every mutation is a SQLite write transaction."""
 
-    def __init__(self, path, map_id, catalog):
+    def __init__(self, path, map_id, catalog, *, action_source='unreal'):
+        if type(action_source) is not str or action_source not in ('unreal', 'synthetic'):
+            raise ValueError('invalid simulated action source')
+        self._action_source = action_source
+        self._schema_version = (_SCHEMA_VERSION if action_source == 'unreal'
+                                else _SYNTHETIC_SCHEMA_VERSION)
         name = os.fspath(path)
         if not isinstance(name, str) or not name or name == ':memory:':
             raise ValueError('file-backed simulation journal required')
@@ -71,17 +77,41 @@ class PersistentOrderStore:
         else:
             os.close(fd)
             created = True
+        self._schema_initialized = not created
         try:
             if created:
                 self._create()
+                self._schema_initialized = True
             else:
                 self._validate()
         except sqlite3.Error as exc:
             raise ValueError('simulation journal is corrupt or unavailable') from exc
 
     def _connect(self):
-        return sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=rw',
-                               uri=True, timeout=5, isolation_level=None)
+        db = sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=rw',
+                             uri=True, timeout=5, isolation_level=None)
+        try:
+            if self._schema_initialized and (
+                    db.execute('PRAGMA application_id').fetchone() != (_APPLICATION_ID,)
+                    or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)):
+                raise ValueError('simulation journal source or schema differs')
+            return db
+        except BaseException:
+            db.close()
+            raise
+
+    def _check_source(self, db):
+        if self._schema_initialized and (
+                db.execute('PRAGMA application_id').fetchone() != (_APPLICATION_ID,)
+                or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)):
+            raise ValueError('simulation journal source or schema differs')
+
+    @contextmanager
+    def _read(self):
+        with closing(self._connect()) as db:
+            db.execute('BEGIN')
+            self._check_source(db)
+            yield db
 
     @contextmanager
     def _write(self):
@@ -89,6 +119,7 @@ class PersistentOrderStore:
             db.execute('PRAGMA foreign_keys=ON')
             db.execute('BEGIN IMMEDIATE')
             try:
+                self._check_source(db)
                 yield db
                 db.execute('COMMIT')
             except BaseException:
@@ -99,7 +130,7 @@ class PersistentOrderStore:
     def _create(self):
         with self._write() as db:
             db.execute('PRAGMA application_id={}'.format(_APPLICATION_ID))
-            db.execute('PRAGMA user_version={}'.format(_SCHEMA_VERSION))
+            db.execute('PRAGMA user_version={}'.format(self._schema_version))
             db.execute('CREATE TABLE metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
                        'map_id TEXT NOT NULL, catalog_json TEXT NOT NULL, shelf_revision INTEGER NOT NULL, '
                        'simulation_id TEXT, world_id TEXT, pickup_id TEXT)')
@@ -126,10 +157,10 @@ class PersistentOrderStore:
                                [(shelf, kind, i) for i in range(count)])
 
     def _validate(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             db.execute('PRAGMA foreign_keys=ON')
             if (db.execute('PRAGMA application_id').fetchone() != (_APPLICATION_ID,)
-                    or db.execute('PRAGMA user_version').fetchone() != (_SCHEMA_VERSION,)
+                    or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)
                     or db.execute('PRAGMA quick_check').fetchall() != [('ok',)]
                     or db.execute('PRAGMA foreign_key_check').fetchall()):
                 raise ValueError('simulation journal schema or integrity mismatch')
@@ -158,7 +189,7 @@ class PersistentOrderStore:
 
     @property
     def simulation_id(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             row = db.execute('SELECT simulation_id FROM metadata WHERE singleton=1').fetchone()
             if row is None:
                 raise ValueError('simulation journal identity is missing')
@@ -177,7 +208,7 @@ class PersistentOrderStore:
 
     @property
     def pickup_id(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             row = db.execute('SELECT pickup_id FROM metadata WHERE singleton=1').fetchone()
             if row is None:
                 raise ValueError('pickup journal identity is missing')
@@ -196,7 +227,7 @@ class PersistentOrderStore:
 
     @property
     def world_id(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             row = db.execute('SELECT world_id FROM metadata WHERE singleton=1').fetchone()
             if row is None:
                 raise ValueError('simulation journal identity is missing')
@@ -246,12 +277,12 @@ class PersistentOrderStore:
 
     def get_order(self, request_id):
         _text(request_id, 'request ID')
-        with closing(self._connect()) as db:
+        with self._read() as db:
             return self._order(db.execute('SELECT request_id,product_id,state,result_json,error '
                                           'FROM orders WHERE request_id=?', (request_id,)).fetchone())
 
     def list_orders(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             return [self._order(row) for row in db.execute('SELECT request_id,product_id,state,result_json,error '
                                                             'FROM orders ORDER BY sequence')]
 
@@ -266,7 +297,7 @@ class PersistentOrderStore:
             return self._order((row[0], row[1], 'dispatching', row[3], row[4]))
 
     def peek_next(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             row = db.execute("SELECT request_id,product_id,state,result_json,error FROM orders "
                              "WHERE state='queued' ORDER BY sequence LIMIT 1").fetchone()
             return None if row is None else self._order(row)
@@ -412,8 +443,7 @@ class PersistentOrderStore:
         return True
 
     def load_shelves(self):
-        with closing(self._connect()) as db:
-            db.execute('BEGIN')
+        with self._read() as db:
             revision = db.execute('SELECT shelf_revision FROM metadata WHERE singleton=1').fetchone()[0]
             shelves = {key: {'product_type': kind, 'slots': [None] * count}
                        for key, (kind, count) in self.shelves.items()}

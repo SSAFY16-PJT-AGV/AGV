@@ -34,7 +34,12 @@ class PickupInventory:
     Transactions across this DB and the order journal are not atomic.
     """
 
-    def __init__(self, path, sources, *, _mode=None, _expected_creation_id=None):
+    def __init__(self, path, sources, *, _mode=None, _expected_creation_id=None,
+                 action_source='unreal'):
+        if type(action_source) is not str or action_source not in ('unreal', 'synthetic'):
+            raise ValueError('invalid simulated action source')
+        self._action_source = action_source
+        self._schema_version = 1 if action_source == 'unreal' else 2
         if _mode not in ('new', 'existing'):
             raise ValueError('use create_new or open_existing for pickup inventory')
         raw = os.fspath(path)
@@ -71,7 +76,7 @@ class PickupInventory:
             if created:
                 with self._write() as db:
                     db.execute('PRAGMA application_id=1095194192')
-                    db.execute('PRAGMA user_version=1')
+                    db.execute('PRAGMA user_version={}'.format(self._schema_version))
                     db.execute('CREATE TABLE metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
                                'sources TEXT NOT NULL, world_id TEXT, session_id TEXT, revision INTEGER NOT NULL, '
                                'mutation INTEGER NOT NULL, creation_id TEXT NOT NULL)')
@@ -92,12 +97,13 @@ class PickupInventory:
             raise ValueError('pickup inventory unavailable or corrupt') from exc
 
     @classmethod
-    def create_new(cls, path, sources):
-        return cls(path, sources, _mode='new')
+    def create_new(cls, path, sources, *, action_source='unreal'):
+        return cls(path, sources, _mode='new', action_source=action_source)
 
     @classmethod
-    def open_existing(cls, path, sources, *, expected_creation_id):
-        return cls(path, sources, _mode='existing', _expected_creation_id=expected_creation_id)
+    def open_existing(cls, path, sources, *, expected_creation_id, action_source='unreal'):
+        return cls(path, sources, _mode='existing', _expected_creation_id=expected_creation_id,
+                   action_source=action_source)
 
     @property
     def creation_id(self):
@@ -120,6 +126,9 @@ class PickupInventory:
         try:
             self._check_file()
             if self._schema_initialized:
+                if (db.execute('PRAGMA application_id').fetchone() != (1095194192,)
+                        or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)):
+                    raise ValueError('pickup inventory source or schema differs')
                 rows = db.execute('SELECT creation_id FROM metadata WHERE singleton=1').fetchall()
                 if rows != [(self._creation_id,)]:
                     raise ValueError('pickup database identity differs')
@@ -128,12 +137,28 @@ class PickupInventory:
             db.close()
             raise
 
+    def _check_source(self, db):
+        if self._schema_initialized:
+            if (db.execute('PRAGMA application_id').fetchone() != (1095194192,)
+                    or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)):
+                raise ValueError('pickup inventory source or schema differs')
+            if db.execute('SELECT creation_id FROM metadata WHERE singleton=1').fetchall() != [(self._creation_id,)]:
+                raise ValueError('pickup database identity differs')
+
+    @contextmanager
+    def _read(self):
+        with closing(self._connect()) as db:
+            db.execute('BEGIN')
+            self._check_source(db)
+            yield db
+
     @contextmanager
     def _write(self):
         with self._lock, closing(self._connect()) as db:
             db.execute('PRAGMA foreign_keys=ON')
             db.execute('BEGIN IMMEDIATE')
             try:
+                self._check_source(db)
                 yield db
                 db.execute('COMMIT')
             except BaseException:
@@ -142,9 +167,9 @@ class PickupInventory:
                 raise
 
     def _validate(self):
-        with closing(self._connect()) as db:
+        with self._read() as db:
             if (db.execute('PRAGMA application_id').fetchone() != (1095194192,)
-                    or db.execute('PRAGMA user_version').fetchone() != (1,)
+                    or db.execute('PRAGMA user_version').fetchone() != (self._schema_version,)
                     or db.execute('PRAGMA quick_check').fetchall() != [('ok',)]
                     or db.execute('PRAGMA foreign_key_check').fetchone() is not None):
                 raise ValueError('pickup database integrity differs')
@@ -335,8 +360,7 @@ class PickupInventory:
             self._pending_snapshot = None
 
     def snapshot(self):
-        with self._lock, closing(self._connect()) as db:
-            db.execute('BEGIN')
+        with self._lock, self._read() as db:
             world, token, revision = db.execute('SELECT world_id,session_id,revision FROM metadata WHERE singleton=1').fetchone()
             fresh = bool(self._session and self._session == token and self._fresh_revision == revision)
             counts = dict(db.execute('SELECT source_id,available FROM counts'))
