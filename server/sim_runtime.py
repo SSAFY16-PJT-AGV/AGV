@@ -122,7 +122,13 @@ class SimRuntime:
         self._reference_operations = 0
         self._reference_local = threading.local()
         self._shutdown_running = False
+        self._shutdown_thread = None
         self._shutdown_error = None
+        self._reconnecting = False
+        self._reconnect_cleanup_failed = False
+        self._reconnect_cancel = None
+        self._reconnect_workers = ()
+        self._receiver_cancel = None
         self._owner = _DatabaseOwner(self.path)
         self._started = False
         self._stopped = False
@@ -146,6 +152,19 @@ class SimRuntime:
                 client.disconnect()
             finally:
                 client.loop_stop()
+                thread = getattr(client, '_thread', None)
+                if thread is not None and thread.is_alive():
+                    raise RuntimeError('simulation network thread is still running')
+
+    @staticmethod
+    def _guard_receiver_callbacks(client, receiver, cancel):
+        for name in ('on_connect', 'on_subscribe', 'on_message', 'on_disconnect'):
+            callback = getattr(client, name)
+            def guarded(*args, _callback=callback, _disconnect=(name == 'on_disconnect')):
+                with receiver._dispatch_lock:
+                    if _disconnect or not cancel.is_set():
+                        return _callback(*args)
+            setattr(client, name, guarded)
 
     def _connect_publisher(self):
         client = self._new_client()
@@ -261,6 +280,8 @@ class SimRuntime:
                 self.receiver = SimEventReceiver(self._client, self.progress, inbox=self.inbox,
                     recovery_gate=self.gate, robot_tasks=mapping, robot_sessions=self._sessions,
                     simulation_enabled=True)
+                self._receiver_cancel = threading.Event()
+                self._guard_receiver_callbacks(self._client, self.receiver, self._receiver_cancel)
                 self.workflow = SimProgressWorkflow(self.receiver, robot_sessions=self._sessions,
                     publisher_factory=self._publisher_factory, simulation_enabled=True)
                 self.workflow.start()
@@ -280,8 +301,15 @@ class SimRuntime:
         return self
 
     def _ready(self):
-        if not self._started or self._stopped or self.receiver is None or not self.receiver.ready:
+        if (not self._started or self._stopped or self._reconnecting or self._reconnect_cleanup_failed
+                or self.receiver is None or not self.receiver.ready):
             raise RuntimeError('simulation runtime is not ready')
+
+    def _on_owned_worker(self):
+        current = threading.current_thread()
+        observer = self.command_observation_receiver
+        clients = (self._client, getattr(observer, '_client', None), self.workflow, *self._reconnect_workers)
+        return any(client is not None and getattr(client, '_thread', None) is current for client in clients)
 
     def reconnect(self):
         """Reconnect a failed receiver without replacing the recovery epoch.
@@ -290,51 +318,141 @@ class SimRuntime:
         tasks remain blocked until separately reconciled; this does not itself
         authorize motion or release any reserved resource.
         """
-        with self._lock:
-            if not self._started or self._stopped:
-                raise RuntimeError('simulation runtime is not started')
-            if self.receiver is not None and self.receiver.ready:
-                raise RuntimeError('simulation receiver is already connected')
-            if self.receiver is not None and not self.receiver._closed:
-                raise RuntimeError('previous simulation receiver is still closing')
-            old_workflow, old_client = self.workflow, self._client
-            self.workflow = self.receiver = self._client = None
-            if old_workflow is not None:
-                old_workflow.stop()
-            self._close_client(old_client)
-            for _coordinator, client, _generation in self._prepared.values():
-                self._close_client(client)
-            self._prepared.clear()
+        if self._on_owned_worker():
+            raise RuntimeError('cannot reconnect from a simulation worker')
+        with self._runtime_read_operation():
+            with self._lock:
+                if not self._started or self._stopped:
+                    raise RuntimeError('simulation runtime is not started')
+                if self._reconnect_cleanup_failed:
+                    raise RuntimeError('simulation receiver cleanup failed')
+                if self._reconnecting:
+                    raise RuntimeError('simulation receiver reconnection is already in progress')
+                if self.receiver is not None and self.receiver.ready:
+                    raise RuntimeError('simulation receiver is already connected')
+                if self.receiver is not None and not self.receiver._closed:
+                    raise RuntimeError('previous simulation receiver is still closing')
+                self._reconnecting = True
+                old_workflow, old_client = self.workflow, self._client
+                old_prepared = list(self._prepared.values())
+                if self._receiver_cancel is not None:
+                    self._receiver_cancel.set()
+                self._reconnect_workers = (old_workflow, old_client,
+                                           *(client for _coordinator, client, _generation in old_prepared))
+                self.workflow = self.receiver = self._client = None
+                self._receiver_cancel = None
+                self._prepared.clear()
 
-            mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
-            client = self._new_client(client_id=self.client_id, persistent=True)
-            receiver = SimEventReceiver(client, self.progress, inbox=self.inbox,
-                recovery_gate=self.gate, robot_tasks=mapping, robot_sessions=self._sessions,
-                simulation_enabled=True)
-            workflow = SimProgressWorkflow(receiver, robot_sessions=self._sessions,
-                publisher_factory=self._publisher_factory, simulation_enabled=True)
-            self._client, self.receiver, self.workflow = client, receiver, workflow
+            client = receiver = workflow = None
+            cancel = threading.Event()
+            success = False
             try:
+                cleanup_errors = []
+                actions = ([old_workflow.stop] if old_workflow is not None else [])
+                actions.append(lambda: self._close_client(old_client))
+                actions.extend(lambda client=client: self._close_client(client)
+                               for _coordinator, client, _generation in old_prepared)
+                for action in actions:
+                    try:
+                        action()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                if cleanup_errors:
+                    with self._lock:
+                        self._reconnect_cleanup_failed = True
+                    raise RuntimeError('previous simulation receiver cleanup failed') from cleanup_errors[0]
+                with self._lock:
+                    if self._stopped:
+                        raise RuntimeError('simulation runtime is stopping')
+                with self.gate._state_lock:
+                    if any(task not in self.gate._blocked for task in self._tasks):
+                        raise RuntimeError('simulation reconnect recovery block is missing')
+                mapping = {robot: tuple(tasks) for robot, tasks in self._sessions.items()}
+                client = self._new_client(client_id=self.client_id, persistent=True)
+                receiver = SimEventReceiver(client, self.progress, inbox=self.inbox,
+                    recovery_gate=self.gate, robot_tasks=mapping, robot_sessions=self._sessions,
+                    simulation_enabled=True)
+                # Already-entered callbacks finish under the dispatch lock.
+                self._guard_receiver_callbacks(client, receiver, cancel)
+                workflow = SimProgressWorkflow(receiver, robot_sessions=self._sessions,
+                    publisher_factory=self._publisher_factory, simulation_enabled=True)
+                with self._lock:
+                    if self._stopped:
+                        raise RuntimeError('simulation runtime is stopping')
+                    self._client, self.receiver, self.workflow = client, receiver, workflow
+                    self._reconnect_cancel = cancel
+                    self._receiver_cancel = cancel
                 workflow.start()
+                with self._lock:
+                    if self._stopped:
+                        raise RuntimeError('simulation runtime is stopping')
                 if client.connect(self.host, self.port, keepalive=15) != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('simulation receiver reconnection failed')
+                with self._lock:
+                    if self._stopped:
+                        raise RuntimeError('simulation runtime is stopping')
                 if client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('simulation receiver loop failed')
                 deadline = time.monotonic() + self.connect_timeout
                 while not receiver.ready:
-                    if receiver._closed or time.monotonic() >= deadline:
+                    if self._stopped or receiver._closed or time.monotonic() >= deadline:
                         raise RuntimeError('simulation receiver was not ready')
                     time.sleep(.01)
-            except BaseException:
-                receiver._close_and_invalidate(RuntimeError('simulation receiver reconnection failed'))
-                workflow.stop()
-                self._close_client(client)
-                raise
+                with self._lock:
+                    if self._stopped:
+                        raise RuntimeError('simulation runtime is stopping')
+                    success = True
+            finally:
+                # Hand ownership to stop atomically, or keep sole ownership
+                # of the provisional client when shutdown has already begun.
+                with self._lock:
+                    handed_off = success and not self._stopped
+                    if handed_off:
+                        self._reconnect_cancel = None
+                        self._reconnecting = False
+                        self._reconnect_workers = ()
+                cleanup_errors = []
+                if not handed_off:
+                    cancel.set()
+                    if receiver is not None:
+                        try:
+                            receiver._close_and_invalidate(
+                                RuntimeError('simulation receiver reconnection failed'), disconnect=False)
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                        try:
+                            receiver.gate.invalidate_many(tuple(receiver.task_ids))
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                    if workflow is not None:
+                        try:
+                            workflow.stop()
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                    if client is not None:
+                        try:
+                            self._close_client(client)
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                    with self._lock:
+                        if cleanup_errors:
+                            self._reconnect_cleanup_failed = True
+                        if not cleanup_errors and self._client is client:
+                            self._client = self.receiver = self.workflow = None
+                            self._receiver_cancel = None
+                        self._reconnect_cancel = None
+                        self._reconnecting = False
+                        self._reconnect_workers = ()
+                if cleanup_errors:
+                    raise RuntimeError('simulation receiver cleanup failed') from cleanup_errors[0]
+                if success and not handed_off:
+                    raise RuntimeError('simulation runtime is stopping')
         return self.status()
 
     def status(self):
         with self._lock:
-            result = {'ready': bool(self._started and not self._stopped and self.receiver and self.receiver.ready),
+            result = {'ready': bool(self._started and not self._stopped and not self._reconnecting
+                                    and not self._reconnect_cleanup_failed and self.receiver and self.receiver.ready),
                       'simulation_only': True,
                       'last_workflow_error': self.workflow.last_error if self.workflow else None}
             enabled = self._command_observations_enabled
@@ -919,18 +1037,31 @@ class SimRuntime:
     def _shutdown(self):
         # Fence the workflow before exposing shutdown or waiting on any I/O.
         # A publish which already passed its workflow check remains in flight.
+        if self._reconnect_cancel is not None:
+            self._reconnect_cancel.set()
+        if self._receiver_cancel is not None:
+            self._receiver_cancel.set()
         if self.workflow is not None:
             with self.workflow._lock:
                 self.workflow._stopping = True
         self._stopped = True
         self._shutdown_running = True
+        self._shutdown_thread = threading.current_thread()
         try:
             errors = []
             actions = []
             if self.workflow is not None:
                 actions.append(self.workflow.stop)
-            if self._client is not None:
-                actions.append(lambda: self._close_client(self._client))
+            if self.receiver is not None and not self._reconnecting:
+                receiver = self.receiver
+                actions.append(lambda receiver=receiver: receiver._close_and_invalidate(
+                    RuntimeError('simulation runtime stopped'), disconnect=False))
+                actions.append(lambda receiver=receiver: receiver.gate.invalidate_many(tuple(receiver.task_ids)))
+            # The reconnect thread owns its provisional client until its
+            # blocking connect has returned; never disconnect it concurrently.
+            if self._client is not None and not self._reconnecting:
+                client = self._client
+                actions.append(lambda client=client: self._close_client(client))
             if self.command_observation_receiver is not None:
                 actions.append(self.command_observation_receiver.stop)
             actions.extend(lambda client=client: self._close_client(client)
@@ -951,6 +1082,8 @@ class SimRuntime:
             # reference which was admitted before shutdown has completed.
             while self._reference_operations:
                 self._reference_condition.wait()
+            if self._reconnect_cleanup_failed:
+                errors.append(RuntimeError('simulation reconnect cleanup failed'))
             if errors:
                 raise RuntimeError('simulation runtime cleanup failed') from errors[0]
             self._owner.release()
@@ -959,12 +1092,19 @@ class SimRuntime:
             raise
         finally:
             self._shutdown_running = False
+            self._shutdown_thread = None
             self._reference_condition.notify_all()
 
     def stop(self):
         if getattr(self._reference_local, 'depth', 0):
             raise RuntimeError('cannot stop from a reference operation')
+        if self._shutdown_thread is threading.current_thread():
+            raise RuntimeError('cannot reenter simulation shutdown')
+        if self._on_owned_worker():
+            raise RuntimeError('cannot stop from a simulation worker')
         with self._reference_condition:
+            if self._on_owned_worker():
+                raise RuntimeError('cannot stop from a simulation worker')
             if not self._stopped:
                 self._shutdown()
             else:
