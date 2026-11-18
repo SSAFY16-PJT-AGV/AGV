@@ -2,7 +2,10 @@
 import io
 import json
 import os
+import threading
+import time
 import unittest
+from unittest.mock import patch as mock_patch
 from types import SimpleNamespace
 from agv.link import FakeLink, LinkController, MqttLink
 from agv.nav import NavMap, Navigator
@@ -189,6 +192,7 @@ class SequenceTests(unittest.TestCase):
   runner.state="hold"; runner.hold_reason="nav_hold"
   def fail(_event): raise RuntimeError("send failure")
   link.publish_event=fail; ctl._watch_stop(); self.assertEqual(ctl.error,"event_unconfirmed")
+  self.assertEqual(ctl._stopped,set()); self.assertIsNone(ctl._anchor)
   link.publish_event=lambda event: self.fail("event must not be retried"); ctl._watch_stop()
  def test_reconnect_does_not_auto_resume_even_if_enabled(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
@@ -210,6 +214,146 @@ class SequenceTests(unittest.TestCase):
   runner.state="follow"; ctl._watch_link(112)
   self.assertEqual((runner.state,runner.hold_reason),("hold","link_lost"))
   ctl._watch_link(113); self.assertEqual(ctl.error,"link_lost")
+ def test_disconnect_reconnect_between_steps_latches_before_queued_extension(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+  ctl.link=link
+  ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  self.assertEqual(ctl.book.current["seq"],1)
+  resumes=runner.resumes
+  # Both callbacks and a new-generation order arrive before the next tick.
+  link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+  link._on_message(client,None,Msg()); ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(runner.resumes,resumes)
+ def test_disconnect_reconnect_after_tick_check_still_fences_new_order(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+  ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  resumes=runner.resumes
+  poll=link.poll_with_generation
+  def racing_poll():
+   link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+   link._on_message(client,None,Msg())
+   return poll()
+  link.poll_with_generation=racing_poll
+  ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(runner.resumes,resumes)
+ def test_disconnect_reconnect_before_stop_never_publishes_rear_clear(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  sent=[]; link.publish_event_once=lambda event:sent.append(event) or True
+  link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"
+  link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+  ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(sent,[]); self.assertEqual(ctl._stopped,set())
+ def test_disconnect_callback_during_puback_keeps_event_unconfirmed(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"
+  started=threading.Event(); workers=[]; sent=[]
+  def disconnect():
+   started.set(); link._on_disconnect(client,None,1)
+  def one_shot(event):
+   sent.append(event); t=threading.Thread(target=disconnect); workers.append(t); t.start()
+   self.assertTrue(started.wait(1))
+   pending=getattr(link,"disconnect_pending",None)
+   if pending is None:
+    time.sleep(.05)  # original callback blocks on the held MQTT lock
+   else:
+    deadline=time.monotonic()+1
+    while not pending() and time.monotonic()<deadline: time.sleep(.001)
+    self.assertTrue(pending())
+   return True  # server may have received it despite the disconnect
+  link.publish_event_once=one_shot
+  link.run_with_disconnect_fence(ctl._watch_stop_fenced)
+  for t in workers: t.join(2); self.assertFalse(t.is_alive())
+  self.assertEqual(len(sent),1)  # sending cannot be undone
+  self.assertEqual(ctl.error,"event_unconfirmed")
+  self.assertEqual(ctl._stopped,set())
+  self.assertFalse(ctl.book.finished)
+ def test_old_disconnect_requires_fresh_link_for_new_repeat_but_not_generic(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False
+  for repeated in (True,False):
+   nav,runner,_fake,ctl=self.fresh()
+   link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+   link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+   link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+   payload=order(1,"C")
+   if not repeated: payload["nodes"]=["A","B","C"]
+   msg=Msg(); msg.payload=json.dumps(payload).encode()
+   link._on_message(client,None,msg); ctl.step(now=100.1)
+   if repeated:
+    self.assertEqual(ctl.error,"link_lost"); self.assertIsNone(ctl.book.current)
+   else:
+    self.assertIsNone(ctl.error); self.assertEqual(ctl.book.current["seq"],1)
+ def test_one_shot_event_waits_for_puback_without_reconnect(self):
+  class EventClient(object):
+   def __init__(self,ack): self.ack=ack; self.connects=0; self.publishes=0; self.loops=0; self.closed=0
+   def connect(self,*args,**kwargs): self.connects+=1; return 0
+   def publish(self,*args,**kwargs):
+    self.publishes+=1
+    return SimpleNamespace(rc=0,mid=7)
+   def loop(self,timeout=0):
+    self.loops+=1
+    if self.loops==1: self.on_connect(self,None,None,0); return 0
+    if self.ack: self.on_publish(self,None,7); return 0
+    return 4  # disconnected after publish but before PUBACK
+   def disconnect(self): self.closed+=1
+  link=MqttLink("sim-r1"); link.connected=True
+  self.assertTrue(callable(getattr(link,"publish_event_once",None)))
+  for ack in (True,False):
+   one=EventClient(ack)
+   with mock_patch("agv.link.mqtt.mqtt.Client",return_value=one):
+    self.assertEqual(link.publish_event_once({"event_id":"e"}),ack)
+   self.assertEqual((one.connects,one.publishes,one.closed),(1,1,1))
+   self.assertEqual(one.loops,2)
+  # Paho 1.x has no CallbackAPIVersion; this validates its API shape only.
+  legacy=EventClient(True)
+  legacy_api=SimpleNamespace(Client=lambda **kwargs:legacy, MQTT_ERR_SUCCESS=0)
+  with mock_patch("agv.link.mqtt.mqtt",legacy_api):
+   self.assertTrue(link.publish_event_once({"event_id":"legacy"}))
+  self.assertEqual((legacy.connects,legacy.publishes,legacy.closed),(1,1,1))
  def test_unexpected_dead_end_stops_repeat_sequence(self):
   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
   nav.on_dead_end("left",100); stop=nav.pop_stop()

@@ -427,31 +427,93 @@ index 05e1abc..8e7a2d1 100644
                  for s in ("left", "right"):
                      f = br.get(s)
 diff --git a/agv/link/controller.py b/agv/link/controller.py
-index 3a11e31..818ac86 100644
+index 3a11e31..e699ff9 100644
 --- a/agv/link/controller.py
 +++ b/agv/link/controller.py
-@@ -74,8 +74,15 @@ class LinkController(object):
+@@ -57,6 +57,9 @@ class LinkController(object):
+         self._last_status = None
+         self.n_orders = 0
+         self._anchor = None             # (노드, 경로 순번, odo): 마지막으로 선 해제 노드
++        get_generation = getattr(link, "disconnect_generation", None)
++        self._seen_disconnect_generation = get_generation() if get_generation is not None else None
++        self._strict_disconnect_latched = False
+-
++
+     # ---------- 연결 ----------
+     def attach(self, runner):
+@@ -69,15 +72,58 @@ class LinkController(object):
+         if self._log is not None:
+             self._log(msg, **kw)
+-
++
++    def _consume_disconnect(self):
++        get_generation = getattr(self.link, "disconnect_generation", None)
++        if get_generation is None:
++            return
++        current = get_generation()
++        previous = self._seen_disconnect_generation
++        self._seen_disconnect_generation = current
++        pending = getattr(self.link, "disconnect_pending", lambda: False)()
++        if not getattr(self.nav, "_strict_repeat", False):
++            return
++        if not pending and (previous is None or previous == current):
++            return
++        self._strict_disconnect_latched = True
++        if self.error is None:
++            self.error = "link_lost"
++            self._note("link_lost", state=None if self.runner is None else self.runner.state)
++        runner = self.runner
++        if runner is not None and runner.state != "hold" and runner.hold("link_lost"):
++            self._note("link_lost_hold")
++
++    def _handle_fenced(self, payload):
++        # Called while MqttLink holds its re-entrant connection lock.
++        self._consume_disconnect()
++        self._handle(payload)
++
++    def _watch_stop_fenced(self):
++        self._consume_disconnect()
++        self._watch_stop()
++
+     # ---------- 한 스텝 ----------
+     def step(self, now=None):
          now = self.clock() if now is None else now
          for msg, kw in getattr(self.link, "pop_notes", lambda: [])():
              self._note(msg, **kw)
 -        for payload in self.link.poll():
 -            self._handle(payload)
++        self._consume_disconnect()
+         self._watch_link(now)
+-        self._watch_stop()
 +        poll_tagged = getattr(self.link, "poll_with_generation", None)
 +        process = getattr(self.link, "process_if_current", None)
 +        if poll_tagged is not None and process is not None:
 +            for generation, payload in poll_tagged():
-+                if not process(generation, payload, self._handle):
++                if not process(generation, payload, self._handle_fenced):
 +                    self._note("link_stale_order_discarded")
 +        else:
 +            for payload in self.link.poll():
-+                self._handle(payload)
-         self._watch_link(now)
-         self._watch_stop()
++                self._handle_fenced(payload)
++        self._consume_disconnect()
++        self._watch_link(now)
++        fence = getattr(self.link, "run_with_disconnect_fence", None)
++        if fence is None:
++            self._watch_stop_fenced()
++        else:
++            fence(self._watch_stop_fenced)
          st = self.state(now)
-@@ -120,6 +127,12 @@ class LinkController(object):
+         if (self._last_pub is None or now - self._last_pub >= self.state_period - 1e-6
+                 or st["status"] != self._last_status):
+@@ -120,6 +166,18 @@ class LinkController(object):
          if d.kind == "duplicate":
              self._note("link_order_duplicate", order_id=o["order_id"], seq=o["seq"])
              return
++        if (len(set(o["nodes"])) != len(o["nodes"])
++                and getattr(self.link, "disconnect_pending", lambda: False)()):
++            self._strict_disconnect_latched = True
++            self.error = "link_lost"
++            self._reject(o, "repeated route requires explicit recovery after disconnect")
++            return
 +        # A previously queued first order must not start after link loss.
 +        # Reconnect races are additionally fenced by MqttLink's queue lock.
 +        if not self.link.connected and (getattr(self.nav, "_strict_repeat", False)
@@ -461,7 +523,7 @@ index 3a11e31..818ac86 100644
          if r is None or r.finished:
              self._reject(o, "robot stopped (%s)" % (r.finish_reason if r is not None else "not ready"))
              return
-@@ -134,6 +147,13 @@ class LinkController(object):
+@@ -134,6 +192,13 @@ class LinkController(object):
                  self.nav.hold_at_end = True       # 마지막 노드에 닿아도 끝내지 않고 다음 작업을 기다림
                  self.nav.set_route(o["nodes"], o["released_until"])
              else:
@@ -475,16 +537,16 @@ index 3a11e31..818ac86 100644
                  self.nav.extend(o["released_until"])
          except (OrderRejected, ValueError) as e:
              self._reject(o, e.args[0] if e.args else str(e))
-@@ -153,6 +173,8 @@ class LinkController(object):
+@@ -153,6 +218,8 @@ class LinkController(object):
          r, b = self.runner, self.book
          if r is None or b.current is None:
              return
-+        if getattr(self.nav, "_strict_repeat", False) and self.error == "event_unconfirmed":
-+            return  # never replay an uncertain stop event automatically
++        if getattr(self.nav, "_strict_repeat", False) and self.error is not None:
++            return  # any unresolved error prevents a stop receipt
          o = b.current
          key = (o["order_id"], o["seq"])
          release = o["released_until"]
-@@ -162,6 +184,10 @@ class LinkController(object):
+@@ -162,6 +229,16 @@ class LinkController(object):
          if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
                  or self.nav.at_node != release:
              return
@@ -492,34 +554,49 @@ index 3a11e31..818ac86 100644
 +            self.error = "event_unconfirmed"
 +            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
 +            return
++        if (getattr(self.nav, "_strict_repeat", False)
++                and getattr(self.link, "disconnect_pending", lambda: False)()):
++            self.error = "event_unconfirmed"
++            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
++            return
++        previous_anchor = self._anchor
          self._stopped.add(key)
          self._anchor = (release, b.release_i, r.odo)
          self._event_n += 1
-@@ -169,7 +195,18 @@ class LinkController(object):
+@@ -169,7 +246,27 @@ class LinkController(object):
                "robot_session": self.session, "order_id": o["order_id"], "seq": o["seq"],
                "map_id": o["map_id"], "stopped_at": release,
                "cleared_resources": self.rules.cleared(o["nodes"], b.segment_start_i, b.release_i)}
 -        self.link.publish_event(ev)
 +        try:
-+            accepted = self.link.publish_event(ev)
++            if getattr(self.nav, "_strict_repeat", False):
++                one_shot = getattr(self.link, "publish_event_once", None)
++                accepted = one_shot(ev) if one_shot is not None else False
++            else:
++                accepted = self.link.publish_event(ev)
 +        except Exception:
 +            if not getattr(self.nav, "_strict_repeat", False):
 +                raise
++            self._stopped.discard(key)
++            self._anchor = previous_anchor
 +            self.error = "event_unconfirmed"
 +            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
 +            return
-+        if getattr(self.nav, "_strict_repeat", False) and accepted is not True:
++        if (getattr(self.nav, "_strict_repeat", False)
++                and (accepted is not True or getattr(self.link, "disconnect_pending", lambda: False)())):
++            self._stopped.discard(key)
++            self._anchor = previous_anchor
 +            self.error = "event_unconfirmed"
 +            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
 +            return
          final = b.at_final_release
          if final:
              b.mark_finished()
-@@ -194,9 +231,16 @@ class LinkController(object):
+@@ -194,9 +291,16 @@ class LinkController(object):
              return
          if self.error != "link_lost":
              return
-+        if getattr(self.nav, "_strict_repeat", False):
++        if self._strict_disconnect_latched or getattr(self.nav, "_strict_repeat", False):
 +            # Keep the disconnect latched even if the link returns during a
 +            # pivot/reverse/park action that cannot stop immediately. As soon
 +            # as the runner can hold, stop it and require manual recovery.
@@ -534,20 +611,33 @@ index 3a11e31..818ac86 100644
                  self._note("link_restored", resumed=True)
                  r.resume()
 diff --git a/agv/link/mqtt.py b/agv/link/mqtt.py
-index 8bb688f..abe602a 100644
+index 8bb688f..2340845 100644
 --- a/agv/link/mqtt.py
 +++ b/agv/link/mqtt.py
-@@ -52,7 +52,8 @@ class MqttLink(object):
+@@ -15,6 +15,7 @@ import json
+ import os
+ import threading
+ import time
++import uuid
+-
++
+ try:
+     import paho.mqtt.client as mqtt
+@@ -51,8 +52,12 @@ class MqttLink(object):
+         self.robot_id = robot_id
          self.topic = lambda kind: "agv/%s/%s" % (robot_id, kind)
          self.host, self.port, self.keepalive = host, int(port), int(keepalive)
++        self._event_credentials = (username, password, tls_ca)
          self._log = log
 -        self._lock = threading.Lock()
 +        self._lock = threading.RLock()
 +        self._connection_generation = 0
++        self._disconnect_generation = 0
++        self._disconnect_observed = threading.Event()
          self._orders = []
          self._notes = []
          self.connected = False
-@@ -92,16 +93,21 @@ class MqttLink(object):
+@@ -92,16 +97,25 @@ class MqttLink(object):
          if rc != 0:
              self._note("link_connect_failed", rc=rc)
              return
@@ -566,15 +656,19 @@ index 8bb688f..abe602a 100644
      def _on_disconnect(self, client, userdata, rc):
 -        self.connected = False
 -        self.disconnected_at = time.time()
++        # This must happen before waiting for the control/MQTT lock, which may
++        # be held while an event waits for its separate connection's PUBACK.
++        self._disconnect_observed.set()
 +        with self._lock:
 +            self.connected = False
 +            self.disconnected_at = time.time()
++            self._disconnect_generation += 1
 +            self._connection_generation += 1
 +            self._orders = []  # never replay orders from a lost connection
          self._note("link_disconnected", rc=rc)
  
      def _on_message(self, client, userdata, msg):
-@@ -112,8 +118,8 @@ class MqttLink(object):
+@@ -112,8 +126,8 @@ class MqttLink(object):
              self.dropped_retained += 1
              return
          with self._lock:
@@ -585,12 +679,26 @@ index 8bb688f..abe602a 100644
  
      def start(self):
          self.c.connect_async(self.host, self.port, keepalive=self.keepalive)
-@@ -130,7 +136,25 @@ class MqttLink(object):
+@@ -130,7 +144,39 @@ class MqttLink(object):
          """받은 주문 payload(bytes) 목록을 꺼낸다."""
          with self._lock:
              out, self._orders = self._orders, []
 -        return out
 +        return [payload for _, payload in out]
++
++    def disconnect_pending(self):
++        """Sticky callback-start signal; only a fresh link clears it."""
++        return self._disconnect_observed.is_set()
++
++    def disconnect_generation(self):
++        """Count observed disconnects even when a reconnect clears the timestamp."""
++        with self._lock:
++            return self._disconnect_generation
++
++    def run_with_disconnect_fence(self, handler):
++        """Serialize a short control operation with connection callbacks."""
++        with self._lock:
++            return handler()
 +
 +    def poll_with_generation(self):
 +        """Atomically return orders tagged with the connection they arrived on."""
@@ -612,6 +720,80 @@ index 8bb688f..abe602a 100644
  
      def publish_state(self, state):
          if self.connected:
+@@ -143,6 +189,61 @@ class MqttLink(object):
+                               qos=1, retain=False)
+         return info.rc == mqtt.MQTT_ERR_SUCCESS
+-
++
++    def publish_event_once(self, event, timeout=3.0):
++        """Use one temporary connection, require PUBACK, and never reconnect.
++
++        A lost acknowledgement is uncertain, not evidence of non-delivery.
++        This prevents this process from automatically replaying that event;
++        it does not promise exactly-once delivery or physical stop proof.
++        """
++        if not self.connected:
++            return False
++        username, password, tls_ca = self._event_credentials
++        client_id = "agv-event-" + uuid.uuid4().hex[:16]
++        if hasattr(mqtt, "CallbackAPIVersion"):
++            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True)
++        else:
++            client = mqtt.Client(client_id=client_id, clean_session=True)
++        connected, acked = [], set()
++        def on_connect(_client, _userdata, _flags, code):
++            connected.append(code == 0)
++        def on_publish(_client, _userdata, mid):
++            acked.add(mid)
++        client.on_connect = on_connect
++        client.on_publish = on_publish
++        try:
++            if username:
++                client.username_pw_set(username, password)
++            if tls_ca:
++                client.tls_set(ca_certs=tls_ca)
++            if hasattr(client, "connect_timeout"):
++                client.connect_timeout = timeout
++            deadline = time.monotonic() + timeout
++            if client.connect(self.host, self.port, keepalive=self.keepalive) != mqtt.MQTT_ERR_SUCCESS:
++                return False
++            while not connected:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
++                    return False
++            if not connected[0]:
++                return False
++            info = client.publish(self.topic("event"), json.dumps(event, ensure_ascii=False, separators=(",", ":")),
++                                  qos=1, retain=False)
++            if info.rc != mqtt.MQTT_ERR_SUCCESS:
++                return False
++            while info.mid not in acked:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
++                    return False
++            return True
++        except (OSError, RuntimeError, ValueError):
++            return False
++        finally:
++            try:
++                client.disconnect()
++            except (OSError, RuntimeError):
++                pass
++
+     def stop(self):
+         try:
+             if self.connected:
+@@ -179,6 +280,9 @@ class FakeLink(object):
+         if self.connected:
+             self.states.append(state)
+-
++
++    def publish_event_once(self, event):
++        return self.publish_event(event)
++
+     def publish_event(self, event):
+         self.events.append(event)
+         return True
 diff --git a/agv/runner.py b/agv/runner.py
 index 669caa2..0e097e7 100644
 --- a/agv/runner.py
