@@ -75,7 +75,7 @@ const status={mode:'fleet', accepting_orders:false, accepting_queued_orders:true
 const answers={'id-1':{status:'pending',request_id:'id-1'}, 'id-2':{status:'pending',request_id:'id-2'}};
 const context={
   crypto:{randomUUID:()=> 'key-' + (++uuid)},
-  document:{getElementById:element, createElement:()=>({})},
+  document:{getElementById:element, createElement:()=>({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(f) {timer=f;},
   fetch:async (url) => {
     if (url.endsWith('/products')) return {ok:true,json:async()=>({products:[
@@ -165,13 +165,14 @@ let timer;
 let outcome = {status:'pending', request_id:'id-1'};
 const context = {
   crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
-  document: {getElementById:element, createElement:() => ({})},
+  document: {getElementById:element, createElement:() => ({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(f) {timer=f;},
   fetch: async (url) => {
     if (url.endsWith('/products')) return {ok:true, json:async () => ({products:[
       {id:'red', label:'빨강', pickup_node:'D01', destination_node:'D04', shelf_id:'SHELF_RED', slot_index:0}]})};
     if (url.endsWith('/nodes')) return {ok:true, json:async () => ({nodes:[{id:'D01'}]})};
-    if (url.endsWith('/status')) return {ok:true, json:async () => ({status:'idle', phase:null, route:[]})};
+    if (url.endsWith('/status')) return {ok:true, json:async () =>
+      ({status:'idle', phase:null, route:[], stale:false, connected:true, unreal_connected:true})};
     if (url.endsWith('/product-orders')) {posts++; return {ok:true, status:202, json:async () => ({status:'pending', request_id:'id-1'})};}
     if (url.endsWith('/submissions/id-1')) return {ok:true, json:async () => outcome};
     throw new Error(url);
@@ -230,12 +231,13 @@ const catalog = [{id:'red', label:'빨강', pickup_node:'D01', destination_node:
                   shelf_id:'SHELF_RED', slot_index:0}];
 const context = {
   crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
-  document: {getElementById:element, createElement:() => ({})},
+  document: {getElementById:element, createElement:() => ({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(fn) {timer = fn;},
   fetch: async (url, options = {}) => {
     if (url.endsWith('/products')) return {ok:true, json:async () => ({products:catalog})};
     if (url.endsWith('/nodes')) return {ok:true, json:async () => ({nodes:[{id:'D01'}, {id:'D04'}]})};
-    if (url.endsWith('/status')) return {ok:true, json:async () => current};
+    if (url.endsWith('/status')) return {ok:true, json:async () =>
+      ({stale:false, connected:true, unreal_connected:true, ...current})};
     if (url.endsWith('/submissions/test-request-1')) {
       if (lookupLost) throw new Error('status lookup lost');
       return {ok:true, json:async () => submissionState};
