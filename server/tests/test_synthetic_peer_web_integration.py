@@ -84,6 +84,9 @@ class SyntheticPeerWebIntegration(unittest.TestCase):
             self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('accepting_orders')),
                             diagnostic())
             self.assertEqual(request(server_port, '/order-demo/api/status')['action_source'], 'synthetic')
+            map_view = request(server_port, '/order-demo/api/map')
+            self.assertEqual(map_view['coordinate_unit'], 'mm')
+            self.assertEqual({item['robot_id'] for item in map_view['occupancy']}, {'sim-r1', 'sim-r2'})
             # An authenticated UE-style socket can observe but cannot attach
             # as the synthetic action owner or inject a fabricated result.
             with connect('ws://127.0.0.1:{}/ws/digital-twin'.format(server_port), proxy=None,
@@ -96,6 +99,10 @@ class SyntheticPeerWebIntegration(unittest.TestCase):
                     submissions = [future.result() for future in futures]
                 self.assertTrue(all(status in (200, 202) for status, _ in submissions))
                 request_ids = [submitted['request_id'] for _, submitted in submissions]
+                def active_map():
+                    view = request(server_port, '/order-demo/api/map')
+                    return view if any(item['kind'] == 'edge' for item in view['occupancy']) else None
+                self.assertIsNotNone(wait_for(active_map, timeout=15), diagnostic())
                 def terminal(request_id):
                     row = request(server_port, '/order-demo/api/orders/' + request_id)
                     return row if row.get('status') in ('completed', 'unknown', 'failed') else None
@@ -103,6 +110,8 @@ class SyntheticPeerWebIntegration(unittest.TestCase):
                 self.assertTrue(all(result is not None and result['status'] == 'completed' for result in results),
                                 diagnostic())
                 self.assertEqual({result['assigned_robot'] for result in results}, {'sim-r1', 'sim-r2'})
+                map_view = request(server_port, '/order-demo/api/map')
+                self.assertEqual({item['robot_id'] for item in map_view['occupancy']}, {'sim-r1', 'sim-r2'})
             with closing(sqlite3.connect(durable / 'pickup-inventory.sqlite3')) as db:
                 self.assertEqual(db.execute("SELECT available FROM counts WHERE source_id='D01'").fetchone(), (2,))
                 self.assertEqual(db.execute("SELECT available FROM counts WHERE source_id='D06'").fetchone(), (2,))

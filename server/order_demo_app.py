@@ -47,8 +47,9 @@ class ShelfFull(RuntimeError):
 class DemoRuntime:
     def __init__(self, engine, port, nodes, observer=None, *, snapshot_max_age=1.0, clock=time.monotonic,
                  auto_recovery=False, journal=None, recovery_blocked=False, pickup_store=None,
-                 field_mapping=None, products=None, action_source='unreal'):
+                 field_mapping=None, products=None, action_source='unreal', map_runtime=None):
         self.engine = engine
+        self.map_runtime = map_runtime
         self._action_source = action_source
         self.field_mapping = field_mapping
         self.products = copy.deepcopy(products if products is not None else PRODUCTS)
@@ -769,6 +770,7 @@ async def lifespan(app):
     with ExitStack() as cleanup:
         journal = None
         pickup_store = None
+        runtime = None
         recovery_blocked = False
         if os.environ.get('AGV_ORDER_COORDINATED') == '1':
             # A fresh, disposable DB and dedicated robot are only for the
@@ -916,7 +918,8 @@ async def lifespan(app):
                            auto_recovery=(os.environ.get('AGV_ORDER_COORDINATED') == '1'
                                           and os.environ.get('AGV_ORDER_FLEET') == '1'),
                            journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store,
-                           field_mapping=field_mapping, products=products, action_source=action_source)
+                           field_mapping=field_mapping, products=products, action_source=action_source,
+                           map_runtime=runtime)
         app.state.mqtt_service = service
         try:
             demo.start()
@@ -993,6 +996,18 @@ def nodes(request: Request):
 @app.get('/order-demo/api/status')
 def status(request: Request):
     return _demo(request).snapshot()
+
+
+@app.get('/order-demo/api/map')
+def map_observation(request: Request):
+    demo = _demo(request)
+    try:
+        from server.order_demo_map import read_map
+        value = read_map(demo.map_runtime)
+        return JSONResponse(value, headers={'Cache-Control': 'no-store'})
+    except Exception:
+        raise HTTPException(503, '가상 지도 및 점유를 확인할 수 없습니다',
+                            headers={'Cache-Control': 'no-store'}) from None
 
 
 @app.get('/order-demo/api/products')

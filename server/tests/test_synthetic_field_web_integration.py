@@ -170,9 +170,18 @@ uvicorn.run('server.order_demo_app:app', host='127.0.0.1', port=int(os.environ['
                 return (folder / 'server.log').read_text(encoding='utf-8', errors='replace')[-12000:]
             self.assertTrue(wait_for(lambda: request(server_port, '/order-demo/api/status').get('accepting_orders')),
                             diagnostic())
+            map_view = request(server_port, '/order-demo/api/map')
+            self.assertEqual(map_view['map_id'], 'mat_ssafy_v2@v0')
+            self.assertEqual(map_view['coordinate_unit'], 'mm')
+            self.assertEqual({item['robot_id'] for item in map_view['occupancy']}, {'sim-r1', 'sim-r2'})
             product_ids = ['red'] if repeat or crash else ['red', 'blue']
             with ThreadPoolExecutor(max_workers=len(product_ids)) as pool:
                 requests = list(pool.map(lambda product: submit(server_port, product), product_ids))
+            if not crash and not repeat:
+                def active_map():
+                    view = request(server_port, '/order-demo/api/map')
+                    return view if any(item['kind'] == 'edge' for item in view['occupancy']) else None
+                self.assertIsNotNone(wait_for(active_map, timeout=15), diagnostic())
             if crash:
                 self.assertTrue(wait_for(marker.exists, timeout=120), diagnostic())
                 server.kill()
@@ -199,6 +208,8 @@ uvicorn.run('server.order_demo_app:app', host='127.0.0.1', port=int(os.environ['
             results = [wait_for(lambda: terminal(rid), timeout=150) for rid in requests]
             self.assertTrue(all(row is not None and row['status'] == 'completed' for row in results),
                             'orders={!r}\n{}'.format(results, diagnostic()))
+            map_view = request(server_port, '/order-demo/api/map')
+            self.assertEqual({item['robot_id'] for item in map_view['occupancy']}, {'sim-r1', 'sim-r2'})
             self.assertEqual({row['assigned_robot'] for row in results}, {'sim-r1'} if repeat else {'sim-r1', 'sim-r2'})
             orders = []
             while not captured.empty():
