@@ -17,7 +17,7 @@
 ```
 git remote set-url origin https://github.com/SSAFY16-PJT-AGV/AGV.git   # 저장소 주소가 바뀜(한 번만)
 git fetch origin
-git checkout feature/topo-mapping
+git checkout feature/field-run
 git pull
 python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레이션 테스트는 건너뜀
 ```
@@ -285,7 +285,7 @@ python3 -m agv.tools.runlog data/replay --all
 
 ## 9. 완성된 맵에서 목표 패치로 가기 (goto)
 
-실제 매트에서는 `feature/field-run` 브랜치를 쓴다. goto(`feature/goto-nav`)에 실물 주행 수정(`feature/topo-mapping`: 모터 드라이버, 라인 문턱 자동, 패치 가장자리·매트 밖 바닥 무시, 급커브 라인 찾기, 회전 멈춤 보정)을 합친 브랜치다. Jetson에서 `git stash && git fetch origin && git checkout feature/field-run && git pull && git stash pop`.
+로봇 코드는 `feature/field-run` 브랜치 하나에 모여 있다(예전 `feature/topo-mapping`·`feature/goto-nav`·`feature/robot-mqtt`는 모두 이 브랜치에 합쳐졌고 지웠다). goto와 실물 주행 수정(모터 드라이버, 라인 문턱 자동, 패치 가장자리·매트 밖 바닥 무시, 급커브 라인 찾기, 회전 멈춤 보정), 서버 주문 serve 모드가 다 들어 있다. Jetson이 예전 브랜치에 있으면 `git stash && git fetch origin --prune && git checkout feature/field-run && git pull && git stash pop`.
 
 맵은 매트 도안으로 만든 `maps/mat_ssafy_v2.json`을 쓴다(아래 명령의 `maps/field_v2.json` 자리에 넣는다). 탐색으로 만든 맵(6단계)이 있으면 그것도 된다. 시뮬레이션 맵(`maps/sim_ssafy_v2.json`)은 실제 매트와 길이가 달라서 실기체에는 쓰지 않는다. 1~3단계(카메라 자세, 색, 속도 보정)는 끝나 있어야 한다. 로봇은 패치 색과 갈림길로 위치를 알기 때문이다. 특히 `patch.length_mm`(패치 진행 방향 길이)가 있어야 패치마다 속도를 다시 재서 위치가 안 밀린다.
 

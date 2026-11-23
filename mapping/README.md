@@ -55,7 +55,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 python3 mapping/unify_map.py maps/mat_ssafy_v2.json      # 그 자리에 고쳐 씀(다시 돌려도 같음)
 ```
 
-`maps/mat_ssafy_v2.json`(실제 매트 맵, `feature/topo-mapping`의 `design_map.py`가 매트 도안으로 만든 것)을 이렇게 고쳐 넣었다(`V_E15`: S2-M2 오른쪽 가지, `V_E16`: S3-P_yellow 두 번째 가지). 나중에 `design_map.py`·`build_map.py`가 바로 이 형식을 내보내면 이 스크립트는 필요 없다.
+`maps/mat_ssafy_v2.json`(실제 매트 맵, `mapping/design_map.py`가 매트 도안으로 만든 것)을 이렇게 고쳐 넣었다(`V_E15`: S2-M2 오른쪽 가지, `V_E16`: S3-P_yellow 두 번째 가지). 나중에 `design_map.py`·`build_map.py`가 바로 이 형식을 내보내면 이 스크립트는 필요 없다.
 
 ## 뷰어
 
