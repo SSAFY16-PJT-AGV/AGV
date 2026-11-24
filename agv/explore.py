@@ -53,7 +53,7 @@ import time
 import cv2
 
 from .hw import NullMotors, make_motors, open_camera
-from .linecam import DEFAULT_CONFIG, draw_debug, merge_config
+from .linecam import DEFAULT_CONFIG, draw_debug
 from .runner import ExploreRunner
 from .nav import NavMap, Navigator
 from .topo import EventLogger, Explorer
@@ -62,10 +62,35 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 
-def load_config(path):
-    with io.open(path, "r", encoding="utf-8") as f:
-        user = json.load(f)
-    return merge_config(DEFAULT_CONFIG, user)
+def load_settings(config=None, robot=None):
+    """설정 읽기(robotcfg.Resolved). config를 주면 그 파일 하나만, 아니면 공통 + 로봇 파일."""
+    from .robotcfg import resolve
+    return resolve(config, robot, DEFAULT_CONFIG)
+
+
+def load_config(path=None, robot=None):
+    return load_settings(path, robot).cfg
+
+
+def add_config_args(ap):
+    """--config / --robot (모든 도구 공통)."""
+    ap.add_argument("--robot", "--robot-id", dest="robot", default=None,
+                    help="로봇 ID(예: physical-1). 기본은 환경 변수 AGV_ROBOT_ID, 그다음 agv/config/robot_id 파일. "
+                         "정하면 agv/config/robots/<ID>/explore.json을 공통 설정 위에 덮어 읽고, 현장 도구는 거기에 씀. "
+                         "serve의 MQTT 토픽 ID도 이것")
+    ap.add_argument("--config", default=None,
+                    help="설정 파일 하나만 쓰기(영상 재생 실험 등). 기본은 agv/config/explore.json + 로봇 파일")
+
+
+def settings_from_args(ap, a):
+    """add_config_args로 받은 값으로 설정을 읽는다. a.settings, a.config(현장 도구가 쓸 파일)를 채움."""
+    try:
+        res = load_settings(a.config, a.robot)
+    except ValueError as e:
+        ap.error(str(e))
+    a.settings = res
+    a.config = res.write_path
+    return res
 
 
 def make_ask_fn(motors, view=None):
@@ -87,10 +112,10 @@ def make_ask_fn(motors, view=None):
     return ask
 
 
-def _note_camera_calib(cfg, logger, runner):
-    """렌즈 보정값(config/camera_calib.json)이 있으면 기록하고, 지금 카메라 설정과 맞는지 본다.
+def _note_camera_calib(cfg, logger, runner, path=None):
+    """렌즈 보정값(로봇 폴더의 camera_calib.json)이 있으면 기록하고, 지금 카메라 설정과 맞는지 본다.
     지금은 주행에 쓰지 않는다(바닥 mm 좌표계 단계에서 씀)."""
-    path = os.path.join(HERE, "config", "camera_calib.json")
+    path = path or os.path.join(HERE, "config", "camera_calib.json")
     if not os.path.exists(path):
         return
     try:
@@ -197,7 +222,8 @@ def _start_link(a, cfg, nav, nmap, runner, logger):
         st["host"] = a.mqtt_host
     if a.mqtt_port:
         st["port"] = a.mqtt_port
-    rid = a.robot_id or lc.get("robot_id") or cfg["robot"].get("id", "agv1")
+    res = getattr(a, "settings", None)
+    rid = (res.robot if res is not None else None) or lc.get("robot_id") or cfg["robot"].get("id", "agv1")
 
     def note(msg, **kw):
         logger.log("note", runner._odo(), msg=msg, **kw)
@@ -239,13 +265,12 @@ def main(argv=None):
                     help="패치 속도 보정. auto: lap 모드는 색을 잡은 뒤(autocolor --write)에만 켬, 나머지 모드는 켬")
     ap.add_argument("--lap-side", choices=["left", "right"], default="left",
                     help="lap 모드에서 갈림길마다 고를 쪽. 매트를 시계 방향으로 돌면 left가 바깥 고리")
-    ap.add_argument("--robot-id", default=None, help="serve: MQTT 토픽의 로봇 ID(기본 config robot.id)")
     ap.add_argument("--mqtt-host", default=None, help="serve: 브로커 주소(기본 MQTT_HOST, config link.host)")
     ap.add_argument("--mqtt-port", type=int, default=None, help="serve: 브로커 포트(기본 1883)")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
-    ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
+    add_config_args(ap)
     ap.add_argument("--out", default=None, help="결과 폴더(기본 data/runs/<시각>)")
     ap.add_argument("--record", action="store_true", help="카메라 영상을 camera.mp4로 저장")
     ap.add_argument("--debug-every", type=int, default=20, help="N프레임마다 검출 그림 저장(0이면 끔)")
@@ -263,7 +288,9 @@ def main(argv=None):
                     help="OpenCV 창으로 띄움(모니터 연결 또는 ssh -X). q로 정지. 원격이면 --view가 훨씬 빠름")
     a = ap.parse_args(argv)
 
-    cfg = load_config(a.config)
+    res = settings_from_args(ap, a)
+    cfg = res.cfg
+    print(res.describe())
     if a.max_time is None:
         a.max_time = float("inf") if a.mode == "serve" else (240.0 if a.mode == "lap" else 600.0)
     video_mode = a.camera.startswith("video:")
@@ -315,7 +342,10 @@ def main(argv=None):
     if not os.path.isdir(dbg_dir):
         os.makedirs(dbg_dir)
     with io.open(os.path.join(out, "config_used.json"), "w", encoding="utf-8") as f:
-        f.write(json.dumps(cfg, ensure_ascii=False, indent=1))
+        used = dict(cfg)
+        used["_settings"] = {"robot": res.robot, "robot_source": res.source,
+                             "layers": [os.path.relpath(x, ROOT) if x.startswith(ROOT) else x for x in res.layers]}
+        f.write(json.dumps(used, ensure_ascii=False, indent=1))
 
     arm_res = None
     if not video_mode and not a.no_arm:
@@ -367,7 +397,7 @@ def main(argv=None):
                            map_hint=(nav.m.map_id if nav is not None else None),
                            trace_path=os.path.join(out, "trace.jsonl"), lap_side=a.lap_side,
                            speedcal=_speedcal(a, cfg))
-    _note_camera_calib(cfg, logger, runner)
+    _note_camera_calib(cfg, logger, runner, res.calib_path)
     ctl = link = None
     if a.mode == "serve":
         ctl, link = _start_link(a, cfg, nav, nmap, runner, logger)

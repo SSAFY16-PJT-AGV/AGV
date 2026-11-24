@@ -6,7 +6,7 @@ JETANK 카메라는 팔 끝에 달려 있어서 카메라가 바닥을 보는 �
     1번 팔 좌우(카메라 좌우) / 2번 팔 아래 관절 / 3번 팔 가운데 관절 / 5번 카메라 상하
     (4번은 집게라 카메라와 상관없음)
 
-사람이 한 번 자세를 정해 `config/explore.json`의 `arm.servo_angles`에 저장하면(`camtool arm`),
+사람이 한 번 자세를 정해 설정의 `arm.servo_angles`에 저장하면(`camtool arm`, 로봇 ID가 있으면 `config/robots/<ID>/explore.json`),
 탐색·사진 찍기·색 보정 촬영이 시작할 때마다 그 자세로 맞춘다. 판정 지점 거리(`geom.ctrl_ahead_mm`),
 렌즈 보정, 바닥 사진은 이 자세에서 잰 값이라서 자세를 바꾸면 다시 재야 한다.
 
@@ -16,10 +16,7 @@ Python 3.6 호환.
 """
 from __future__ import print_function
 
-import io
-import json
 import os
-import shutil
 import time
 
 ARM_IDS = ("1", "2", "3", "5")
@@ -181,21 +178,21 @@ def apply_saved(cfg, say=print, settle_s=1.5):
     return res
 
 
-def save_pose(config_path, pose, note=None):
-    """config 파일의 arm.servo_angles에 쓴다(원래 파일은 .bak-<시각>). 반환: (백업 경로, 이전 자세)."""
-    with io.open(config_path, encoding="utf-8") as f:
-        user = json.load(f)
-    bak = config_path + time.strftime(".bak-%Y%m%d-%H%M%S")
-    shutil.copy(config_path, bak)
-    arm = user.setdefault("arm", {})
-    old = arm.get("servo_angles")
-    arm["servo_angles"] = dict((k, None if v is None else round(float(v), 1)) for k, v in sorted(pose.items()))
-    arm["saved_at"] = time.strftime("%Y-%m-%d %H:%M")
-    if note:
-        arm["saved_note"] = note
-    with io.open(config_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(user, ensure_ascii=False, indent=2) + u"\n")
-    return bak, old
+def save_pose(config_path, pose, note=None, robot=None):
+    """config 파일의 arm.servo_angles에 쓴다(원래 파일은 .bak-<시각>, 로봇 파일이 없으면 새로 만듦).
+    반환: (백업 경로 또는 None, 이전 자세)."""
+    from .robotcfg import update
+    box = {}
+
+    def put(user):
+        arm = user.setdefault("arm", {})
+        box["old"] = arm.get("servo_angles")
+        arm["servo_angles"] = dict((k, None if v is None else round(float(v), 1)) for k, v in sorted(pose.items()))
+        arm["saved_at"] = time.strftime("%Y-%m-%d %H:%M")
+        if note:
+            arm["saved_note"] = note
+    bak = update(config_path, put, robot)
+    return bak, box.get("old")
 
 
 def calib_pose_warning(cfg, recorded, what):

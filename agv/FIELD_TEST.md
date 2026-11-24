@@ -22,13 +22,25 @@ git pull
 python3 -m unittest discover -s agv/tests      # sim/mat/이 없으면 시뮬레이션 테스트는 건너뜀
 ```
 
-현장에서 저장한 설정(`autocolor --write`, `camtool arm`의 `p`, `calib --write`)은 `agv/config/` 안의 파일을 바꾼다. 그 상태에서 `git pull`이 "local changes would be overwritten"으로 멈추면 설정을 잠깐 치워 두고 받은 뒤 되돌린다.
+**로봇 ID (젯슨마다 처음 한 번)**: 로봇이 두 대라 현장 값(카메라 자세, 색, 판정 지점 거리, trim, 렌즈 보정값)을 로봇마다 따로 둔다. 젯슨에서 한 번 로봇 ID를 정하면 `agv/config/robot_id`(git에 안 올림)에 적히고, 이후 모든 명령이 `agv/config/robots/<ID>/`의 설정을 공통 설정(`agv/config/explore.json`) 위에 덮어 읽는다. 현장 도구(`camtool arm`의 `p`, `autocolor --write`, `calib --write`)도 그 로봇 폴더에 쓴다. serve 모드의 MQTT 로봇 ID도 이것이다.
+
+```
+python3 -m agv.tools.robotcfg init physical-1               # 2호기는 physical-2
+python3 -m agv.tools.robotcfg init physical-1 --move-local  # 예전처럼 공통 파일에 현장 값을 저장해 둔 젯슨(1호기)
+python3 -m agv.tools.robotcfg show                          # 지금 로봇 ID·설정 파일·현장 값 확인
+```
+
+`--move-local`은 공통 파일에서 git 원래 내용과 다른 값만 로봇 파일로 옮기고 공통 파일은 원래대로 되돌린다(바꾸기 전 파일은 `explore.json.before-robotcfg`). `git stash`로 치워 둔 설정이 있으면 `git stash pop`을 먼저 한다. 렌즈 보정값(`agv/config/camera_calib.json`)도 로봇 폴더로 옮긴다. 명령마다 `--robot physical-2`로 바꿔 줄 수도 있다(환경 변수 `AGV_ROBOT_ID`도 됨). 시작할 때 `로봇 physical-1(...) - 설정 ...` 줄로 어느 설정을 읽었는지 보인다.
+
+로봇 폴더 파일은 그 젯슨에서만 고치므로 `git pull`과 부딪히지 않는다. 공통 파일(`agv/config/explore.json`)을 현장에서 고쳤다면 예전처럼 치워 두고 받는다.
 
 ```
 git stash          # 현장에서 바꾼 설정 잠깐 치우기
 git pull
 git stash pop      # 되돌리기. 충돌이 나면 agv/config/explore.json에서 <<<< 표시 부분을 골라 고친다
 ```
+
+로봇 폴더 값을 잃지 않으려면 가끔 커밋해 올리거나(`git add agv/config/robots/physical-1 && git commit`) 노트북으로 복사해 둔다.
 
 **모터 (처음 한 번 확인)**: JetPack 4.5 JetBot 이미지는 `jetbot` 라이브러리가 도커 컨테이너 안에만 있어서 SSH 터미널의 python3에서는 `No module named 'jetbot'`이 난다. 이때는 모터 보드(PCA9685, I2C)를 바로 움직이는 내장 드라이버로 바꿔 쓴다. 시작할 때 `모터: pca9685@0x60`이 나오면 그것이다(`jetbot`이 있으면 `모터: jetbot`).
 
@@ -112,7 +124,7 @@ python3 -m agv.explore --mode lap --enable-motors --record --view
 
 ```
 python3 -m agv.tools.autocolor data/runs/<시각>            # 결과 확인
-python3 -m agv.tools.autocolor data/runs/<시각> --write    # 괜찮으면 config/explore.json에 저장
+python3 -m agv.tools.autocolor data/runs/<시각> --write    # 괜찮으면 로봇 설정(config/robots/<ID>/explore.json)에 저장
 ```
 
 **통과 기준**
@@ -196,7 +208,7 @@ python3 -m agv.explore --mode ask --enable-motors --record --view
 
 **안 되면**
 
-| 증상 | 고칠 값 (`config/explore.json`의 `recover`) |
+| 증상 | 고칠 값 (로봇 설정 `config/robots/<ID>/explore.json`의 `recover`) |
 | --- | --- |
 | 스퍼 끝을 못 알아보고 매트 밖으로 나감 | `end_frames` 3 → 2. 스퍼가 600mm보다 길면 `window_mm`를 늘림 |
 | 후진이 비뚤어짐 | `k_slope` 0.04 → 0.03(흔들림) 또는 0.05(덜 따라감). `reverse_speed`를 낮춤 |
@@ -268,7 +280,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field_v2.js
 `--record`로 찍은 `camera.mp4`를 노트북에서 다시 돌리면 로봇 없이 문턱값을 바꿔 볼 수 있다. 녹화 fps가 주행과 같아서 프레임 수 기준 판정도 그대로 재현된다.
 
 ```
-cp agv/config/explore.json /tmp/try.json            # junction.vee_cont_px 등을 고쳐 본다
+cp data/runs/<시각>/config_used.json /tmp/try.json   # 그 주행에 쓴 설정. junction.vee_cont_px 등을 고쳐 본다
 python3 -m agv.explore --camera video:data/runs/<시각>/camera.mp4 --config /tmp/try.json --out data/replay
 # --view를 붙이면 브라우저(http://localhost:8080)에서 실제 속도로 보면서 재생
 python3 -m agv.tools.runlog data/replay --all
@@ -276,7 +288,7 @@ python3 -m agv.tools.runlog data/replay --all
 
 - **모서리에서 `vee_seen`이 안 나옴**: `--all`로 그 시각 근처에 `merge`가 찍혔는지 본다. 찍혔다면 옆 선이 천천히 붙은 것이다. 이때는 `vee_max_frames`를 7로 올려 본다.
 - **엉뚱한 곳에서 `vee_seen`**: 그 `cont` 값보다 `vee_cont_px`를 높인다. 단, 모서리의 `cont`보다는 낮게 유지한다.
-- 고친 값은 `agv/config/explore.json`의 `junction` 아래에 적는다(`DEFAULT_CONFIG`를 덮어씀).
+- 고친 값은 로봇마다 다르면 `agv/config/robots/<ID>/explore.json`, 두 대 공통이면 `agv/config/explore.json`의 `junction` 아래에 적는다(`DEFAULT_CONFIG`를 덮어씀).
 - 영상 재생은 모터를 쓰지 않아 `trace.jsonl`이 없으므로, 재생 결과로 만든 맵은 모양을 계산하지 않는다(엣지 길이로 추정한 배치). 맵 모양은 원래 주행 폴더로 만든다.
 
 ## 8. 결과 공유

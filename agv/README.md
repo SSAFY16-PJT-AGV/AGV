@@ -23,9 +23,12 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `speedcal.py` | 색 패치를 지날 때마다 실제 주행 속도를 다시 재서 이동거리 보정 |
 | `tools/autocolor.py` | 한 바퀴 영상에서 패치 색 범위·문턱 자동 보정 |
 | `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
-| `config/explore.json` | 현장 값(속도, HSV, 카메라). `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
+| `config/explore.json` | 두 대 공통 값. `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
+| `config/robots/<ID>/` | 로봇마다 잰 값(`explore.json`: 카메라 자세·색·판정 지점·trim, `camera_calib.json`: 렌즈 보정값). 공통 값을 덮어쓴다. 로봇 ID는 `tools/robotcfg.py init`(`robotcfg.py`) |
 
 ## 현장 순서
+
+**로봇 ID 먼저(젯슨마다 한 번)**: `python3 -m agv.tools.robotcfg init physical-1`(2호기는 `physical-2`). 아래에서 저장하는 현장 값은 모두 그 로봇 폴더(`config/robots/<ID>/`)로 간다. 예전에 공통 파일에 저장해 둔 젯슨은 `init physical-1 --move-local`로 옮긴다([FIELD_TEST.md](FIELD_TEST.md) 0단계).
 
 막다른 길·V자까지 단계별로 시험하는 체크리스트는 [FIELD_TEST.md](FIELD_TEST.md)에 있다. 주행 결과 요약은 `python3 -m agv.tools.runlog data/runs/<시각>`으로 본다.
 
@@ -35,7 +38,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - Waveshare 서보 라이브러리 `SCSCtrl`이 필요하다. 없다고 나오면 `cd ~ && git clone https://github.com/waveshare/JETANK.git && cd JETANK && pip3 install --user .`(받아만 둬도 `~/JETANK`에서 찾아 씀). 포트 권한·시리얼 콘솔 문제는 [FIELD_TEST.md](FIELD_TEST.md) 0단계.
    - 로봇을 라인 위에 놓고 브라우저(`http://<젯슨 IP>:8080`)로 검출 화면을 보며 키보드로 맞춘다. `1`·`2`·`3`·`5`로 서보(팔 좌우, 팔 아래 관절, 팔 가운데 관절, 카메라 상하)를 고르고 `+`/`-`로 움직인다(`[` 1도씩, `]` 5도씩). 손으로 맞추려면 `f`로 힘을 뺐다가 `f`로 고정한다. `p`로 저장, `q`로 끝.
    - 라인이 화면 아래 절반의 가운데쯤 보이고, 가로줄마다 초록 점이 하나씩 찍히면 된다. 상태 표에 "선 하나로 보이는 줄", "조향 줄 선 위치"가 숫자로 나온다. `--view`가 없으면 `data/snap/arm_preview.png`를 계속 저장한다.
-   - 저장한 각도(`config/explore.json`의 `arm.servo_angles`)는 이후 `explore`, `camtool snap`/`ground`, `autocolor --camera`가 시작할 때 자동으로 맞춘다. 맞춘 뒤 다시 읽어 3도 넘게 다르면 경고한다. 팔을 건드리지 않으려면 `--no-arm`. `camtool arm --read`는 지금·저장한 각도 출력, `--apply`는 맞추기만, `--save-now`는 지금 자세를 그대로 저장.
+   - 저장한 각도(로봇 설정 `config/robots/<ID>/explore.json`의 `arm.servo_angles`)는 이후 `explore`, `camtool snap`/`ground`, `autocolor --camera`가 시작할 때 자동으로 맞춘다. 맞춘 뒤 다시 읽어 3도 넘게 다르면 경고한다. 팔을 건드리지 않으려면 `--no-arm`. `camtool arm --read`는 지금·저장한 각도 출력, `--apply`는 맞추기만, `--save-now`는 지금 자세를 그대로 저장.
    - 자세를 다시 저장하면 그 자세에서 잰 값(5번 판정 지점 거리, 7번 렌즈 보정·바닥 사진)을 다시 잰다. 저장할 때 목록이 나온다.
    - 확인: `python3 -m agv.tools.camtool snap` → `data/snap/debug.png`. `full.png`(원본 해상도)도 같이 저장된다. 검출 그림과 HSV 측정은 주행 해상도인 `raw.png` 기준이다.
    - GStreamer가 안 열리면 `--camera jetbot`으로 바꾼다(이때는 노출 고정이 안 됨). JetPack이 오래돼 `aelock`을 모르면 `camera.lock_exposure`를 `false`로 둔다.
@@ -44,7 +47,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - `lap`이 엉뚱한 쪽으로 가면 `--mode ask`로 갈림길을 직접 고른다(고를 쪽은 `FIELD_TEST.md` 2단계). 모터가 준비되지 않았거나 선을 못 따라가면 `--mode passive`로 로봇을 손으로 밀어 한 바퀴 녹화한다.
    - 처음 바퀴를 굴리기 전에 앞으로 가는지 확인한다. 바퀴 방향이 반대면 `robot.invert_left/right`를 고친다.
    - `python3 -m agv.tools.autocolor data/runs/<시각>` → 색마다 새 H 범위, 바꿀 문턱, **그 영상에서 잡히는 패치 순서(기존 설정 vs 새 설정)**가 나온다. `autocolor.png`에서 이름표와 실제 패치 사진이 맞는지 본다.
-   - 괜찮으면 `--write`를 붙여 다시 실행한다. `config/explore.json`에 쓰고 원래 파일은 `.bak-<시각>`으로 남는다. 라인 문턱(`line.v_max` 등)은 지금 값이 안전한 범위면 그대로 둔다.
+   - 괜찮으면 `--write`를 붙여 다시 실행한다. 로봇 설정(`config/robots/<ID>/explore.json`, 로봇 ID가 없으면 `config/explore.json`)에 쓰고 원래 파일은 `.bak-<시각>`으로 남는다. 라인 문턱(`line.v_max` 등)은 지금 값이 안전한 범위면 그대로 둔다.
    - 조명이 바뀌면(낮/밤, 다른 강의실) 한 바퀴 다시 찍어 돌리면 된다. 녹화 없이 `--camera gst --seconds 60`으로 카메라에서 바로 찍을 수도 있다.
    - 이름은 무지개 순서(빨강→주황→노랑→초록→파랑→보라)로 붙인다. 매트에 일부 색만 있으면 `--colors red,blue,...`로 알려 준다. 바닥·신발 같은 다른 색이 잡히면 화면에 안 들어오게 다시 찍는다.
    - 손으로 재야 할 때: `snap` 후 `python3 -m agv.tools.camtool hsv data/snap/raw.png x y w h`.
@@ -58,7 +61,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
    - 갈라지는 곳에서 멈추고 왼쪽/오른쪽을 묻는다. 라인 추종이 흔들리면 `follow.base_speed`를 낮추고 `follow.kp`를 조정한다.
 7. **렌즈 보정(카메라 캘리브레이션)**: 지금 주행과 맵 생성에는 안 쓴다. 다음 단계(카메라와 패치로 바닥 mm 좌표를 재서 맵 모양을 더 정확하게)에 필요하니 현장에 간 김에 찍어 둔다. 계산은 노트북에서 해도 된다.
    - 주행 자세(팔 각도) 그대로 `python3 -m agv.tools.camtool snap --count 25 --out data/calib`. 1.5초마다 한 장씩 찍으며 장마다 체커보드가 보였는지(O/x) 알려 준다. 보드를 화면 가운데·네 귀퉁이·가장자리로, 30~45도 기울여 가며 옮긴다.
-   - `python3 -m agv.tools.calib data/calib` → 일반(핀홀)·어안 모델을 둘 다 계산해 재투영 오차가 작은 쪽을 고른다. 오차 1px 아래, 화면 덮은 비율 60% 이상이면 좋다. `calib_check.png` 오른쪽(편 사진)에서 곧은 선이 곧게 보이는지 확인하고 `--write`로 `config/camera_calib.json`에 저장한다.
+   - `python3 -m agv.tools.calib data/calib` → 일반(핀홀)·어안 모델을 둘 다 계산해 재투영 오차가 작은 쪽을 고른다. 오차 1px 아래, 화면 덮은 비율 60% 이상이면 좋다. `calib_check.png` 오른쪽(편 사진)에서 곧은 선이 곧게 보이는지 확인하고 `--write`로 `config/robots/<ID>/camera_calib.json`에 저장한다.
    - 보정값은 그 센서 모드에서만 맞는다. `camera.capture_width/height`나 `flip`을 바꾸거나 초점 링을 돌리면 다시 찍는다(주행 시작 때 안 맞으면 경고).
    - 설계 문서 5.2절은 ChArUco 보드를 쓰지만, Jetson 기본 OpenCV(4.1.1)에는 aruco 모듈이 없을 수 있어 일반 체커보드를 쓴다. 렌즈 보정값은 같게 나온다. 보드 크기(안쪽 모서리 9x6 등)는 자동으로 찾고, 칸 크기는 결과에 영향이 없다.
    - 같이 찍어 둘 것: 로봇을 라인 위, 패치가 앞 15~25cm에 통째로 보이게 세우고 `python3 -m agv.tools.camtool ground --enable-motors --out data/ground` (제자리에서 좌우로 조금씩 돌며 9장).
@@ -121,7 +124,13 @@ MQTT_HOST=<브로커 PC IP> python3 -m agv.explore --mode serve --map maps/mat_s
 ```
 
 - 로봇을 `--start` 노드 조금 앞(라인 위)에 놓으면 서서 첫 주문을 기다린다(상태 `IDLE`, `last_node`가 그 노드). 첫 주문의 첫 노드는 `--start`여야 하고, 다음 새 작업은 이전 작업의 마지막 노드에서 시작해야 한다. 스퍼 끝에서 시작하는 주문(`D_P_red, P_red, ...`)은 그 스퍼에 주차해 있을 때만 된다(처음부터 스퍼 끝에 놓고 시작하는 건 아직 안 됨).
-- 로봇 ID는 `--robot-id` 또는 config `robot.id`. 브로커 주소·인증은 서버와 같은 환경변수(`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA`)나 config `link` 항목(`host`, `port`, `waiting`, `state_hz`, `link_loss_s`, `resume_after_reconnect`, `battery`)으로 준다.
+- 로봇 ID는 젯슨마다 `python3 -m agv.tools.robotcfg init physical-1`로 정한 값(또는 `--robot`, 환경 변수 `AGV_ROBOT_ID`). 실물은 `physical-<번호>`, 서버의 가상 로봇은 `sim-`으로 시작한다. 브로커 주소·인증은 서버와 같은 환경변수(`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA`)나 config `link` 항목(`host`, `port`, `waiting`, `state_hz`, `link_loss_s`, `resume_after_reconnect`, `battery`)으로 준다.
+- **서버 없이 실물 1대 시험**: 노트북에서 브로커(`mosquitto -v`)를 띄우고, 젯슨에서 위 serve 명령(`MQTT_HOST=<노트북 IP>`)을 띄운 뒤 노트북에서 배차기만 돌린다. 로봇의 첫 상태를 받으면 주문을 보내고, `rear_clear`를 받을 때마다 다음 주문을 보낸다(예약·충돌 방지는 안 함, 1대용). 보낸 주문은 `data/link_demo/dispatch.jsonl`에 남는다.
+  ```bash
+  python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \
+      --dispatch P_orange,S1,M3,P_red --then P_red,P_blue,P_orange
+  mosquitto_sub -h 127.0.0.1 -t 'agv/physical-1/#' -v     # 다른 창에서 상태·이벤트 보기
+  ```
 - 시간 제한이 없다(`--max-time`으로 줄 수 있음). Ctrl+C로 끝내면 `conn`에 `offline`을 남긴다. 프로그램이 죽거나 와이파이가 끊기면 브로커가 15초쯤 뒤 LWT로 `offline`을 대신 보낸다.
 
 | 토픽 | 방향 | 내용 |

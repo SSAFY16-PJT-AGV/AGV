@@ -34,7 +34,7 @@ import cv2
 import numpy as np
 
 from ..camcalib import find_corners, guess_board
-from ..explore import HERE, ROOT, _offmat_text, _thr_text, load_config
+from ..explore import ROOT, _offmat_text, _thr_text, add_config_args, settings_from_args
 from ..hw import make_motors, open_camera
 from ..linecam import JunctionTracker, PatchTracker, analyze, draw_debug
 
@@ -255,8 +255,8 @@ def _arm_save(a, cfg, pose):
         print(u"못 읽은 서보가 있어서 저장하지 않았어요: " + A.fmt(pose))
         return 1
     old = A.saved_pose(cfg)
-    bak, _ = A.save_pose(a.config, pose)
-    print(u"카메라 자세를 저장했어요: %s (원래 설정: %s)" % (A.fmt(pose), bak))
+    bak, _ = A.save_pose(a.config, pose, robot=getattr(a, "settings", None) and a.settings.robot)
+    print(u"카메라 자세를 %s에 저장했어요: %s (%s)" % (a.config, A.fmt(pose), u"원래 설정: %s" % bak if bak else u"새 파일"))
     d = A.pose_diff(old, pose) if old else None
     if old is None or d is None or d > 1.0:
         print(u"자세가 바뀌었으니 이 자세에서 다시 재야 하는 것:")
@@ -441,7 +441,7 @@ def cmd_turn(a, cfg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
+    add_config_args(ap)
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("snap")
     s.add_argument("--no-arm", action="store_true", help="저장한 카메라 자세로 팔을 맞추지 않음")
@@ -479,7 +479,10 @@ def main(argv=None):
     tu.add_argument("--seconds", type=float, default=1.0)
     tu.add_argument("--enable-motors", action="store_true")
     a = ap.parse_args(argv)
-    cfg = load_config(a.config)
+    res = settings_from_args(ap, a)
+    cfg = res.cfg
+    if a.cmd in ("snap", "arm", "ground"):
+        print(res.describe())
     if a.cmd == "snap":
         return cmd_snap(a, cfg)
     if a.cmd == "hsv":

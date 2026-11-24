@@ -5,7 +5,7 @@
     python3 -m agv.tools.camtool snap --count 25 --out data/calib
     # 2) 계산 -> 결과 표, 확인 그림(calib_check.png), data/calib/camera_calib.json
     python3 -m agv.tools.calib data/calib
-    # 3) 괜찮으면 설정 폴더에 저장(agv/config/camera_calib.json)
+    # 3) 괜찮으면 설정 폴더에 저장(agv/config/robots/<ID>/camera_calib.json, 로봇 ID가 없으면 agv/config/)
     python3 -m agv.tools.calib data/calib --write
 
 일반(핀홀) 모델과 어안 모델을 둘 다 계산해 재투영 오차가 작은 쪽을 고른다. 보드 크기(안쪽 모서리
@@ -32,7 +32,7 @@ import numpy as np
 
 from ..camcalib import (CameraCalib, board_points, calib_fisheye, calib_pinhole, coverage, find_corners,
                         fov_deg, guess_board, scale_K)
-from ..explore import HERE, load_config
+from ..explore import add_config_args, settings_from_args
 
 
 def _parse_board(s):
@@ -183,10 +183,12 @@ def main(argv=None):
                     help="체커보드 사진 폴더(full_*.png)")
     ap.add_argument("--board", default=None, help="안쪽 모서리 가로x세로(예: 9x6). 기본은 자동")
     ap.add_argument("--square", type=float, default=25.0, help="칸 한 변(mm). 렌즈 보정값에는 영향 없음")
-    ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
-    ap.add_argument("--write", action="store_true", help="agv/config/camera_calib.json에 저장(원래 파일은 .bak)")
+    add_config_args(ap)
+    ap.add_argument("--write", action="store_true",
+                    help="설정 폴더에 저장(로봇 ID가 있으면 agv/config/robots/<ID>/camera_calib.json, 원래 파일은 .bak)")
     a = ap.parse_args(argv)
-    cfg = load_config(a.config)
+    res_cfg = settings_from_args(ap, a)
+    cfg = res_cfg.cfg
     out, info = run(a.folder, cfg, _parse_board(a.board) if a.board else None, a.square)
 
     print(u"\n== 결과 ==")
@@ -211,7 +213,9 @@ def main(argv=None):
     print(u"\n확인 그림: %s (오른쪽 사진에서 보드·매트의 곧은 선이 곧게 펴졌는지 보세요)" % chk)
     print(u"결과: %s" % res_path)
     if a.write:
-        dst = os.path.join(HERE, "config", "camera_calib.json")
+        dst = res_cfg.calib_path
+        if not os.path.isdir(os.path.dirname(dst)):
+            os.makedirs(os.path.dirname(dst))
         if os.path.exists(dst):
             bak = dst + time.strftime(".bak-%Y%m%d-%H%M%S")
             shutil.copy(dst, bak)

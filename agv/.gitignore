@@ -1,2 +1,8 @@
 .ipynb_checkpoints/
 __pycache__/
+# 젯슨마다 다른 로봇 ID와 현장 도구가 남기는 백업 (agv/robotcfg.py)
+config/robot_id
+config/*.bak*
+config/**/*.bak*
+config/*.before-robotcfg
+config/**/*.tmp

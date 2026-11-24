@@ -10,6 +10,10 @@
     python3 sim/link_demo.py --dispatch P_orange,S1,M1,P_purple,S2,V_E15,M2,P_green \\
         --releases P_purple,V_E15,P_green --then P_green,M2,S2,P_purple,M1,S1,P_orange,D_P_orange
 
+    # 실물 로봇에 배차기만(가상 로봇 없이). 젯슨에서 serve 모드를 먼저 띄워 둔다
+    python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \
+        --dispatch P_orange,S1,M3,P_red --then P_red,P_blue,P_orange
+
     # 주문 하나를 손으로(mosquitto_pub)
     mosquitto_pub -t agv/sim-r1/order -q 1 -m '{"order_id":"T1","seq":1,"map_id":"mat_ssafy_v2@v0",
         "nodes":["P_orange","S1","M3","P_red"],"released_until":"P_red","action_at_end":{"type":"none"}}'
@@ -51,8 +55,12 @@ class Dispatcher(object):
             self.c.username_pw_set(st["username"], st["password"])
         if st["tls_ca"]:
             self.c.tls_set(ca_certs=st["tls_ca"])
-        self.c.on_connect = lambda c, u, f, rc: c.subscribe("agv/%s/event" % robot_id, qos=1)
-        self.c.on_message = self._on_event
+        self.c.on_connect = lambda c, u, f, rc: (c.subscribe("agv/%s/event" % robot_id, qos=1),
+                                                 c.subscribe("agv/%s/state" % robot_id, qos=0))
+        self.c.on_message = self._on_message
+        self.last_state = None
+        self.got_state = threading.Event()
+        self.prefix = "D" + time.strftime("%H%M%S")   # 다시 띄워도 order_id가 겹치지 않게
         self.c.connect(st["host"], st["port"], 10)
         self.c.loop_start()
         self.job = None
@@ -74,8 +82,18 @@ class Dispatcher(object):
             return
         self.n += 1
         nodes, rel = self.jobs.pop(0)
-        self.job, self.k = ("D%d" % self.n, nodes, rel), 0
+        self.job, self.k = ("%s-%d" % (self.prefix, self.n), nodes, rel), 0
         self._send()
+
+    def _on_message(self, c, u, msg):
+        if msg.topic.endswith("/state"):
+            try:
+                self.last_state = json.loads(msg.payload.decode("utf-8"))
+            except ValueError:
+                return
+            self.got_state.set()
+            return
+        self._on_event(c, u, msg)
 
     def _on_event(self, c, u, msg):
         ev = json.loads(msg.payload.decode("utf-8"))
@@ -110,6 +128,8 @@ def main(argv=None):
     ap.add_argument("--dispatch", default=None, help="작은 배차기로 보낼 경로(쉼표)")
     ap.add_argument("--releases", default=None, help="--dispatch 경로의 해제 노드들(쉼표). 없으면 끝 노드 한 번")
     ap.add_argument("--then", default=None, help="첫 작업 뒤 이어서 보낼 경로(쉼표, 끝 노드까지 한 번에 해제)")
+    ap.add_argument("--dispatch-only", action="store_true",
+                    help="가상 로봇 없이 배차기만(실물 로봇에 --dispatch 경로를 보냄). --robot-id physical-1 등")
     ap.add_argument("--max-time", type=float, default=600.0)
     ap.add_argument("--fast", action="store_true", help="실시간보다 빠르게(기본은 실제 시간에 맞춤)")
     ap.add_argument("--out", default=os.path.join(ROOT, "data", "link_demo"))
@@ -123,6 +143,8 @@ def main(argv=None):
         st["port"] = a.port
     with io.open(a.map, encoding="utf-8") as f:
         raw = json.load(f)
+    if a.dispatch_only:
+        return dispatch_only(a, st, raw)
     nmap = NavMap(raw)
     nav = Navigator(nmap, start=a.start, stop_offset_mm=80, hold_at_end=True)
     if not os.path.isdir(a.out):
@@ -185,6 +207,54 @@ def main(argv=None):
         if disp is not None:
             disp.stop()
         link.stop()
+        lf.close()
+    return 0
+
+
+def _jobs(a):
+    nodes = [n.strip() for n in a.dispatch.split(",") if n.strip()]
+    rel = [n.strip() for n in a.releases.split(",")] if a.releases else [nodes[-1]]
+    jobs = [(nodes, rel)]
+    if a.then:
+        t = [n.strip() for n in a.then.split(",") if n.strip()]
+        jobs.append((t, [t[-1]]))
+    return jobs
+
+
+def dispatch_only(a, st, raw):
+    """실물 로봇(serve 모드)에 주문만 보낸다. 로봇의 첫 상태를 받은 뒤 시작한다."""
+    if not a.dispatch:
+        print(u"--dispatch-only에는 --dispatch 경로가 필요해요")
+        return 2
+    from agv.link.controller import map_ref_of
+    map_ref = map_ref_of(NavMap(raw))
+    if not os.path.isdir(a.out):
+        os.makedirs(a.out)
+    lf = io.open(os.path.join(a.out, "dispatch.jsonl"), "a", encoding="utf-8")
+
+    def log_line(d):
+        lf.write(json.dumps(dict(d, t=round(time.time(), 3)), ensure_ascii=False) + u"\n")
+        lf.flush()
+    disp = Dispatcher(st, a.robot_id, map_ref, _jobs(a), log_line)
+    print(u"브로커 %s:%d, 로봇 %s, 맵 %s - 로봇 상태를 기다려요(젯슨에서 serve 모드를 띄웠는지 확인)" % (
+        st["host"], st["port"], a.robot_id, map_ref))
+    try:
+        if not disp.got_state.wait(30.0):
+            print(u"30초 동안 agv/%s/state가 안 왔어요. 로봇 ID·브로커 주소를 확인하세요." % a.robot_id)
+            return 2
+        s = disp.last_state or {}
+        print(u"로봇 상태: %s, 마지막 노드 %s, 맵 %s" % (s.get("status"), s.get("last_node"), s.get("map_id")))
+        if s.get("map_id") and s.get("map_id") != map_ref:
+            print(u"[주의] 로봇 맵(%s)과 보낼 맵(%s)이 달라요. 로봇이 주문을 거절할 거예요." % (s.get("map_id"), map_ref))
+        disp.next_job()
+        t0 = time.time()
+        while not disp.done.is_set() and time.time() - t0 < a.max_time:
+            time.sleep(0.2)
+        print(u"끝: %s" % (u"주문 다 보냄" if disp.done.is_set() else u"시간 초과"))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        disp.stop()
         lf.close()
     return 0
 

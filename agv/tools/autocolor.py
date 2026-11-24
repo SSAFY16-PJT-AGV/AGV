@@ -7,7 +7,7 @@
     python3 -m agv.explore --mode passive --record
     # 2) 그 영상으로 색 잡기 -> 결과 표, 확인용 그림(autocolor.png), 다시 돌려 본 패치 순서
     python3 -m agv.tools.autocolor data/runs/<시각>
-    # 3) 괜찮으면 config/explore.json에 쓰기(원래 파일은 .bak으로 남김)
+    # 3) 괜찮으면 설정에 쓰기(로봇 ID가 있으면 config/robots/<ID>/explore.json, 원래 파일은 .bak으로 남김)
     python3 -m agv.tools.autocolor data/runs/<시각> --write
 
     # 녹화 없이 카메라로 바로(그동안 로봇을 손으로 밀어 한 바퀴)
@@ -31,14 +31,13 @@ import io
 import itertools
 import json
 import os
-import shutil
 import sys
 import time
 
 import cv2
 import numpy as np
 
-from ..explore import HERE, load_config
+from ..explore import add_config_args, settings_from_args
 from ..linecam import DEFAULT_CONFIG, PatchTracker, analyze, merge_config
 
 H = 180   # OpenCV 색상 범위
@@ -380,14 +379,16 @@ def main(argv=None):
     ap.add_argument("--no-arm", action="store_true", help="--camera일 때 저장한 카메라 자세로 팔을 맞추지 않음")
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--every", type=int, default=2, help="N프레임마다 하나 씀")
-    ap.add_argument("--config", default=os.path.join(HERE, "config", "explore.json"))
+    add_config_args(ap)
     ap.add_argument("--colors", default=None, help="매트에 있는 색 이름(쉼표). 기본은 설정의 patch.colors 전부")
     ap.add_argument("--out", default=None, help="확인 그림·결과 JSON 폴더(기본: 주행 폴더 또는 data/autocolor)")
-    ap.add_argument("--write", action="store_true", help="결과를 --config 파일에 써 넣음(원래 파일은 .bak)")
+    ap.add_argument("--write", action="store_true", help="결과를 설정에 써 넣음(로봇 ID가 있으면 그 로봇 파일, 원래 파일은 .bak)")
     a = ap.parse_args(argv)
     if not a.run and not a.camera:
         ap.error(u"주행 폴더(영상)나 --camera 중 하나가 필요해요")
-    cfg = load_config(a.config)
+    res_cfg = settings_from_args(ap, a)
+    cfg = res_cfg.cfg
+    print(res_cfg.describe())
     expect = [c.strip() for c in a.colors.split(",")] if a.colors else list(cfg["patch"]["colors"])
     out = a.out or (a.run if a.run and os.path.isdir(a.run) else os.path.join(os.getcwd(), "data", "autocolor"))
     if not os.path.isdir(out):
@@ -437,25 +438,23 @@ def main(argv=None):
     print(u"\n확인 그림: %s (색 이름이 실제 패치와 맞는지 보세요)" % sw)
 
     if a.write:
-        with io.open(a.config, encoding="utf-8") as f:
-            user = json.load(f)
-        bak = a.config + time.strftime(".bak-%Y%m%d-%H%M%S")
-        shutil.copy(a.config, bak)
-        for sec in ("line", "patch"):
-            if not res[sec]:
-                continue
-            user.setdefault(sec, {})
-            for k, v in res[sec].items():
-                if k == "colors":
-                    cols = dict(user[sec].get("colors") or cfg["patch"]["colors"])
-                    cols.update(v)
-                    user[sec]["colors"] = cols
-                else:
-                    user[sec][k] = v
-        user.setdefault("patch", {})["autocolor_at"] = time.strftime("%Y-%m-%d %H:%M")   # 색을 잡았다는 표시
-        with io.open(a.config, "w", encoding="utf-8") as f:
-            f.write(json.dumps(user, ensure_ascii=False, indent=2) + u"\n")
-        print(u"%s에 썼어요(원래 파일: %s)" % (a.config, bak))
+        from ..robotcfg import update
+
+        def put(user):
+            for sec in ("line", "patch"):
+                if not res[sec]:
+                    continue
+                user.setdefault(sec, {})
+                for k, v in res[sec].items():
+                    if k == "colors":
+                        cols = dict(user[sec].get("colors") or cfg["patch"]["colors"])
+                        cols.update(v)
+                        user[sec]["colors"] = cols
+                    else:
+                        user[sec][k] = v
+            user.setdefault("patch", {})["autocolor_at"] = time.strftime("%Y-%m-%d %H:%M")   # 색을 잡았다는 표시
+        bak = update(a.config, put, res_cfg.robot)
+        print(u"%s에 썼어요(%s)" % (a.config, u"원래 파일: %s" % bak if bak else u"새 파일"))
     else:
         print(u"설정에 넣으려면 --write를 붙여 다시 실행하세요.")
     return 0
