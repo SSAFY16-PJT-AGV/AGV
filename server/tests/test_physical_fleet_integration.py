@@ -76,15 +76,27 @@ class PhysicalFleetIntegration(unittest.TestCase):
                     time.sleep(.1)
 
             states = {}
+            timeline = []   # every order/event/state change seen on the broker, for AGV_PHYSICAL_TIMELINE
             lock = threading.Lock()
+            t0 = time.monotonic()
             subscribed = threading.Event()
             watch = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
 
             def on_message(_c, _u, msg):
-                robot = msg.topic.split('/')[1]
+                robot, kind = msg.topic.split('/')[1:3]
+                if kind == 'conn':
+                    return
+                value = json.loads(msg.payload.decode('utf-8'))
                 with lock:
-                    states[robot] = json.loads(msg.payload.decode('utf-8'))
-            watch.on_connect = lambda c, u, f, r, p: c.subscribe('agv/+/state', 0)
+                    if kind == 'state':
+                        old = states.get(robot) or {}
+                        states[robot] = value
+                        keys = ('status', 'last_node', 'order_id', 'seq', 'released_until')
+                        if tuple(old.get(k) for k in keys) == tuple(value.get(k) for k in keys):
+                            return
+                    timeline.append((round(time.monotonic() - t0, 2), robot, kind, value))
+            watch.on_connect = lambda c, u, f, r, p: c.subscribe([('agv/+/state', 0), ('agv/+/order', 1),
+                                                                   ('agv/+/event', 1)])
             watch.on_subscribe = lambda c, u, mid, codes, props: subscribed.set()
             watch.on_message = on_message
             watch.connect('127.0.0.1', port, 15)
@@ -197,6 +209,12 @@ class PhysicalFleetIntegration(unittest.TestCase):
                              {('node', 'D_P_orange'): 'physical-1', ('node', 'D_P_blue'): 'physical-2'})
             for task in ('P1-1', 'P2-1'):
                 self.assertEqual(runtime.task_status(task)['status'], 'DONE')
+            out = os.environ.get('AGV_PHYSICAL_TIMELINE')
+            if out:
+                with open(out, 'w', encoding='utf-8') as f:
+                    for t, robot, kind, value in timeline:
+                        f.write(json.dumps({'t': t, 'robot': robot, 'kind': kind, 'msg': value},
+                                           ensure_ascii=False) + '\n')
             self.assertIsNone(runtime.physical_watcher.last_error)
             self.assertIsNone(runtime.workflow.last_error)
 
