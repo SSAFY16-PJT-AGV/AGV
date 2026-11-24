@@ -17,6 +17,7 @@ from contextlib import closing, contextmanager
 
 from server.allocation_store import _validate_json, _stored_field_route, _verify_field_global
 from server.route_occurrence import visit_indices_from_orders
+from server.robot_ids import is_fleet_robot
 
 
 class RecoveryError(ValueError):
@@ -78,8 +79,8 @@ def _snapshot(db, task_id, *, field_required=False):
     if row is None or row[6] != 'ASSIGNED':
         raise RecoveryError('task has no active allocation')
     robot, map_id, nodes_json, released, first_payload, first_state, status = row
-    if not isinstance(robot, str) or not robot.startswith('sim-') or not robot[4:].strip():
-        raise RecoveryError('only isolated simulation robots can be reconciled')
+    if not is_fleet_robot(robot):
+        raise RecoveryError('only sim- or physical- robots can be reconciled')
     _id(robot, 'robot_id'); _id(map_id, 'map_id')
     active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
     fingerprint = db.execute("SELECT value FROM allocation_meta WHERE key='map_fingerprint'").fetchone()

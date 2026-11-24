@@ -1,7 +1,10 @@
-"""Lifecycle owner for the proposed, isolated-simulation control workflow.
+"""Lifecycle owner for the proposed control workflow (isolated simulation, opt-in physical robots).
 
 The local endpoint and simulated identities are not authentication or network
-isolation. Never use this runtime for a physical robot or a shared broker.
+isolation. ``physical-`` robots are accepted only with ``physical_robots=True``
+and field simulation (team-map routes); their sessions and stop proofs come
+from their own state messages (``server/physical_state_proof.py``). Use broker
+authentication for a shared broker.
 """
 import copy
 import json
@@ -23,6 +26,8 @@ from server.order_publisher import OrderPublisher, _topic
 from server.mqtt_security import configure_mqtt_client, read_mqtt_security
 from server.recovery import RecoveryGate
 from server.segment_progress import SegmentProgress
+from server.robot_ids import is_physical_robot
+from server.physical_state_proof import FROM_STATE, PhysicalStateWatcher
 from sim.event_inbox import SimEventInbox
 from sim.event_receiver import SimEventReceiver
 from sim.workflow import SimProgressWorkflow
@@ -70,9 +75,11 @@ class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
                  field_simulation=False, field_initial_positions=None, command_observations=False,
-                 investigation_notes=False):
+                 investigation_notes=False, physical_robots=False, physical_state_timeout=15.0):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
+        if type(physical_robots) is not bool:
+            raise ValueError('physical_robots must be boolean')
         if type(command_observations) is not bool or (command_observations and not field_simulation):
             raise ValueError('command observations require explicit field simulation')
         if type(investigation_notes) is not bool:
@@ -96,10 +103,24 @@ class SimRuntime:
         if not isinstance(robot_sessions, dict) or not robot_sessions:
             raise ValueError('static robot sessions are required')
         self._tasks, self._sessions = {}, copy.deepcopy(robot_sessions)
+        physical = [robot for robot in self._sessions if is_physical_robot(robot)]
+        if physical and not physical_robots:
+            raise ValueError('physical- robots require physical_robots=True')
+        if physical and (not field_simulation or simulation_store is not None
+                         or command_observations or field_initial_positions is not None):
+            raise ValueError('physical- robots are supported only with plain field simulation')
+        if (isinstance(physical_state_timeout, bool) or not isinstance(physical_state_timeout, (int, float))
+                or not 0 < physical_state_timeout <= 120):
+            raise ValueError('physical_state_timeout must be in (0, 120] seconds')
+        self._physical = tuple(physical)
+        self._physical_state_timeout = float(physical_state_timeout)
+        self.physical_watcher = None
         for robot, sessions in self._sessions.items():
             _topic(robot)
             if not isinstance(sessions, dict) or not sessions:
                 raise ValueError('each robot needs explicitly mapped tasks')
+            if not is_physical_robot(robot) and FROM_STATE in sessions.values():
+                raise ValueError('only physical- robots may take their session from state')
             for task, session in sessions.items():
                 _id(task, 'task_id'); _id(session, 'robot_session')
                 if task in self._tasks:
@@ -204,6 +225,8 @@ class SimRuntime:
                 self._simulation_store.validate_bound(self.path)
             self._owner.acquire()
             try:
+                if self._physical:
+                    self._start_physical_watcher()
                 self.store = self._simulation_store or (AllocationStore(self.path, field_required=True)
                                                         if self._field_simulation else AllocationStore(self.path))
                 if self._simulation_store is not None:
@@ -294,11 +317,28 @@ class SimRuntime:
                     if self.receiver._closed or time.monotonic() >= deadline:
                         raise RuntimeError('simulation receiver was not ready')
                     time.sleep(0.01)
+                if self.physical_watcher is not None:
+                    self.physical_watcher.bind(self, {r: self._physical_sessions[r] for r in self._physical})
                 self._started = True
             except BaseException:
                 self._shutdown()
                 raise
         return self
+
+    def _start_physical_watcher(self):
+        """Read each physical robot's live session and bind it into the static task mapping."""
+        watcher = PhysicalStateWatcher(self._physical, client=self._new_client(), host=self.host,
+                                       port=self.port, connect_timeout=self.connect_timeout)
+        self.physical_watcher = watcher.start()
+        live = watcher.wait_sessions(self._physical_state_timeout)
+        self._physical_sessions = live
+        for robot in self._physical:
+            for task, session in list(self._sessions[robot].items()):
+                if session == FROM_STATE:
+                    self._sessions[robot][task] = live[robot]
+                    self._tasks[task] = (robot, live[robot])
+                elif session != live[robot]:
+                    raise RuntimeError('configured session of %s differs from its live state' % robot)
 
     def _ready(self):
         if (not self._started or self._stopped or self._reconnecting or self._reconnect_cleanup_failed
@@ -1044,6 +1084,12 @@ class SimRuntime:
         if self.workflow is not None:
             with self.workflow._lock:
                 self.workflow._stopping = True
+        watcher, self.physical_watcher = getattr(self, 'physical_watcher', None), None
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
         self._stopped = True
         self._shutdown_running = True
         self._shutdown_thread = threading.current_thread()

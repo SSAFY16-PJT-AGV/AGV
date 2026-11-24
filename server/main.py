@@ -34,8 +34,10 @@ def load_sim_runtime():
     config = json.loads(raw.decode('utf-8'), object_pairs_hook=pairs)
     required = {'database', 'map_file', 'robots', 'mqtt_port', 'mqtt_client_id'}
     if (not isinstance(config, dict) or not required.issubset(config)
-            or set(config) - required - {'field_simulation', 'command_observations', 'investigation_notes'}
+            or set(config) - required - {'field_simulation', 'command_observations', 'investigation_notes',
+                                         'physical_robots'}
             or type(config.get('field_simulation', False)) is not bool
+            or type(config.get('physical_robots', False)) is not bool
             or type(config.get('command_observations', False)) is not bool
             or type(config.get('investigation_notes', False)) is not bool
             or (config.get('command_observations', False) and not config.get('field_simulation', False))):
@@ -57,6 +59,8 @@ def load_sim_runtime():
         options['command_observations'] = True
     if config.get('investigation_notes', False):
         options['investigation_notes'] = True
+    if config.get('physical_robots', False):
+        options['physical_robots'] = True
     runtime = SimRuntime(db_path, map_data, config['robots'], port=config['mqtt_port'],
                          client_id=config['mqtt_client_id'], **options)
     return runtime, token

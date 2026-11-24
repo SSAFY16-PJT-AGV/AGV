@@ -12,6 +12,7 @@ from server.allocation_store import AllocationConflict, _id, _validate_json
 from server.segment_progress import _EVENT_KEYS, _canonical, _resources, _read_order
 from server.order_publisher import validate_order
 from server.segments import plan_segment
+from server.robot_ids import is_fleet_robot
 
 MAX_EVENT_BYTES = 256 * 1024
 _locks_guard = threading.Lock()
@@ -74,8 +75,8 @@ class SimEventInbox:
         mapping, seen = {}, set()
         for robot, tasks in robot_tasks.items():
             _id(robot, 'robot id', True)
-            if not robot.startswith('sim-'):
-                raise ValueError('only simulated robots accepted')
+            if not is_fleet_robot(robot):
+                raise ValueError('only sim- or physical- robots accepted')
             if not isinstance(tasks, (list, tuple, set, frozenset)) or not tasks:
                 raise ValueError('nonempty task list required')
             for task in tasks:

@@ -34,6 +34,17 @@ class FieldDispatchTests(unittest.TestCase):
             with self.subTest(ref=ref, goal=goal), self.assertRaises(ValueError):
                 choose_field_robot(sample_map(), ref, goal, [])
 
+    def test_physical_robot_parked_in_spur_can_be_sent_to_another_spur(self):
+        data = sample_map()
+        data['nodes'].append({'id': 'D_A', 'pos': [-10, 0], 'kind': 'spur_end'})
+        data['edges'].append({'id': 'EA', 'from': 'A', 'to': 'D_A', 'length_mm': 10, 'bidirectional': True,
+                              'type': 'destination', 'shape': [[0, 0], [-10, 0]]})
+        choice = choose_field_robot(data, 'field-test@v1', 'D_C',
+                                    [FieldCandidate('physical-1', 'D_A', 'EA', True)])
+        self.assertEqual(choice.robot_id, 'physical-1')
+        self.assertEqual(choice.route.nodes, ('D_A', 'A', 'B', 'C', 'D_C'))
+        self.assertEqual(choice.route.edge_ids, ('EA~r', 'E1', 'E2', 'ED'))
+
     def test_deterministic_tie_breaking(self):
         candidates = [FieldCandidate('sim-b', 'B', 'E1', True),
                       FieldCandidate('sim-a', 'B', 'E1', True)]

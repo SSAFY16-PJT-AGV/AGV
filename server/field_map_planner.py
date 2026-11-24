@@ -2,9 +2,22 @@
 
 The caller supplies an incoming directed edge on the same map version and is
 responsible for proving where and how the robot is actually stopped. Results
-are not integrated with scheduling, reservations, MQTT or recovery. Spur
-arrival/departure is deliberately unsupported. Team-map crossing data is
-validated fail-closed instead of reproducing NavMap's fallback on missing pairs.
+are not integrated with scheduling, reservations, MQTT or recovery. Team-map
+crossing data is validated fail-closed instead of reproducing NavMap's fallback
+on missing pairs.
+
+Spurs (destination edges ``parent -> spur_end``) follow the team robot's
+behaviour: it parks at a spur end by pivoting at the parent node, and leaves by
+backing out to the parent and pivoting to either direction of the main line.
+
+- A spur-end goal plans to the parent node from any direction and appends the
+  destination edge (its ID is the last edge ID).
+- A spur-end start uses the destination edge ID as ``incoming_edge`` (the robot
+  is parked at its end). The first returned edge is the spur edge traversed
+  back to the parent (``<edge>~r`` for a ``parent -> end`` edge), and any main
+  arc leaving the parent may follow without a U-turn cost.
+- Spurs whose parent is an explicit crossing are rejected: which crossing line
+  the robot joins is not defined by the map.
 """
 from collections import namedtuple
 import heapq
@@ -119,6 +132,7 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
     # An arc is (from, to, direction, cost, reverse-id). Source edge IDs
     # ending in the reverse marker are forbidden to prevent collisions.
     arcs, outs, inbound, base = {}, {n: [] for n in nodes}, {n: [] for n in nodes}, {}
+    spurs, spur_of = {}, {}
     all_ids = set()
     for edge in raw_edges:
         if not isinstance(edge, dict):
@@ -134,6 +148,13 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
         all_ids.add(eid)
         if (edge.get('type') == 'destination' or _kind(nodes[target]) == 'spur_end'
                 or _kind(nodes[source]) == 'spur_end'):
+            parent, end = (source, target) if _kind(nodes[target]) == 'spur_end' else (target, source)
+            if _kind(nodes[end]) != 'spur_end' or _kind(nodes[parent]) == 'spur_end' or end in spur_of:
+                raise ValueError('a spur edge must join one main node to one spur end')
+            # Edge IDs as traversed: towards the end and backing out to the parent.
+            inward, outward = (eid, eid + _REVERSE) if target == end else (eid + _REVERSE, eid)
+            spurs[eid] = (parent, end, _length(edge), inward, outward)
+            spur_of[end] = eid
             continue
         cost = _length(edge)
         reverse = eid + _REVERSE if edge['bidirectional'] and edge.get('directed') is not True else None
@@ -146,12 +167,21 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
             outs[target].append(reverse)
             inbound[source].append(reverse)
 
-    if not isinstance(incoming_edge, str) or incoming_edge not in arcs:
-        raise ValueError('incoming edge must be a known directed main edge')
+    start_spur = incoming_edge if isinstance(incoming_edge, str) and incoming_edge in spurs else None
+    if start_spur is None and (not isinstance(incoming_edge, str) or incoming_edge not in arcs):
+        raise ValueError('incoming edge must be a known directed main edge or a spur edge')
     if not isinstance(goal, str) or goal not in nodes:
         raise ValueError('goal must be a known node')
-    if _kind(nodes[goal]) == 'spur_end':
-        raise ValueError('destination spur entry or departure is unsupported')
+    goal_spur = spur_of.get(goal) if _kind(nodes[goal]) == 'spur_end' else None
+    if _kind(nodes[goal]) == 'spur_end' and goal_spur is None:
+        raise ValueError('spur end has no destination edge')
+    for spur in (start_spur, goal_spur):
+        if spur is not None and nodes[spurs[spur][0]].get('crossing'):
+            raise ValueError('spurs at an explicit crossing are unsupported')
+    if start_spur is not None and goal == spurs[start_spur][1]:
+        # Already parked at the goal: the self-route used to validate candidates.
+        return FieldRoute(expected_ref, incoming_edge, (goal,), (), 0.0)
+    main_goal = spurs[goal_spur][0] if goal_spur is not None else goal
 
     # Validate the complete forward crossing table, including its incident
     # edges. The reverse table follows mechanically via reverse arcs.
@@ -190,17 +220,30 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
 
     # Search state is a directed incoming edge, not merely a node. This
     # preserves the information needed to validate crossings and U-turns.
-    distance = {incoming_edge: 0.0}
-    previous = {}
     counter = itertools.count()
-    queue = [(0.0, next(counter), incoming_edge)]
+    if start_spur is None:
+        seeds = [(incoming_edge, 0.0)]
+    else:
+        # Backing out puts the robot on the parent node, where it pivots to
+        # either direction: every main arc leaving the parent is a first step.
+        parent = spurs[start_spur][0]
+        if main_goal == parent:
+            seeds = []
+        else:
+            seeds = [(eid, arcs[eid][3]) for eid in outs[parent]]
+            if not seeds:
+                raise NoFieldRouteError('spur parent has no main-line arc')
+    distance = {eid: cost for eid, cost in seeds}
+    previous = {eid: None for eid, _cost in seeds}
+    queue = [(cost, next(counter), eid) for eid, cost in seeds]
+    heapq.heapify(queue)
     terminal = None
     while queue:
         dist, _, eid = heapq.heappop(queue)
         if dist != distance.get(eid):
             continue
         _, node_id, direction, _, reverse = arcs[eid]
-        if node_id == goal:
+        if node_id == main_goal:
             terminal = eid
             break
         candidates = [out for out in outs[node_id] if arcs[out][2] == direction]
@@ -223,13 +266,28 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
                 distance[candidate] = value
                 previous[candidate] = eid
                 heapq.heappush(queue, (value, next(counter), candidate))
-    if terminal is None:
-        raise NoFieldRouteError('no direction-compatible route exists')
-    result_edges = []
-    while terminal != incoming_edge:
-        result_edges.append(terminal)
-        terminal = previous[terminal]
-    result_edges.reverse()
-    result_nodes = [arcs[incoming_edge][1]] + [arcs[eid][1] for eid in result_edges]
-    return FieldRoute(expected_ref, incoming_edge, tuple(result_nodes), tuple(result_edges), distance[result_edges[-1]]
-                      if result_edges else 0.0)
+    if start_spur is not None and main_goal == spurs[start_spur][0]:
+        total, result_edges = 0.0, []
+    else:
+        if terminal is None:
+            raise NoFieldRouteError('no direction-compatible route exists')
+        total = distance[terminal]
+        result_edges = []
+        while terminal is not None and terminal != incoming_edge:
+            result_edges.append(terminal)
+            terminal = previous[terminal]
+        result_edges.reverse()
+    if start_spur is None:
+        result_nodes = [arcs[incoming_edge][1]] + [arcs[eid][1] for eid in result_edges]
+    else:
+        parent, end, length, _inward, outward = spurs[start_spur]
+        result_nodes = [end, parent] + [arcs[eid][1] for eid in result_edges]
+        result_edges.insert(0, outward)
+        total += length
+    if goal_spur is not None:
+        parent, end, length, inward, _outward = spurs[goal_spur]
+        result_edges.append(inward)
+        result_nodes.append(end)
+        total += length
+    return FieldRoute(expected_ref, incoming_edge, tuple(result_nodes), tuple(result_edges),
+                      total if result_edges else 0.0)

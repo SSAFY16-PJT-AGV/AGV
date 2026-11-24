@@ -81,20 +81,49 @@ class FieldMapPlannerTests(unittest.TestCase):
             with self.subTest(start=start, ref=ref), self.assertRaises(ValueError):
                 self.plan(sample_map(), start, 'C', ref)
 
-    def test_destination_spur_is_explicitly_unsupported(self):
-        with self.assertRaises(ValueError):
-            self.plan(sample_map(), 'E1', 'D_C')
-        with self.assertRaises(ValueError):
-            self.plan(sample_map(), 'ED', 'C')
+    def test_spur_goal_appends_destination_edge(self):
+        plan = self.plan(sample_map(), 'E1', 'D_C')
+        self.assertEqual((plan.nodes, plan.edge_ids, plan.distance_mm), (('B', 'C', 'D_C'), ('E2', 'ED'), 20))
 
-    def test_spur_end_cannot_be_used_as_a_mainline_incoming_edge(self):
+    def test_spur_start_backs_out_then_may_take_either_direction(self):
+        plan = self.plan(sample_map(), 'ED', 'C')
+        self.assertEqual((plan.nodes, plan.edge_ids, plan.distance_mm), (('D_C', 'C'), ('ED~r',), 10))
+        # C is a dead end towards D_C; leaving the spur towards B needs no U-turn cost.
+        plan = self.plan(sample_map(), 'ED', 'A')
+        self.assertEqual(plan.nodes, ('D_C', 'C', 'B', 'A'))
+        self.assertEqual(plan.edge_ids, ('ED~r', 'E2~r', 'E1~r'))
+        self.assertEqual(plan.distance_mm, 30)
+
+    def test_parked_spur_self_route_is_empty(self):
+        plan = self.plan(sample_map(), 'ED', 'D_C')
+        self.assertEqual((plan.nodes, plan.edge_ids, plan.distance_mm), (('D_C',), (), 0.0))
+
+    def test_reverse_of_spur_edge_is_not_an_incoming_edge(self):
+        with self.assertRaises(ValueError):
+            self.plan(sample_map(), 'ED~r', 'C')
+
+    def test_spur_at_a_crossing_is_rejected(self):
+        data = sample_map()
+        data['nodes'].append({'id': 'D_B', 'pos': [10, 5], 'kind': 'spur_end'})
+        data['edges'].append({'id': 'EB', 'from': 'B', 'to': 'D_B', 'length_mm': 5, 'bidirectional': True,
+                              'type': 'destination', 'shape': [[10, 0], [10, 5]]})
+        for start, goal in (('E1', 'D_B'), ('EB', 'C')):
+            with self.subTest(start=start, goal=goal), self.assertRaisesRegex(ValueError, 'crossing'):
+                self.plan(data, start, goal)
+
+    def test_spur_edge_is_never_a_mainline_arc_whatever_its_orientation(self):
         data = sample_map()
         data['edges'] = [edge for edge in data['edges'] if edge['id'] != 'ED']
         data['edges'].append({'id': 'ES', 'from': 'D_C', 'to': 'C',
                               'length_mm': 10, 'bidirectional': True,
                               'shape': [[30, 0], [20, 0]]})
-        with self.assertRaisesRegex(ValueError, 'incoming|spur'):
-            self.plan(data, 'ES', 'C')
+        # As an incoming edge it means "parked at the spur end", not "arrived at C on a main line".
+        plan = self.plan(data, 'ES', 'C')
+        self.assertEqual((plan.nodes, plan.edge_ids), (('D_C', 'C'), ('ES',)))
+        plan = self.plan(data, 'E1', 'D_C')
+        self.assertEqual((plan.nodes, plan.edge_ids), (('B', 'C', 'D_C'), ('E2', 'ES~r')))
+        with self.assertRaises(ValueError):
+            self.plan(data, 'ES~r', 'C')
 
     def test_malformed_or_incomplete_crossing_rules_are_rejected(self):
         for through in (None, [], [['E1', 'missing']], [['E1', 'E4'], ['E3', 'E4']],
@@ -171,6 +200,29 @@ class TeamNavigatorComparisonTests(unittest.TestCase):
                         self.assertEqual(ours.nodes[-1], goal)
                         # Equal-cost routes may be tie-broken differently.
                         self.assertAlmostEqual(ours.distance_mm, expected, places=6)
+
+    def test_spur_goals_cost_team_parent_distance_plus_spur(self):
+        from server.field_map_planner import plan_field_route, NoFieldRouteError
+        root = Path(os.environ['AGV_FIELD_REPO'])
+        raw = json.loads((root / 'maps/mat_ssafy_v2.json').read_text(encoding='utf-8'))
+        spec = importlib.util.spec_from_file_location('field_team_navmap_spur', root / 'agv/nav/navmap.py')
+        navmap = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(navmap)
+        team = navmap.NavMap(raw)
+        for incoming in team.main_edges():
+            for goal, node in team.nodes.items():
+                parent = team.spur_parent(goal) if node['kind'] == 'spur_end' else None
+                if parent is None or team.nodes[parent].get('crossing'):
+                    continue
+                with self.subTest(incoming=incoming, goal=goal):
+                    expected = team.dist_to(parent).get(incoming)
+                    if expected is None:
+                        with self.assertRaises(NoFieldRouteError):
+                            plan_field_route(raw, map_ref='mat_ssafy_v2@v0', incoming_edge=incoming, goal=goal)
+                    else:
+                        ours = plan_field_route(raw, map_ref='mat_ssafy_v2@v0', incoming_edge=incoming, goal=goal)
+                        self.assertEqual(ours.nodes[-2:], (parent, goal))
+                        self.assertAlmostEqual(ours.distance_mm, expected + team.spur_length(goal), places=6)
 
 
 if __name__ == '__main__':

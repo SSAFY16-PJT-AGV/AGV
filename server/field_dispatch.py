@@ -21,9 +21,7 @@ def choose_field_robot(map_data, map_ref, destination, candidates):
     if map_ref != expected:
         raise ValueError('map reference does not match')
     nodes = {node['id']: node for node in map_data['nodes']}
-    if (not isinstance(destination, str) or destination not in nodes
-            or nodes[destination].get('kind') == 'spur_end'
-            or nodes[destination].get('type') == 'destination'):
+    if not isinstance(destination, str) or destination not in nodes:
         raise ValueError('unknown or unsupported destination')
     if not isinstance(candidates, (list, tuple)):
         raise ValueError('candidates must be a list or tuple')

@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sqlite3
+from server.robot_ids import is_fleet_robot
 
 
 class AllocationConflict(ValueError):
@@ -212,8 +213,8 @@ def _input(task_id, robot_id, map_id, nodes, released_until, resources, action_a
         _id(node, 'node')
     repeated = len(nodes) != len(set(nodes))
     if repeated:
-        if not robot_id.startswith('sim-') or not robot_id[4:].strip():
-            raise InvalidAllocation('repeated routes are only supported for isolated simulation')
+        if not is_fleet_robot(robot_id):
+            raise InvalidAllocation('repeated routes are only supported for sim- or physical- robots')
         if type(release_index) is not int or not 1 <= release_index < len(nodes):
             raise InvalidAllocation('repeated route requires an explicit release index')
     elif release_index is not None:
@@ -343,8 +344,8 @@ class AllocationStore:
             raise AllocationConflict('field route provenance is required for this store')
         field_json = None
         if field_context is not None:
-            if not robot_id.startswith('sim-') or not robot_id[4:].strip():
-                raise InvalidAllocation('field route is limited to isolated simulation')
+            if not is_fleet_robot(robot_id):
+                raise InvalidAllocation('field route is limited to sim- or physical- robots')
             from server.field_robot_contract import validate_field_robot_order
             validate_field_robot_order(json.loads(payload))
             field_context = copy.deepcopy(field_context)

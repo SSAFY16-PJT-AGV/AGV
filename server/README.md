@@ -71,6 +71,10 @@ TLS만 쓴다면 사용자명과 비밀번호 설정을 모두 제거한다. 인
 사전검증과 실물 연동의 남은 조건은 [팀 로봇 연동 대조](docs/field_robot_interop.md)를
 참고한다.
 
+실물 JETANK(`physical-1`, `physical-2`)를 같은 팀 맵 런타임으로 움직이는 방법(로봇 상태에서
+세션·정지 증명 읽기, 스퍼 끝 목적지, 켜는 조건과 남은 제한)은
+[실물 로봇 연동](docs/physical_robots.md)을 참고한다.
+
 - `mqtt_client.py`: `agv/+/state` 및 `agv/+/conn` 수신. 토픽의 로봇 ID별
   관찰값은 프로세스 메모리에만 있다. 보관 메시지와 통신 두절 전 관찰값은
   위치 확정이나 주행 허가의 근거가 아니다. payload, 중첩 깊이, 로봇 ID와
