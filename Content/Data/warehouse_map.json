@@ -17,13 +17,15 @@
     {"id":"N04","x":11.0,"y":2.0,"type":"access","color":"purple","group":"G03"},
     {"id":"N05","x":13.5,"y":2.0,"type":"access","color":"green","group":"G03"},
     {"id":"N06","x":12.0,"y":7.0,"type":"access","color":"yellow","group":"G04"},
+    {"id":"N07","x":12.25,"y":2.0,"type":"access","color":"cyan","group":"G03"},
 
     {"id":"D01","x":3.5,"y":0.5,"type":"destination"},
     {"id":"D02","x":2.8,"y":8.5,"type":"destination"},
     {"id":"D03","x":5.5,"y":8.5,"type":"destination"},
     {"id":"D04","x":11.0,"y":0.5,"type":"destination"},
     {"id":"D05","x":13.5,"y":0.5,"type":"destination"},
-    {"id":"D06","x":12.0,"y":8.5,"type":"destination"}
+    {"id":"D06","x":12.0,"y":8.5,"type":"destination"},
+    {"id":"D07","x":12.25,"y":0.5,"type":"destination"}
   ],
   "edges": [
     {
@@ -47,7 +49,12 @@
       "points":[]
     },
     {
-      "from":"N04","to":"N05",
+      "from":"N04","to":"N07",
+      "type":"main",
+      "points":[]
+    },
+    {
+      "from":"N07","to":"N05",
       "type":"main",
       "points":[]
     },
@@ -134,6 +141,7 @@
     {"from":"N03","to":"D03","type":"destination","points":[]},
     {"from":"N04","to":"D04","type":"destination","points":[]},
     {"from":"N05","to":"D05","type":"destination","points":[]},
-    {"from":"N06","to":"D06","type":"destination","points":[]}
+    {"from":"N06","to":"D06","type":"destination","points":[]},
+    {"from":"N07","to":"D07","type":"destination","points":[]}
   ]
 }
