@@ -122,6 +122,8 @@ def main(argv=None):
     ap.add_argument("--map", default=os.path.join(ROOT, "maps", "mat_ssafy_v2.json"))
     ap.add_argument("--mat", default=os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"))
     ap.add_argument("--start", default="P_orange", help="놓은 자리 바로 앞 노드(가상 매트 기본 출발점은 주황 앞)")
+    ap.add_argument("--start-pose", default=None,
+                    help="가상 매트에 놓을 자세 x,y,각도(도) mm. --start 노드 바로 앞이어야 함(예: 파랑 앞 528,188.3,180)")
     ap.add_argument("--waiting", default="zones", choices=["zones", "all"],
                     help="rear_clear 자원 계산의 대기 노드: zones(맵 waiting 구역) | all(서버 시연 가정)")
     ap.add_argument("--battery", type=float, default=0.8, help="가상 배터리(0~1). 음수면 안 보냄")
@@ -197,7 +199,9 @@ def main(argv=None):
         if disp is not None and disp.done.is_set() and s["status"] == "IDLE":
             runner.stop("dispatch_done")
     try:
-        ev, gt = run_sim.run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, policy=nav, on_step=on_step)
+        pose = [float(v) for v in a.start_pose.split(",")] if a.start_pose else None
+        ev, gt = run_sim.run(a.mat, a.out, seed=a.seed, max_time_s=a.max_time, policy=nav, on_step=on_step,
+                             start_pose=pose)
         print(u"끝: %s" % gt["finish_reason"])
     except KeyboardInterrupt:
         pass
