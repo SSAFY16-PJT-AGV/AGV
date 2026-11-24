@@ -7,7 +7,9 @@ and checks the physical path end to end:
 - sessions are read from each robot's live state (``from_state``),
 - stop proofs come from robot state, and blocked rear_clear events are retried,
 - routes end at spur ends (the only waiting points of the real map),
-- a second robot waits while the first holds a shared node.
+- a second robot waits while the first holds a shared node,
+- each robot's next leg starts from the spur where the last one ended (handoff
+  without an action acknowledgement, because the legs have no end action).
 
 Nothing here moves hardware. Requires a field-run checkout (AGV_FIELD_REPO),
 OpenCV/NumPy (AGV_FIELD_MAT_DEPS) and Mosquitto (MOSQUITTO_EXE). The aMQTT test
@@ -44,6 +46,7 @@ MAP_REF = 'mat_ssafy_v2@v0'
                      'set AGV_FIELD_REPO, AGV_FIELD_MAT_DEPS and MOSQUITTO_EXE for the physical fleet test')
 class PhysicalFleetIntegration(unittest.TestCase):
     def test_two_physical_robots_spur_to_spur_with_shared_segment(self):
+        from server.sim_handoff_store import SimHandoffStore
         from server.sim_runtime import SimRuntime
         field = Path(FIELD).resolve()
         mat_deps = Path(MAT_DEPS).resolve()
@@ -94,14 +97,16 @@ class PhysicalFleetIntegration(unittest.TestCase):
             robot_env.update(PYTHONPATH=os.pathsep.join([str(mat_deps), sysconfig.get_paths()['purelib']]),
                              PYTHONUTF8='1', TEMP=str(run), TMP=str(run))
             logs = {}
-            for rid in ('physical-1', 'physical-2'):
+            # physical-1 in front of orange (the mat's default pose); physical-2 in front of blue.
+            starts = {'physical-1': ('P_orange', []), 'physical-2': ('P_blue', ['--start-pose', '528,188.3,180'])}
+            for rid, (start, extra) in starts.items():
                 logs[rid] = run / (rid + '.log')
                 handle = logs[rid].open('w', encoding='utf-8')
                 stack.callback(handle.close)
                 proc = subprocess.Popen(
                     [python, '-u', str(field / 'sim/link_demo.py'), '--host', '127.0.0.1', '--port', str(port),
-                     '--robot-id', rid, '--start', 'P_orange', '--waiting', 'zones', '--battery', '-1',
-                     '--max-time', '900', '--out', str(run / rid)], cwd=field, env=robot_env,
+                     '--robot-id', rid, '--start', start, '--waiting', 'zones', '--battery', '-1',
+                     '--max-time', '900', '--out', str(run / rid)] + extra, cwd=field, env=robot_env,
                     stdout=handle, stderr=handle)
                 stack.callback(stop_process, proc)
 
@@ -124,10 +129,14 @@ class PhysicalFleetIntegration(unittest.TestCase):
             runtime = None
             wait(lambda: len(states) == 2, 'both robots report state', 30)
 
+            positions = {rid: start for rid, (start, _extra) in starts.items()}
+            store = SimHandoffStore.create_new(run / 'server.sqlite3', simulation_enabled=True,
+                                               idle_positions=positions, physical_robots=True)
             runtime = SimRuntime(run / 'server.sqlite3', field_map,
-                                 {'physical-1': {'P1-1': 'from_state'}, 'physical-2': {'P2-1': 'from_state'}},
+                                 {'physical-1': {'P1-1': 'from_state', 'P1-2': 'from_state'},
+                                  'physical-2': {'P2-1': 'from_state', 'P2-2': 'from_state'}},
                                  port=port, client_id='physical-fleet-test', field_simulation=True,
-                                 physical_robots=True)
+                                 physical_robots=True, simulation_store=store, field_initial_positions=positions)
             runtime.start()
             stack.callback(runtime.stop)
             with lock:
@@ -145,14 +154,17 @@ class PhysicalFleetIntegration(unittest.TestCase):
                 return (status['released_until'] == goal and status['occupancy'] == [['node', goal]]
                         and not runtime.pending_events()['events'])
 
-            def go(task, rid, node, edge, goal):
+            def go(task, rid, node, edge, goal, after=None):
                 runtime.create_task(task)
                 deadline = time.monotonic() + 120
                 while True:
                     try:
-                        result = runtime.prepare_field(task, goal, [{'robot_id': rid, 'node': node,
-                                                                     'incoming_edge': edge, 'available': True}],
-                                                       {'type': 'none'})
+                        if after is not None:
+                            result = runtime.prepare_field_next(task, after, goal)
+                        else:
+                            result = runtime.prepare_field(task, goal, [{'robot_id': rid, 'node': node,
+                                                                         'incoming_edge': edge, 'available': True}],
+                                                           {'type': 'none'})
                         break
                     except ValueError:
                         # Another robot holds part of the route; wait like an operator would.
@@ -162,22 +174,29 @@ class PhysicalFleetIntegration(unittest.TestCase):
                 runtime.publish(task)
                 return result
 
-            # Both virtual robots start in front of P_orange (each on its own
-            # virtual mat). physical-1 takes the route first; physical-2 needs
-            # P_orange too, so its preparation is refused until physical-1 has
-            # stopped in the red spur and its rear_clear released the route.
+            # physical-1 takes P_orange -> red spur first; physical-2's route from blue to the
+            # purple spur also needs P_orange and S1, so it is refused until physical-1 parked.
             first = go('P1-1', 'physical-1', 'P_orange', 'E13', 'D_P_red')
             self.assertEqual(first['nodes'][-2:], ['P_red', 'D_P_red'])
             started = time.monotonic()
-            second = go('P2-1', 'physical-2', 'P_orange', 'E13', 'D_P_purple')
-            waited = time.monotonic() - started
-            self.assertEqual(second['nodes'][-2:], ['P_purple', 'D_P_purple'])
-            self.assertGreater(waited, 2.0, 'second robot must wait for the shared start node')
+            second = go('P2-1', 'physical-2', 'P_blue', 'E12', 'D_P_purple')
+            self.assertGreater(time.monotonic() - started, 2.0, 'second robot must wait for the shared nodes')
+            self.assertEqual(second['nodes'][0], 'P_blue')
             self.assertTrue(at('physical-1', 'D_P_red'), 'route released only after physical-1 parked')
-            wait(lambda: at('physical-2', 'D_P_purple') and finished('P2-1', 'D_P_purple'), 'physical-2 parks at D_P_purple', 120)
+            wait(lambda: at('physical-2', 'D_P_purple') and finished('P2-1', 'D_P_purple'), 'physical-2 parks', 120)
             self.assertTrue(finished('P1-1', 'D_P_red'))
+
+            # Next legs start from the spurs (handoff). Their routes share P_orange, so one waits.
+            third = go('P1-2', 'physical-1', None, None, 'D_P_orange', after='P1-1')
+            self.assertEqual(third['nodes'][:2], ['D_P_red', 'P_red'])
+            fourth = go('P2-2', 'physical-2', None, None, 'D_P_blue', after='P2-1')
+            self.assertEqual(fourth['nodes'][:2], ['D_P_purple', 'P_purple'])
+            wait(lambda: at('physical-1', 'D_P_orange') and finished('P1-2', 'D_P_orange'), 'physical-1 second leg', 180)
+            wait(lambda: at('physical-2', 'D_P_blue') and finished('P2-2', 'D_P_blue'), 'physical-2 second leg', 180)
             self.assertEqual(runtime.store.list_occupancy(),
-                             {('node', 'D_P_red'): 'physical-1', ('node', 'D_P_purple'): 'physical-2'})
+                             {('node', 'D_P_orange'): 'physical-1', ('node', 'D_P_blue'): 'physical-2'})
+            for task in ('P1-1', 'P2-1'):
+                self.assertEqual(runtime.task_status(task)['status'], 'DONE')
             self.assertIsNone(runtime.physical_watcher.last_error)
             self.assertIsNone(runtime.workflow.last_error)
 

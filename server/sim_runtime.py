@@ -106,9 +106,10 @@ class SimRuntime:
         physical = [robot for robot in self._sessions if is_physical_robot(robot)]
         if physical and not physical_robots:
             raise ValueError('physical- robots require physical_robots=True')
-        if physical and (not field_simulation or simulation_store is not None
-                         or command_observations or field_initial_positions is not None):
-            raise ValueError('physical- robots are supported only with plain field simulation')
+        if physical and (not field_simulation or command_observations):
+            raise ValueError('physical- robots are supported only with field simulation')
+        if physical and simulation_store is not None and not getattr(simulation_store, '_physical_robots', False):
+            raise ValueError('physical- robots need a handoff store created with physical_robots=True')
         if (isinstance(physical_state_timeout, bool) or not isinstance(physical_state_timeout, (int, float))
                 or not 0 < physical_state_timeout <= 120):
             raise ValueError('physical_state_timeout must be in (0, 120] seconds')
@@ -998,6 +999,50 @@ class SimRuntime:
                 raise
             self._prepared[task_id] = (coordinator, client, generation)
             return result
+
+    def prepare_field_next(self, task_id, source_task_id, destination):
+        """Prepare a physical robot's next leg from where its finished leg stopped.
+
+        The source leg must have ended with ``action_at_end`` ``none``, its final
+        rear_clear must be applied and its stop proven from the robot's state.
+        The robot keeps its stop node while the new leg is reserved (handoff).
+        Requires a handoff store created with ``physical_robots=True``.
+        """
+        from server.sim_handoff_store import SimHandoffCoordinatorStore
+        with self._lock:
+            self._ready()
+            robot, session = self._tasks.get(source_task_id, (None, None))
+            if robot is None or not is_physical_robot(robot) or self._tasks.get(task_id, (None,))[0] != robot:
+                raise ValueError('source and target must be tasks of the same physical robot')
+            if self._simulation_store is None or not getattr(self._simulation_store, '_physical_robots', False):
+                raise ValueError('a physical handoff store is required')
+            with closing(sqlite3.connect('file:%s?mode=ro' % self.path, uri=True)) as db:
+                job = db.execute('SELECT j.nodes_json,j.released_until,p.incoming_edge,p.goal FROM allocation_jobs j '
+                                 'JOIN field_route_provenance p ON p.task_id=j.task_id WHERE j.task_id=? '
+                                 'AND j.robot_id=?', (source_task_id, robot)).fetchone()
+                if job is None:
+                    raise ValueError('source leg has no field allocation')
+                nodes, stopped = json.loads(job[0]), job[1]
+                if nodes[-1] != stopped:
+                    raise ValueError('source leg has not been released to its goal yet')
+                row = db.execute("SELECT i.event_id,i.seq FROM sim_event_inbox i JOIN progress_events p "
+                                 "ON p.robot_id=i.robot_id AND p.event_id=i.event_id WHERE i.robot_id=? AND "
+                                 "i.task_id=? AND i.state='applied' AND p.result='finished' "
+                                 "ORDER BY i.seq DESC LIMIT 1", (robot, source_task_id)).fetchone()
+                if row is None:
+                    raise ValueError('source leg has not finished yet')
+            from server.field_map_planner import plan_field_route
+            route = plan_field_route(self.map_data, map_ref='{}@v{}'.format(
+                self.map_data['map_id'], self.map_data['version']), incoming_edge=job[2], goal=job[3])
+            if list(route.nodes) != nodes or not route.edge_ids:
+                raise ValueError('source route provenance differs')
+            adapter = SimHandoffCoordinatorStore(
+                self.store, target_task_id=task_id, source_task_id=source_task_id, robot_id=robot,
+                robot_session=session, seq=row[1], stopped_at=stopped, event_id=row[0], action_ack=None,
+                expected_twin_id=None, gate=self.gate, progress=self.progress, receiver=self.receiver,
+                simulation_enabled=True)
+            candidate = {'robot_id': robot, 'node': stopped, 'incoming_edge': route.edge_ids[-1], 'available': True}
+            return self.prepare_field(task_id, destination, [candidate], {'type': 'none'}, handoff_store=adapter)
 
     def publish(self, task_id):
         with self._lock:

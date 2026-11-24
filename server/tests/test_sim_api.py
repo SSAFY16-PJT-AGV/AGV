@@ -108,6 +108,14 @@ class SimulationApiTests(unittest.TestCase):
         del body['candidates'][0]['incoming_edge']
         self.assertEqual(self.call('POST', '/tasks/T1/prepare-field', body=body)[0], 422)
 
+    def test_physical_next_leg_is_dispatched(self):
+        body = {'source_task_id': 'P1-1', 'destination': 'D_P_orange'}
+        self.assertEqual(self.call('POST', '/tasks/P1-2/prepare-next', body=body, token=None)[0], 401)
+        code, result, _headers = self.call('POST', '/tasks/P1-2/prepare-next', body=body)
+        self.assertEqual((code, result), (200, {'method': 'prepare_field_next'}))
+        self.assertEqual(self.runtime.calls[-1], ('prepare_field_next', ('P1-2', 'P1-1', 'D_P_orange')))
+        self.assertEqual(self.call('POST', '/tasks/P1-2/prepare-next', body={'destination': 'D'})[0], 422)
+
     def test_recovery_retry_and_submit_are_dispatched(self):
         complete = {"session": "boot-1", "challenge": "abc", "robot_id": "sim-r1",
                     "order_id": "T1", "seq": 1, "map_id": "M@v1", "stopped_at": "N3",

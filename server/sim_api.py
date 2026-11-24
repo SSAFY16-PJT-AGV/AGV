@@ -133,6 +133,11 @@ class _PrepareField(_Model):
     action: dict
 
 
+class _PrepareNext(_Model):
+    source_task_id: StrictStr
+    destination: StrictStr
+
+
 class _Session(_Model):
     session: StrictStr
 
@@ -195,6 +200,12 @@ def publish(task_id: str, runtime=Depends(_runtime)):
 def prepare_field(task_id: str, body: _PrepareField, runtime=Depends(_runtime)):
     return _invoke(runtime, "prepare_field", task_id, body.destination,
                    [candidate.model_dump() for candidate in body.candidates], body.action)
+
+
+@router.post("/tasks/{task_id}/prepare-next")
+def prepare_next(task_id: str, body: _PrepareNext, runtime=Depends(_runtime)):
+    """Physical robots: next leg from the spur where ``source_task_id`` finished (handoff)."""
+    return _invoke(runtime, "prepare_field_next", task_id, body.source_task_id, body.destination)
 
 
 @router.post("/recovery/{task_id}/begin")

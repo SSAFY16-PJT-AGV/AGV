@@ -80,3 +80,36 @@ class WatcherTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PhysicalHandoffStoreTests(unittest.TestCase):
+    def test_physical_idle_robots_need_a_physical_store(self):
+        from server.sim_handoff_store import SimHandoffStore
+        folder = Path(tempfile.mkdtemp())
+        with self.assertRaisesRegex(ValueError, 'physical_robots'):
+            SimHandoffStore.create_new(folder / 'a.sqlite3', simulation_enabled=True,
+                                       idle_positions={'physical-1': 'A'})
+        store = SimHandoffStore.create_new(folder / 'b.sqlite3', simulation_enabled=True,
+                                           idle_positions={'physical-1': 'A', 'sim-r1': 'C'}, physical_robots=True)
+        store.bind_field_robots(('physical-1', 'sim-r1'), {'physical-1': 'A', 'sim-r1': 'C'})
+        self.assertEqual(store.list_occupancy(), {('node', 'A'): 'physical-1', ('node', 'C'): 'sim-r1'})
+
+    def test_sim_store_keeps_rejecting_physical_jobs_in_the_database(self):
+        import sqlite3
+        from server.sim_handoff_store import SimHandoffStore
+        folder = Path(tempfile.mkdtemp())
+        store = SimHandoffStore.create_new(folder / 'c.sqlite3', simulation_enabled=True)
+        with self.assertRaises(ValueError):
+            store.bind_field_robots(('physical-1',), {'physical-1': 'A'})
+        with sqlite3.connect(store.path) as db:
+            db.execute("INSERT INTO tasks VALUES ('T','PENDING')")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'simulation robot ID'):
+                db.execute("INSERT INTO allocation_jobs VALUES ('T','physical-1','m','[]','A')")
+
+    def test_physical_runtime_needs_a_physical_handoff_store(self):
+        from server.sim_handoff_store import SimHandoffStore
+        folder = Path(tempfile.mkdtemp())
+        store = SimHandoffStore.create_new(folder / 'd.sqlite3', simulation_enabled=True)
+        with self.assertRaisesRegex(ValueError, 'physical_robots=True'):
+            SimRuntime(folder / 'd.sqlite3', sample_map(), {'physical-1': {'P1': FROM_STATE}}, port=1883,
+                       client_id='cfg', field_simulation=True, physical_robots=True, simulation_store=store)
