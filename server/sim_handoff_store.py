@@ -1,8 +1,15 @@
-"""Fresh-database-only simulated leg handoff; never a physical drive permit.
+"""Fresh-database-only leg handoff for simulated and (opt-in) physical robots.
 
-The caller must provide a separately isolated broker and an independently
-validated simulated Unreal acknowledgement. Neither this module, a token,
-nor a simulated event proves a physical robot's state or message identity.
+For ``sim-`` robots the caller must provide a separately isolated broker and an
+independently validated simulated Unreal acknowledgement of the source leg's
+grab/place. Neither this module, a token, nor a simulated event proves a
+physical robot's state or message identity.
+
+A store created with ``physical_robots=True`` also accepts ``physical-`` robots.
+A physical leg whose ``action_at_end`` is ``none`` hands off without an action
+acknowledgement (there is no action to acknowledge); the finished event and the
+state-based stop proof (``server/physical_state_proof.py``) are still required.
+Physical stores are fresh-only: they are never reopened.
 Existing allocation databases are never opened or migrated by create_new().
 """
 import copy
@@ -19,6 +26,7 @@ from contextlib import closing
 from server.allocation_store import (AllocationStore, AllocationConflict, InvalidAllocation, _fingerprint,
                                      _id, _input, _field_route, _verify_field_global)
 from server.order_publisher import _topic, validate_order
+from server.robot_ids import is_fleet_robot, is_physical_robot
 from server.segments import plan_segment
 from server.route_occurrence import plan_occurrence_segment
 from server.field_robot_contract import validate_field_robot_order
@@ -48,15 +56,19 @@ class SimHandoffStore(AllocationStore):
         super().__init__(path)
 
     @classmethod
-    def create_new(cls, path, *, simulation_enabled=False, idle_positions=None):
+    def create_new(cls, path, *, simulation_enabled=False, idle_positions=None, physical_robots=False):
         if simulation_enabled is not True:
             raise ValueError('explicit isolated simulation is required')
+        if type(physical_robots) is not bool:
+            raise ValueError('physical_robots must be boolean')
         if idle_positions is not None:
             if not isinstance(idle_positions, dict) or not idle_positions:
                 raise ValueError('nonempty simulated idle positions required')
             idle_positions = copy.deepcopy(idle_positions)
             for robot, node in idle_positions.items():
                 _topic(robot)
+                if is_physical_robot(robot) and not physical_robots:
+                    raise ValueError('physical- robots require a store created with physical_robots=True')
                 _id(node, 'idle node')
             if len(set(idle_positions.values())) != len(idle_positions):
                 raise ValueError('idle robots cannot occupy the same node')
@@ -67,6 +79,7 @@ class SimHandoffStore(AllocationStore):
         os.close(descriptor)
         store = cls(name, _key=_CONSTRUCTION_KEY)
         store._idle_enabled = idle_positions is not None
+        store._physical_robots = physical_robots
         store._field_expected_robots = frozenset(idle_positions) if idle_positions is not None else None
         store._field_initial_positions = copy.deepcopy(idle_positions)
         store._reopened = False
@@ -88,10 +101,17 @@ class SimHandoffStore(AllocationStore):
                        'target_task_id TEXT UNIQUE NOT NULL REFERENCES tasks(task_id), robot_id TEXT NOT NULL, '
                        'robot_session TEXT NOT NULL, seq INTEGER NOT NULL, stopped_at TEXT NOT NULL, event_id TEXT NOT NULL, '
                        'action_id TEXT UNIQUE NOT NULL, ack_json TEXT NOT NULL)')
-            db.execute('CREATE TRIGGER sim_robot_only BEFORE INSERT ON allocation_jobs '
-                       "WHEN substr(NEW.robot_id,1,4)!='sim-' OR length(trim(substr(NEW.robot_id,5)))=0 "
-                       "OR instr(NEW.robot_id,'/')>0 OR instr(NEW.robot_id,'+')>0 OR instr(NEW.robot_id,'#')>0 BEGIN "
-                       "SELECT RAISE(ABORT,'simulation robot ID required'); END")
+            if physical_robots:
+                db.execute('CREATE TRIGGER sim_robot_only BEFORE INSERT ON allocation_jobs '
+                           "WHEN NOT ((substr(NEW.robot_id,1,4)='sim-' AND length(trim(substr(NEW.robot_id,5)))>0) "
+                           "OR (substr(NEW.robot_id,1,9)='physical-' AND length(trim(substr(NEW.robot_id,10)))>0)) "
+                           "OR instr(NEW.robot_id,'/')>0 OR instr(NEW.robot_id,'+')>0 OR instr(NEW.robot_id,'#')>0 BEGIN "
+                           "SELECT RAISE(ABORT,'sim- or physical- robot ID required'); END")
+            else:
+                db.execute('CREATE TRIGGER sim_robot_only BEFORE INSERT ON allocation_jobs '
+                           "WHEN substr(NEW.robot_id,1,4)!='sim-' OR length(trim(substr(NEW.robot_id,5)))=0 "
+                           "OR instr(NEW.robot_id,'/')>0 OR instr(NEW.robot_id,'+')>0 OR instr(NEW.robot_id,'#')>0 BEGIN "
+                           "SELECT RAISE(ABORT,'simulation robot ID required'); END")
             db.execute('CREATE TRIGGER sim_activate_robot AFTER INSERT ON allocation_jobs BEGIN '
                        'INSERT INTO sim_active_robots(robot_id,task_id) VALUES(NEW.robot_id,NEW.task_id); END')
             db.execute('CREATE TRIGGER sim_preserve_job BEFORE DELETE ON allocation_jobs BEGIN '
@@ -151,6 +171,7 @@ class SimHandoffStore(AllocationStore):
             raise ValueError('existing simulation database unavailable') from exc
         store = cls(name, _key=_CONSTRUCTION_KEY)
         store._idle_enabled = expected_idle_enabled
+        store._physical_robots = False   # physical stores are fresh-only; their schema hash differs
         store._field_expected_robots = None
         store._field_initial_positions = None
         store._reopened = True
@@ -169,8 +190,9 @@ class SimHandoffStore(AllocationStore):
             raise ValueError('field simulation robot identities must be unique')
         for robot in expected:
             _topic(robot)
-            if not robot.startswith('sim-') or not robot[4:].strip():
-                raise ValueError('field fleet is restricted to simulated robots')
+            allowed = is_fleet_robot(robot) if getattr(self, '_physical_robots', False) else robot.startswith('sim-')
+            if not allowed or not robot[robot.index('-') + 1:].strip():
+                raise ValueError('field fleet is restricted to simulated robots (or opted-in physical robots)')
         if self._field_expected_robots is not None and self._field_expected_robots != expected:
             raise ValueError('field simulation fleet differs from its creation configuration')
         if initial_positions is not None:
@@ -360,9 +382,14 @@ class SimHandoffStore(AllocationStore):
         if simulation_enabled is not True:
             raise ValueError('explicit isolated simulation is required')
         self.validate_bound(self.path)
+        # A physical robot whose source leg has no end action hands off without
+        # an Unreal acknowledgement; that is checked against the stored order below.
+        no_action = action_ack is None and is_physical_robot(robot_id) and getattr(self, '_physical_robots', False)
         for name, value in (('source_task_id', source_task_id), ('robot_session', robot_session),
                             ('stopped_at', stopped_at), ('event_id', event_id),
                             ('expected_twin_id', expected_twin_id)):
+            if no_action and name == 'expected_twin_id' and value is None:
+                continue
             _id(value, name)
         if source_task_id == task_id or type(seq) is not int or seq < 1:
             raise ValueError('invalid source task or sequence')
@@ -380,11 +407,15 @@ class SimHandoffStore(AllocationStore):
         if progress._field_required != (field_context is not None):
             raise ValueError('handoff and progress field modes differ')
         ack_keys = {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
-        if (not isinstance(action_ack, dict) or set(action_ack) != ack_keys
-                or action_ack['order_id'] != source_task_id or action_ack['agv_id'] != expected_twin_id
-                or action_ack['action'] not in ('grab', 'place') or action_ack['applied'] is not True):
-            raise ValueError('verified simulated action acknowledgement required')
-        _id(action_ack['action_id'], 'action_id')
+        if no_action:
+            action_id, ack_json = 'no-action:' + source_task_id, 'null'
+        else:
+            if (not isinstance(action_ack, dict) or set(action_ack) != ack_keys
+                    or action_ack['order_id'] != source_task_id or action_ack['agv_id'] != expected_twin_id
+                    or action_ack['action'] not in ('grab', 'place') or action_ack['applied'] is not True):
+                raise ValueError('verified simulated action acknowledgement required')
+            _id(action_ack['action_id'], 'action_id')
+            action_id, ack_json = action_ack['action_id'], json.dumps(action_ack, sort_keys=True)
         if (progress._gate is not gate or progress._enabled is not True
                 or os.path.normcase(os.path.realpath(progress.store.path)) != os.path.normcase(os.path.realpath(self.path))
                 or progress._map_id != map_id or progress._fingerprint != map_fingerprint):
@@ -426,9 +457,13 @@ class SimHandoffStore(AllocationStore):
                 if (prior_robot != robot_id or prior_stop != stopped_at or prior_path[-1] != stopped_at
                         or latest_seq != seq or prior_state != 'acked'):
                     raise AllocationConflict('source leg is not finished at its acknowledged destination')
-                required_action = {'load': 'grab', 'unload': 'place'}.get(_order['action_at_end'].get('type'))
-                if required_action is None or action_ack['action'] != required_action:
-                    raise AllocationConflict('source leg and acknowledged action do not match')
+                if no_action:
+                    if _order['action_at_end'] != {'type': 'none'}:
+                        raise AllocationConflict('a source leg with an end action needs its acknowledgement')
+                else:
+                    required_action = {'load': 'grab', 'unload': 'place'}.get(_order['action_at_end'].get('type'))
+                    if required_action is None or action_ack['action'] != required_action:
+                        raise AllocationConflict('source leg and acknowledged action do not match')
                 if progress._occupancy(db, source_task_id) != {('node', stopped_at)}:
                     raise AllocationConflict('source must retain exactly its final node')
                 if db.execute('SELECT task_id FROM sim_active_robots WHERE robot_id=?', (robot_id,)).fetchone() != (source_task_id,):
@@ -456,12 +491,12 @@ class SimHandoffStore(AllocationStore):
                         or result.get('task_id') != source_task_id or result.get('next_seq') is not None):
                     raise AllocationConflict('finished event and simulated proof do not match')
                 if db.execute('SELECT 1 FROM sim_handoff_transfers WHERE source_task_id=? OR target_task_id=? OR action_id=?',
-                              (source_task_id, task_id, action_ack['action_id'])).fetchone():
+                              (source_task_id, task_id, action_id)).fetchone():
                     raise AllocationConflict('handoff or action was already used')
                 self._check_resource_availability(db, checked, ignore_task=source_task_id)
                 db.execute('INSERT INTO sim_handoff_transfers VALUES (?,?,?,?,?,?,?,?,?)',
                            (source_task_id, task_id, robot_id, robot_session, seq, stopped_at,
-                            event_id, action_ack['action_id'], json.dumps(action_ack, sort_keys=True)))
+                            event_id, action_id, ack_json))
                 if db.execute('DELETE FROM sim_active_robots WHERE robot_id=? AND task_id=?',
                               (robot_id, source_task_id)).rowcount != 1:
                     raise AllocationConflict('active ownership changed')

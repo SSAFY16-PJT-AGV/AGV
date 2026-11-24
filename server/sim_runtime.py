@@ -1,7 +1,10 @@
-"""Lifecycle owner for the proposed, isolated-simulation control workflow.
+"""Lifecycle owner for the proposed control workflow (isolated simulation, opt-in physical robots).
 
 The local endpoint and simulated identities are not authentication or network
-isolation. Never use this runtime for a physical robot or a shared broker.
+isolation. ``physical-`` robots are accepted only with ``physical_robots=True``
+and field simulation (team-map routes); their sessions and stop proofs come
+from their own state messages (``server/physical_state_proof.py``). Use broker
+authentication for a shared broker.
 """
 import copy
 import json
@@ -23,6 +26,8 @@ from server.order_publisher import OrderPublisher, _topic
 from server.mqtt_security import configure_mqtt_client, read_mqtt_security
 from server.recovery import RecoveryGate
 from server.segment_progress import SegmentProgress
+from server.robot_ids import is_physical_robot
+from server.physical_state_proof import FROM_STATE, PhysicalStateWatcher
 from sim.event_inbox import SimEventInbox
 from sim.event_receiver import SimEventReceiver
 from sim.workflow import SimProgressWorkflow
@@ -70,9 +75,11 @@ class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
                  field_simulation=False, field_initial_positions=None, command_observations=False,
-                 investigation_notes=False):
+                 investigation_notes=False, physical_robots=False, physical_state_timeout=15.0):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
+        if type(physical_robots) is not bool:
+            raise ValueError('physical_robots must be boolean')
         if type(command_observations) is not bool or (command_observations and not field_simulation):
             raise ValueError('command observations require explicit field simulation')
         if type(investigation_notes) is not bool:
@@ -96,10 +103,25 @@ class SimRuntime:
         if not isinstance(robot_sessions, dict) or not robot_sessions:
             raise ValueError('static robot sessions are required')
         self._tasks, self._sessions = {}, copy.deepcopy(robot_sessions)
+        physical = [robot for robot in self._sessions if is_physical_robot(robot)]
+        if physical and not physical_robots:
+            raise ValueError('physical- robots require physical_robots=True')
+        if physical and (not field_simulation or command_observations):
+            raise ValueError('physical- robots are supported only with field simulation')
+        if physical and simulation_store is not None and not getattr(simulation_store, '_physical_robots', False):
+            raise ValueError('physical- robots need a handoff store created with physical_robots=True')
+        if (isinstance(physical_state_timeout, bool) or not isinstance(physical_state_timeout, (int, float))
+                or not 0 < physical_state_timeout <= 120):
+            raise ValueError('physical_state_timeout must be in (0, 120] seconds')
+        self._physical = tuple(physical)
+        self._physical_state_timeout = float(physical_state_timeout)
+        self.physical_watcher = None
         for robot, sessions in self._sessions.items():
             _topic(robot)
             if not isinstance(sessions, dict) or not sessions:
                 raise ValueError('each robot needs explicitly mapped tasks')
+            if not is_physical_robot(robot) and FROM_STATE in sessions.values():
+                raise ValueError('only physical- robots may take their session from state')
             for task, session in sessions.items():
                 _id(task, 'task_id'); _id(session, 'robot_session')
                 if task in self._tasks:
@@ -204,6 +226,8 @@ class SimRuntime:
                 self._simulation_store.validate_bound(self.path)
             self._owner.acquire()
             try:
+                if self._physical:
+                    self._start_physical_watcher()
                 self.store = self._simulation_store or (AllocationStore(self.path, field_required=True)
                                                         if self._field_simulation else AllocationStore(self.path))
                 if self._simulation_store is not None:
@@ -294,11 +318,28 @@ class SimRuntime:
                     if self.receiver._closed or time.monotonic() >= deadline:
                         raise RuntimeError('simulation receiver was not ready')
                     time.sleep(0.01)
+                if self.physical_watcher is not None:
+                    self.physical_watcher.bind(self, {r: self._physical_sessions[r] for r in self._physical})
                 self._started = True
             except BaseException:
                 self._shutdown()
                 raise
         return self
+
+    def _start_physical_watcher(self):
+        """Read each physical robot's live session and bind it into the static task mapping."""
+        watcher = PhysicalStateWatcher(self._physical, client=self._new_client(), host=self.host,
+                                       port=self.port, connect_timeout=self.connect_timeout)
+        self.physical_watcher = watcher.start()
+        live = watcher.wait_sessions(self._physical_state_timeout)
+        self._physical_sessions = live
+        for robot in self._physical:
+            for task, session in list(self._sessions[robot].items()):
+                if session == FROM_STATE:
+                    self._sessions[robot][task] = live[robot]
+                    self._tasks[task] = (robot, live[robot])
+                elif session != live[robot]:
+                    raise RuntimeError('configured session of %s differs from its live state' % robot)
 
     def _ready(self):
         if (not self._started or self._stopped or self._reconnecting or self._reconnect_cleanup_failed
@@ -959,6 +1000,50 @@ class SimRuntime:
             self._prepared[task_id] = (coordinator, client, generation)
             return result
 
+    def prepare_field_next(self, task_id, source_task_id, destination):
+        """Prepare a physical robot's next leg from where its finished leg stopped.
+
+        The source leg must have ended with ``action_at_end`` ``none``, its final
+        rear_clear must be applied and its stop proven from the robot's state.
+        The robot keeps its stop node while the new leg is reserved (handoff).
+        Requires a handoff store created with ``physical_robots=True``.
+        """
+        from server.sim_handoff_store import SimHandoffCoordinatorStore
+        with self._lock:
+            self._ready()
+            robot, session = self._tasks.get(source_task_id, (None, None))
+            if robot is None or not is_physical_robot(robot) or self._tasks.get(task_id, (None,))[0] != robot:
+                raise ValueError('source and target must be tasks of the same physical robot')
+            if self._simulation_store is None or not getattr(self._simulation_store, '_physical_robots', False):
+                raise ValueError('a physical handoff store is required')
+            with closing(sqlite3.connect('file:%s?mode=ro' % self.path, uri=True)) as db:
+                job = db.execute('SELECT j.nodes_json,j.released_until,p.incoming_edge,p.goal FROM allocation_jobs j '
+                                 'JOIN field_route_provenance p ON p.task_id=j.task_id WHERE j.task_id=? '
+                                 'AND j.robot_id=?', (source_task_id, robot)).fetchone()
+                if job is None:
+                    raise ValueError('source leg has no field allocation')
+                nodes, stopped = json.loads(job[0]), job[1]
+                if nodes[-1] != stopped:
+                    raise ValueError('source leg has not been released to its goal yet')
+                row = db.execute("SELECT i.event_id,i.seq FROM sim_event_inbox i JOIN progress_events p "
+                                 "ON p.robot_id=i.robot_id AND p.event_id=i.event_id WHERE i.robot_id=? AND "
+                                 "i.task_id=? AND i.state='applied' AND p.result='finished' "
+                                 "ORDER BY i.seq DESC LIMIT 1", (robot, source_task_id)).fetchone()
+                if row is None:
+                    raise ValueError('source leg has not finished yet')
+            from server.field_map_planner import plan_field_route
+            route = plan_field_route(self.map_data, map_ref='{}@v{}'.format(
+                self.map_data['map_id'], self.map_data['version']), incoming_edge=job[2], goal=job[3])
+            if list(route.nodes) != nodes or not route.edge_ids:
+                raise ValueError('source route provenance differs')
+            adapter = SimHandoffCoordinatorStore(
+                self.store, target_task_id=task_id, source_task_id=source_task_id, robot_id=robot,
+                robot_session=session, seq=row[1], stopped_at=stopped, event_id=row[0], action_ack=None,
+                expected_twin_id=None, gate=self.gate, progress=self.progress, receiver=self.receiver,
+                simulation_enabled=True)
+            candidate = {'robot_id': robot, 'node': stopped, 'incoming_edge': route.edge_ids[-1], 'available': True}
+            return self.prepare_field(task_id, destination, [candidate], {'type': 'none'}, handoff_store=adapter)
+
     def publish(self, task_id):
         with self._lock:
             self._ready()
@@ -1044,6 +1129,12 @@ class SimRuntime:
         if self.workflow is not None:
             with self.workflow._lock:
                 self.workflow._stopping = True
+        watcher, self.physical_watcher = getattr(self, 'physical_watcher', None), None
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
         self._stopped = True
         self._shutdown_running = True
         self._shutdown_thread = threading.current_thread()

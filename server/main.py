@@ -34,8 +34,11 @@ def load_sim_runtime():
     config = json.loads(raw.decode('utf-8'), object_pairs_hook=pairs)
     required = {'database', 'map_file', 'robots', 'mqtt_port', 'mqtt_client_id'}
     if (not isinstance(config, dict) or not required.issubset(config)
-            or set(config) - required - {'field_simulation', 'command_observations', 'investigation_notes'}
+            or set(config) - required - {'field_simulation', 'command_observations', 'investigation_notes',
+                                         'physical_robots', 'start_positions'}
+            or ('start_positions' in config) != bool(config.get('physical_robots', False))
             or type(config.get('field_simulation', False)) is not bool
+            or type(config.get('physical_robots', False)) is not bool
             or type(config.get('command_observations', False)) is not bool
             or type(config.get('investigation_notes', False)) is not bool
             or (config.get('command_observations', False) and not config.get('field_simulation', False))):
@@ -57,6 +60,17 @@ def load_sim_runtime():
         options['command_observations'] = True
     if config.get('investigation_notes', False):
         options['investigation_notes'] = True
+    if config.get('physical_robots', False):
+        # Physical legs are chained by handoff, which needs a fresh store that
+        # knows every robot's start node. The database file must not exist yet.
+        from server.sim_handoff_store import SimHandoffStore
+        starts = config['start_positions']
+        if not isinstance(starts, dict) or set(starts) != set(config['robots']):
+            raise ValueError('start_positions must name the start node of every configured robot')
+        options['physical_robots'] = True
+        options['field_initial_positions'] = starts
+        options['simulation_store'] = SimHandoffStore.create_new(db_path, simulation_enabled=True,
+                                                                 idle_positions=starts, physical_robots=True)
     runtime = SimRuntime(db_path, map_data, config['robots'], port=config['mqtt_port'],
                          client_id=config['mqtt_client_id'], **options)
     return runtime, token

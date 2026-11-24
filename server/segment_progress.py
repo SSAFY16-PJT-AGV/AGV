@@ -17,6 +17,7 @@ from server.order_publisher import validate_order
 from server.routing import MapGraph, UnsupportedRobotRoutingError
 from server.segments import plan_segment
 from server.route_occurrence import plan_occurrence_segment, visit_indices_from_orders
+from server.robot_ids import is_fleet_robot
 
 
 _EVENT_KEYS = frozenset(('type', 'event_id', 'robot_session', 'order_id', 'seq',
@@ -138,7 +139,7 @@ class SegmentProgress:
                          'WHERE t.task_id=?', (task_id,)).fetchone()
         if (row is None or row[0] != 'ASSIGNED' or row[2] != self._map_id
                 or row[5] != self._fingerprint or row[6] != self._map_id
-                or not row[1].startswith('sim-') or (robot_id is not None and row[1] != robot_id)):
+                or not is_fleet_robot(row[1]) or (robot_id is not None and row[1] != robot_id)):
             raise AllocationConflict('task, robot, map or fingerprint does not match')
         try:
             path = json.loads(row[3])
@@ -301,8 +302,8 @@ class SegmentProgress:
         if type(retained) is not bool or retained:
             raise ValueError('retained events are not accepted')
         _id(robot_id, 'robot id', True)
-        if not robot_id.startswith('sim-'):
-            raise ValueError('only simulation robots are accepted')
+        if not is_fleet_robot(robot_id):
+            raise ValueError('only sim- or physical- robots are accepted')
         event = copy.deepcopy(event)
         if not isinstance(event, dict) or set(event) != _EVENT_KEYS or event.get('type') != 'rear_clear':
             raise ValueError('invalid rear_clear event')

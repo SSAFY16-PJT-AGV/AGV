@@ -11,6 +11,7 @@ import threading
 import weakref
 
 import paho.mqtt.client as mqtt
+from server.robot_ids import is_fleet_robot
 
 
 _ORDER_FIELDS = frozenset(("order_id", "seq", "map_id", "nodes", "released_until", "action_at_end"))
@@ -85,8 +86,8 @@ def _validate_json(value, depth=0):
 
 
 def _topic(robot_id):
-    if not _nonempty_string(robot_id) or not robot_id.startswith("sim-") or not robot_id[4:].strip():
-        raise ValueError("only non-empty simulation robot IDs starting with sim- are allowed")
+    if not _nonempty_string(robot_id) or not is_fleet_robot(robot_id):
+        raise ValueError("only non-empty robot IDs starting with sim- or physical- are allowed")
     if any(ch in robot_id for ch in ("/", "+", "#")) or any(ord(ch) < 32 or ord(ch) == 127 for ch in robot_id):
         raise ValueError("invalid robot ID for MQTT topic")
     try:
