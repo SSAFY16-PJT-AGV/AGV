@@ -292,6 +292,37 @@ class TestSimServe(unittest.TestCase):
         self.assertGreater(sum(1 for s in moving if s["pose"] is not None) / float(len(moving)), 0.9)
         self.assertTrue(set(s["status"] for s in link.states) <= {"IDLE", "MOVING", "WAITING", "ERROR"})
 
+    def test_state_follows_the_robot_out_of_a_spur(self):
+        """스퍼에 주차한 뒤 새 작업: 상태의 노드 순서가 실제 주행과 같아야 한다(트윈 표시).
+        예전에는 후진 중 last가 부모 패치·next가 스퍼 끝으로 거꾸로 나오고, 본선을 달리는 동안
+        이전 작업의 정지 순번 때문에 스퍼 끝에 서 있는 것처럼 보고했다."""
+        r1 = ["P_orange", "S1", "M3", "P_red", "D_P_red"]
+        r2 = ["D_P_red", "P_red", "M3", "S1", "P_orange", "D_P_orange"]
+        plan = {0: self._o(1, "D_P_red", r1, oid="A"), 1: self._o(1, "D_P_orange", r2, oid="B")}
+        sent = set()
+
+        def script(link, ctl, runner, t, s):
+            n = len(link.events)
+            if n in plan and n not in sent and s["status"] in ("IDLE", "WAITING"):
+                sent.add(n)
+                link.send(plan[n])
+            if n == 2 and s["status"] == "IDLE":
+                runner.stop("test_done")
+        link, ctl, notes, gt = self._run(script, max_time=90)
+        self.assertEqual(gt["finish_reason"], "test_done")
+        seq = []
+        for st in link.states:
+            if st["order_id"] == "B" and st["status"] == "MOVING" and (not seq or seq[-1] != st["last_node"]):
+                seq.append(st["last_node"])
+        self.assertEqual(seq[0], "D_P_red", seq)
+        self.assertEqual(seq[-1], "D_P_orange", seq)
+        visited = [n for n in seq if n in r2]
+        self.assertEqual(visited, sorted(visited, key=r2.index), seq)   # 경로 순서를 거슬러 가지 않음
+        self.assertIn("S1", seq)
+        backing = [st for st in link.states if st["order_id"] == "B" and st["last_node"] == "D_P_red"
+                   and st["status"] == "MOVING"]
+        self.assertTrue(backing and all(st["next_node"] == "P_red" for st in backing))
+
     def test_link_loss_stops_robot(self):
         route = ["P_orange", "S1", "M1", "P_purple", "S2", "M2", "P_green"]
         rec = {}

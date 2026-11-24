@@ -139,6 +139,9 @@ class LinkController(object):
             self._reject(o, e.args[0] if e.args else str(e))
             return
         self.book.commit(d)
+        if d.kind == "new":
+            # 이전 작업에서 선 노드의 순번은 새 경로에서 의미가 없다. 새 경로의 첫 노드에 서 있다.
+            self._anchor = (o["nodes"][0], 0, r.odo)
         self.n_orders += 1
         self.rejected = None
         self._note("link_order", kind=d.kind, order_id=o["order_id"], seq=o["seq"],
@@ -299,7 +302,21 @@ class LinkController(object):
             p = self.geom.node_pose(sp["node"])
             if p is not None:
                 pose, src = p, "node"
-        elif sp is not None and sp.get("state") in ("entering", "exiting"):
+        elif sp is not None and sp.get("state") == "exiting" and not sp.get("exit_hyps"):
+            # 스퍼 안에서 후진 중: 스퍼 끝을 떠나 갈림 지점(부모 패치)으로 가는 중
+            last, nxt = sp["node"], sp["parent"]
+            p = self.geom.node_pose(sp["node"])
+            if p is not None:
+                pose, src = p, "spur"
+        elif sp is not None and sp.get("state") == "exiting":
+            # 후진을 마치고 갈림 지점에서 본선 쪽으로 도는 중: 다음은 고른 본선 엣지의 끝
+            last, nxt = sp["parent"], nav.m.edges[sp["exit_hyps"][0].edge]["to"]
+            p = self.geom.node_pose(sp["parent"])
+            if p is not None:
+                pose, src = p, "spur"
+        elif sp is not None and (sp.get("state") == "entering" or (
+                sp.get("state") == "armed" and (w.get("last_node") == sp["parent"] or self.here() == sp["parent"]))):
+            # 스퍼로 들어가는 중(갈림 지점을 지나 돌기 전에 다음 본선 엣지로 넘어간 것처럼 보이는 동안 포함)
             last, nxt = sp["parent"], sp["node"]
             p = self.geom.node_pose(sp["parent"])
             if p is not None:
