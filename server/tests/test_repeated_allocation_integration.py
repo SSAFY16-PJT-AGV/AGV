@@ -40,6 +40,23 @@ class RepeatedAllocationTests(unittest.TestCase):
         return self.store.allocate('T1', 'sim-r1', 'repeat@v1', self.path, 'B',
             self.first.resources, {'type': 'none'}, map_fingerprint=self.fingerprint, **kwargs)
 
+    def test_physical_repeat_is_rejected_before_reserving_or_creating_an_order(self):
+        with self.assertRaisesRegex(InvalidAllocation, 'physical.*repeated'):
+            self.store.allocate('T1', 'physical-1', 'repeat@v1', self.path, 'B',
+                self.first.resources, {'type': 'none'}, map_fingerprint=self.fingerprint,
+                release_index=1)
+        self.assertIsNone(self.store.get_allocation('T1'))
+        self.assertIsNone(self.store.get_order('T1'))
+        self.assertEqual(self.store.list_occupancy(), {})
+
+    def test_physical_unique_path_is_still_allocatable(self):
+        route = ['A', 'B']
+        first = plan_occurrence_segment(self.map, route, 0)
+        result = self.store.allocate('T1', 'physical-1', 'repeat@v1', route, 'B',
+            first.resources, {'type': 'none'}, map_fingerprint=self.fingerprint)
+        self.assertEqual(result['nodes'], route)
+        self.assertEqual(result['robot_id'], 'physical-1')
+
     def test_repeat_requires_explicit_first_occurrence_and_retains_it(self):
         with self.assertRaises(InvalidAllocation):
             self.allocate()

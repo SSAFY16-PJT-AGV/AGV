@@ -12,7 +12,7 @@ import math
 import os
 import re
 import sqlite3
-from server.robot_ids import is_fleet_robot
+from server.robot_ids import is_fleet_robot, is_physical_robot
 
 
 class AllocationConflict(ValueError):
@@ -213,8 +213,12 @@ def _input(task_id, robot_id, map_id, nodes, released_until, resources, action_a
         _id(node, 'node')
     repeated = len(nodes) != len(set(nodes))
     if repeated:
+        # The unmodified physical Navigator treats route edges as a set and can
+        # skip a repeated visit. Block it before any reservation or publication.
+        if is_physical_robot(robot_id):
+            raise InvalidAllocation('physical robots cannot use repeated-node routes')
         if not is_fleet_robot(robot_id):
-            raise InvalidAllocation('repeated routes are only supported for sim- or physical- robots')
+            raise InvalidAllocation('repeated routes are only supported for sim- robots')
         if type(release_index) is not int or not 1 <= release_index < len(nodes):
             raise InvalidAllocation('repeated route requires an explicit release index')
     elif release_index is not None:
