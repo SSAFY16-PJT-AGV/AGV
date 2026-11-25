@@ -152,6 +152,84 @@ class ReconcileMqttTests(unittest.TestCase):
         self.assertEqual(runner.state, 'hold')
         self.assertEqual(runner.resume_count, 1)
 
+        # Delay a fresh response before its one-shot client can publish, then
+        # kill the real broker. The next connection must not replay it.
+        began, release = threading.Event(), threading.Event()
+        original_send = link.publish_reconcile_once
+        def delayed_send(value, generation, signal):
+            began.set()
+            if not release.wait(8):
+                return False
+            return original_send(value, generation, signal)
+        link.publish_reconcile_once = delayed_send
+        next_probe = {k: v for k, v in probe.items() if k != 'mac'}
+        next_probe['nonce'] = 'd' * 64
+        send('request', sign(next_probe))
+        errors = []
+        def run_until_delay():
+            try:
+                until = time.monotonic() + 5
+                while not began.is_set() and time.monotonic() < until:
+                    ctl.step(now=5)
+                    time.sleep(.01)
+            except BaseException as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=run_until_delay)
+        worker.start()
+        self.addCleanup(lambda: (release.set(), worker.join(5)))
+        self.assertTrue(began.wait(5), 'delayed response path not reached')
+        generation_before = link._connection_generation
+        broker.terminate()
+        broker.wait(timeout=5)
+        until = time.monotonic() + 8
+        while link.connected:
+            if time.monotonic() >= until:
+                self.fail('second disconnect not observed')
+            time.sleep(.02)
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        server.disconnect()
+        server.loop_stop()
+        broker = spawn_broker()
+        until = time.monotonic() + 5
+        while True:
+            try:
+                sock = socket.create_connection(('127.0.0.1', port), timeout=.2)
+                sock.close()
+                break
+            except OSError:
+                if time.monotonic() >= until:
+                    self.fail('broker failed to restart')
+                time.sleep(.02)
+        observer = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
+        observer_ready, observer_subscribed = threading.Event(), threading.Event()
+        delayed = queue.Queue()
+        def observer_connect(client, _userdata, _flags, reason, _properties):
+            if not reason.is_failure:
+                client.subscribe('agv/physical-1/reconcile/response', qos=1)
+                observer_ready.set()
+        observer.on_connect = observer_connect
+        observer.on_subscribe = lambda *_args: observer_subscribed.set()
+        observer.on_message = lambda _c, _u, msg: delayed.put(msg.payload)
+        observer.connect('127.0.0.1', port, 10)
+        observer.loop_start()
+        self.addCleanup(lambda: (observer.disconnect(), observer.loop_stop()))
+        self.assertTrue(observer_ready.wait(5))
+        self.assertTrue(observer_subscribed.wait(5))
+        until = time.monotonic() + 10
+        while not link.connected or not link._reconcile_ready:
+            if time.monotonic() >= until:
+                self.fail('second robot reconnect failed')
+            time.sleep(.02)
+        self.assertGreater(link._connection_generation, generation_before)
+        with self.assertRaises(queue.Empty):
+            delayed.get(timeout=1)
+        self.assertTrue(link.disconnect_pending())
+        self.assertEqual(runner.state, 'hold')
+        self.assertEqual(runner.resume_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

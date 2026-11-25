@@ -49,7 +49,7 @@ def _text(value):
 
 
 def _hex(value):
-    return isinstance(value, str) and _HEX.match(value) is not None
+    return isinstance(value, str) and len(value) == 64 and _HEX.match(value) is not None
 
 
 class ReconcileRobot(object):

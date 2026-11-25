@@ -88,6 +88,11 @@ class ReconcileRobotTests(unittest.TestCase):
         body['server_epoch'] = 'e' * 64
         self.assertIsNone(self.machine.probe(sign(body), self.local, 7))
 
+    def test_hex_fields_reject_trailing_newline_even_with_valid_signature(self):
+        body = {k: v for k, v in self.probe.items() if k != 'mac'}
+        body['nonce'] += '\n'
+        self.assertIsNone(self.machine.probe(sign(body), self.local, 7))
+
 
 if __name__ == '__main__':
     unittest.main()
