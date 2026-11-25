@@ -1,0 +1,351 @@
+--- a/agv/link/mqtt.py
++++ b/agv/link/mqtt.py
+@@ -52,7 +52,11 @@
+         self.topic = lambda kind: "agv/%s/%s" % (robot_id, kind)
+         self.host, self.port, self.keepalive = host, int(port), int(keepalive)
+         self._log = log
+-        self._lock = threading.Lock()
++        self._lock = threading.RLock()
++        self._connection_generation = 0
++        # Sticky until this link is replaced. Set before the callback waits on
++        # the lock, so an in-flight control action can observe the loss.
++        self._disconnect_observed = threading.Event()
+         self._orders = []
+         self._notes = []
+         self.connected = False
+@@ -92,16 +96,22 @@
+         if rc != 0:
+             self._note("link_connect_failed", rc=rc)
+             return
+-        self.connected = True
+-        self.ever_connected = True
+-        self.disconnected_at = None
++        with self._lock:
++            self._connection_generation += 1
++            self.connected = True
++            self.ever_connected = True
++            self.disconnected_at = None
+         client.publish(self.topic("conn"), "online", qos=1, retain=True)
+         client.subscribe(self.topic("order"), qos=1)
+         self._note("link_connected", host=self.host, port=self.port)
+ 
+     def _on_disconnect(self, client, userdata, rc):
+-        self.connected = False
+-        self.disconnected_at = time.time()
++        self._disconnect_observed.set()
++        with self._lock:
++            self.connected = False
++            self.disconnected_at = time.time()
++            self._connection_generation += 1
++            self._orders = []
+         self._note("link_disconnected", rc=rc)
+ 
+     def _on_message(self, client, userdata, msg):
+@@ -112,8 +122,8 @@
+             self.dropped_retained += 1
+             return
+         with self._lock:
+-            if len(self._orders) < 64:
+-                self._orders.append(bytes(msg.payload))
++            if self.connected and not self._disconnect_observed.is_set() and len(self._orders) < 64:
++                self._orders.append((self._connection_generation, bytes(msg.payload)))
+ 
+     def start(self):
+         self.c.connect_async(self.host, self.port, keepalive=self.keepalive)
+@@ -130,7 +140,23 @@
+         """받은 주문 payload(bytes) 목록을 꺼낸다."""
+         with self._lock:
+             out, self._orders = self._orders, []
+-        return out
++        return [payload for _, payload in out]
++
++    def disconnect_pending(self):
++        return self._disconnect_observed.is_set()
++
++    def poll_with_generation(self):
++        with self._lock:
++            out, self._orders = self._orders, []
++            return out
++
++    def process_if_current(self, generation, payload, handler):
++        with self._lock:
++            if (not self.connected or self._disconnect_observed.is_set()
++                    or generation != self._connection_generation):
++                return False
++            handler(payload)
++            return not self._disconnect_observed.is_set()
+ 
+     def publish_state(self, state):
+         if self.connected:
+--- a/agv/link/controller.py
++++ b/agv/link/controller.py
+@@ -74,8 +74,16 @@
+         now = self.clock() if now is None else now
+         for msg, kw in getattr(self.link, "pop_notes", lambda: [])():
+             self._note(msg, **kw)
+-        for payload in self.link.poll():
+-            self._handle(payload)
++        self._watch_link(now)
++        tagged = getattr(self.link, "poll_with_generation", None)
++        process = getattr(self.link, "process_if_current", None)
++        if tagged is not None and process is not None:
++            for generation, payload in tagged():
++                if not process(generation, payload, self._handle):
++                    self._note("link_stale_order_discarded")
++        else:
++            for payload in self.link.poll():
++                self._handle(payload)
+         self._watch_link(now)
+         self._watch_stop()
+         st = self.state(now)
+@@ -120,6 +128,9 @@
+         if d.kind == "duplicate":
+             self._note("link_order_duplicate", order_id=o["order_id"], seq=o["seq"])
+             return
++        if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
++            self._reject(o, "link disconnected; manual recovery required")
++            return
+         if r is None or r.finished:
+             self._reject(o, "robot stopped (%s)" % (r.finish_reason if r is not None else "not ready"))
+             return
+@@ -138,6 +149,10 @@
+         except (OrderRejected, ValueError) as e:
+             self._reject(o, e.args[0] if e.args else str(e))
+             return
++        if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
++            self.error = "link_lost"
++            self._reject(o, "link changed while preparing order")
++            return
+         self.book.commit(d)
+         if d.kind == "new":
+             # 이전 작업에서 선 노드의 순번은 새 경로에서 의미가 없다. 새 경로의 첫 노드에 서 있다.
+@@ -146,7 +161,14 @@
+         self.rejected = None
+         self._note("link_order", kind=d.kind, order_id=o["order_id"], seq=o["seq"],
+                    release=o["released_until"], nodes=o["nodes"])
++        if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
++            self.error = "link_lost"
++            return
+         if r.state == "hold" and r.hold_reason in ("wait_order", "nav_hold"):
++            arm = getattr(r, "arm_unstarted_disconnect_guard", None)
++            pending = getattr(self.link, "disconnect_pending", None)
++            if arm is not None and pending is not None:
++                arm(pending)
+             r.resume()
+         else:
+             r.policy_changed()
+@@ -164,6 +186,9 @@
+             self._note("link_error", reason=self.error)
+         if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
+                 or self.nav.at_node != release:
++            return
++        if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
++            self.error = "event_unconfirmed"
+             return
+         self._stopped.add(key)
+         self._anchor = (release, b.release_i, r.odo)
+@@ -181,6 +206,13 @@
+     def _watch_link(self, now):
+         r, L = self.runner, self.link
+         if r is None or r.finished:
++            return
++        if getattr(L, "disconnect_pending", lambda: False)():
++            if self.error is None:
++                self._note("link_lost", state=r.state)
++                self.error = "link_lost"
++            if r.state != "hold" and r.hold("link_lost"):
++                self._note("link_lost_hold")
+             return
+         if not L.connected:
+             gone = L.disconnected_at
+--- a/agv/runner.py
++++ b/agv/runner.py
+@@ -253,6 +253,7 @@
+         self._parked = None         # 스퍼 끝에 서 있음 {j, side} (재개하면 후진해 나옴)
+         self.hold_reason = None
+         self._stop_req = None       # 이동 정책이 요청한 정지 {pos, reason, hold, node}
++        self._unstarted_disconnect_guard = None
+         self._resume_split = None   # 갈림길 앞에서 대기 중이면 그 갈림길 시작 (t, odo)
+         self._resume_vee = None     # V자 앞에서 대기 중이면 그 판정
+         self.rc = dict(RECOVER_DEFAULT)
+@@ -465,6 +466,16 @@
+         self._do_stop({"reason": reason, "hold": True})
+         return True
+ 
++    def arm_unstarted_disconnect_guard(self, guard):
++        self._unstarted_disconnect_guard = guard
++
++    def cancel_unstarted_motion(self, reason):
++        self._unstarted_disconnect_guard = None
++        self._stop_req = self.v_plan = self._piv = self._rev = None
++        self._resume_split = self._resume_vee = None
++        self.choice = self.decision = None
++        self._do_stop({"reason": reason, "hold": True})
++
+     def resume(self):
+         """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
+         if self.state != "hold" or self.finished:
+@@ -529,6 +540,19 @@
+ 
+     # ---------- 한 스텝 ----------
+     def step(self, frame, dt):
++        guard = self._unstarted_disconnect_guard
++        if guard is not None and guard():
++            self.cancel_unstarted_motion("link_lost")
++            return 0.0, 0.0
++        result = self._step_without_disconnect_guard(frame, dt)
++        if guard is not None:
++            if guard():
++                self.cancel_unstarted_motion("link_lost")
++                return 0.0, 0.0
++            self._unstarted_disconnect_guard = None
++        return result
++
++    def _step_without_disconnect_guard(self, frame, dt):
+         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
+         if self.finished:
+             return 0.0, 0.0
+--- /dev/null
++++ b/agv/tests/test_link_disconnect_fence.py
+@@ -0,0 +1,141 @@
++import json
++import threading
++import time
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++from agv.link.controller import LinkController
++from agv.link.mqtt import FakeLink, MqttLink
++
++
++def _payload():
++    return json.dumps({'order_id': 'T1', 'seq': 1, 'map_id': 'm@v1',
++                       'nodes': ['A', 'B'], 'released_until': 'B',
++                       'action_at_end': {'type': 'none'}}).encode('utf8')
++
++
++class Runner:
++    def __init__(self):
++        self.finished = False
++        self.finish_reason = None
++        self.state = 'hold'
++        self.hold_reason = 'wait_order'
++        self.odo = 0
++        self.resume_count = 0
++
++    def hold(self, reason):
++        self.state, self.hold_reason = 'hold', reason
++        return True
++
++    def resume(self):
++        self.state = 'follow'
++        self.resume_count += 1
++        return True
++
++    def policy_changed(self):
++        pass
++
++
++def _controller(link, on_route=None):
++    nav = SimpleNamespace(m=SimpleNamespace(map_id='m', version=1), at_node='A',
++                          hold_at_end=False, set_route=on_route or (lambda *a: None))
++    raw = {'nodes': [{'id': 'A', 'pos': [0, 0]}, {'id': 'B', 'pos': [1, 0]}],
++           'edges': [], 'zones': []}
++    ctl = LinkController(link, nav, raw, start_node='A', clock=lambda: 5)
++    runner = Runner()
++    ctl.attach(runner)
++    ctl.state = lambda now=None: {'status': 'IDLE'}
++    return ctl, runner
++
++
++class DisconnectFenceTests(unittest.TestCase):
++    def test_disconnected_queued_order_does_not_resume(self):
++        link = FakeLink('physical-1')
++        ctl, runner = _controller(link)
++        link.send(_payload())
++        link.connected, link.disconnected_at = False, 0
++        ctl.step(now=5)
++        self.assertEqual(runner.resume_count, 0)
++        self.assertIsNone(ctl.book.current)
++
++    def test_mqtt_discards_queued_order_on_disconnect_reconnect(self):
++        link = MqttLink('physical-1')
++        client = MagicMock()
++        link._on_connect(client, None, None, 0)
++        link._on_message(client, None, SimpleNamespace(topic='agv/physical-1/order',
++                                                       retain=False, payload=_payload()))
++        link._on_disconnect(client, None, 0)
++        link._on_connect(client, None, None, 0)
++        self.assertEqual(link.poll(), [])
++
++    def test_disconnection_during_route_setup_does_not_resume(self):
++        link = MqttLink('physical-1')
++        client = MagicMock()
++        link._on_connect(client, None, None, 0)
++        def race(*args):
++            link._on_disconnect(client, None, 0)
++            link._on_connect(client, None, None, 0)
++        ctl, runner = _controller(link, race)
++        link._on_message(client, None, SimpleNamespace(topic='agv/physical-1/order',
++                                                       retain=False, payload=_payload()))
++        ctl.step(now=5)
++        self.assertEqual(runner.resume_count, 0)
++        self.assertIsNone(ctl.book.current)
++
++    def test_dequeued_order_rejected_after_generation_changes(self):
++        link = MqttLink('physical-1')
++        client = MagicMock()
++        link._on_connect(client, None, None, 0)
++        link._on_message(client, None, SimpleNamespace(topic='agv/physical-1/order',
++                                                       retain=False, payload=_payload()))
++        generation, payload = link.poll_with_generation()[0]
++        link._on_disconnect(client, None, 0)
++        link._on_connect(client, None, None, 0)
++        handled = []
++        self.assertFalse(link.process_if_current(generation, payload, handled.append))
++        self.assertEqual(handled, [])
++        link._on_message(client, None, SimpleNamespace(topic='agv/physical-1/order',
++                                                       retain=False, payload=_payload()))
++        self.assertEqual(link.poll(), [])  # no implicit recovery after reconnect
++
++    def test_callback_can_signal_loss_while_control_holds_connection_lock(self):
++        link = MqttLink('physical-1')
++        client = MagicMock()
++        link._on_connect(client, None, None, 0)
++        callbacks = []
++        def route(*args):
++            t = threading.Thread(target=link._on_disconnect, args=(client, None, 0))
++            callbacks.append(t)
++            t.start()
++            until = time.monotonic() + 2
++            while not link.disconnect_pending() and time.monotonic() < until:
++                time.sleep(.001)
++            self.assertTrue(link.disconnect_pending())
++        ctl, runner = _controller(link, route)
++        link._on_message(client, None, SimpleNamespace(topic='agv/physical-1/order',
++                                                       retain=False, payload=_payload()))
++        ctl.step(now=5)
++        callbacks[0].join(2)
++        self.assertFalse(callbacks[0].is_alive())
++        self.assertEqual(runner.resume_count, 0)
++        self.assertIsNone(ctl.book.current)
++
++    def test_unstarted_order_has_no_first_motor_output_after_disconnect(self):
++        from agv.runner import ExploreRunner
++        runner = ExploreRunner.__new__(ExploreRunner)
++        runner.finished, runner.state, runner.mode = False, 'follow', 'passive'
++        runner.stall = SimpleNamespace(stalled=False)
++        runner._stall_logged, runner._sent = False, (0.0, 0.0)
++        runner.search_side, runner.lost_s = None, 0
++        runner._step = lambda frame, dt: (0.5, 0.5)
++        runner._write_trace = lambda: None
++        cancelled = []
++        runner.cancel_unstarted_motion = cancelled.append
++        getattr(runner, 'arm_unstarted_disconnect_guard', lambda guard: None)(lambda: True)
++        self.assertEqual(runner.step(None, 0.1), (0.0, 0.0))
++        self.assertEqual(cancelled, ['link_lost'])
++
++
++if __name__ == '__main__':
++    unittest.main()
