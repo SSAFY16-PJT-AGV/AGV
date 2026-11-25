@@ -73,11 +73,15 @@ class PhysicalStateWatcher:
         self._stop = threading.Event()
         self._thread = None
         self._connected = threading.Event()
+        self._subscription_done = threading.Event()
+        self._pending_mid = None
+        self._online = {}          # robot -> last accepted broker connection report
         self.last_error = None
 
     # MQTT -----------------------------------------------------------------
     def start(self):
         self._client.on_connect = self._on_connect
+        self._client.on_subscribe = self._on_subscribe
         self._client.on_message = self._on_message
         self._client.on_disconnect = self._on_disconnect
         self._mqtt_started = True
@@ -85,39 +89,83 @@ class PhysicalStateWatcher:
             raise RuntimeError('physical state connection failed')
         if self._client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError('physical state loop failed')
-        if not self._connected.wait(self._timeout):
+        if not self._subscription_done.wait(self._timeout) or not self._connected.is_set():
             self.stop()
-            raise RuntimeError('physical state connection timed out')
+            raise RuntimeError('physical state subscription failed or timed out')
         return self
 
     def _on_connect(self, client, _userdata, _flags, code, _properties):
         if code.is_failure:
             self._on_disconnect(client, None, None, code, None)
             return
-        repeated = self._connected.is_set()
-        self._connected.clear()
         with self._lock:
+            self._connected.clear()
+            repeated = self._connection_generation > 0
             self._connection_generation += 1
+            generation = self._connection_generation
             self._latest.clear()
             self._proven.clear()
-        if repeated and self._runtime is not None:
-            self._invalidate_robots(self.robots)
-        for robot in self.robots:
-            client.subscribe('agv/%s/state' % robot, qos=0)
-        self._connected.set()
-
-    def _invalidate_robots(self, robots):
-        # Permanent local latch. A new message or MQTT reconnect cannot clear
-        # it; re-establishing physical state requires a separate protocol.
+            self._online.clear()
+            self._pending_mid = None
+            self._subscription_done.clear()
+            invalidated = self._latch_robots_locked(self.robots) if repeated and self._runtime is not None else set()
+        self._revoke_robots(invalidated)
+        # Bind callbacks to the connection which registered them. In-flight
+        # callbacks from an earlier generation must not change new evidence.
         with self._lock:
-            new = set(robots) - self._invalidated
-            self._invalidated.update(new)
-            for robot in new:
-                self._proven.pop(robot, None)
+            if generation != self._connection_generation:
+                return
+            client.on_subscribe = lambda c, u, mid, codes, p: self._on_subscribe(
+                c, u, mid, codes, p, _generation=generation)
+            client.on_message = lambda c, u, msg: self._on_message(c, u, msg, _generation=generation)
+            client.on_disconnect = lambda c, u, flags, reason, p: self._on_disconnect(
+                c, u, flags, reason, p, _generation=generation)
+        topics = []
+        for robot in self.robots:
+            topics.extend([('agv/%s/state' % robot, 0), ('agv/%s/conn' % robot, 1)])
+        try:
+            rc, mid = client.subscribe(topics)
+            if rc != mqtt.MQTT_ERR_SUCCESS or type(mid) is not int or mid <= 0:
+                raise RuntimeError('physical subscription request failed')
+            with self._lock:
+                if generation != self._connection_generation:
+                    return
+                self._pending_mid = mid
+        except Exception as exc:
+            self.last_error = type(exc).__name__
+            self._on_disconnect(client, None, None, None, None, _generation=generation)
+
+    def _on_subscribe(self, client, _userdata, mid, reason_codes, _properties, *, _generation=None):
+        with self._lock:
+            if _generation is not None and _generation != self._connection_generation:
+                return
+            try:
+                granted = [code.value for code in reason_codes]
+                success = (mid == self._pending_mid and self._pending_mid is not None
+                           and granted == [qos for _robot in self.robots for qos in (0, 1)]
+                           and all(not code.is_failure for code in reason_codes))
+            except (TypeError, AttributeError):
+                success = False
+            self._pending_mid = None
+            if success:
+                self._connected.set()
+                self._subscription_done.set()
+        if not success:
+            self.last_error = 'SubscriptionRejected'
+            self._on_disconnect(client, None, None, None, None, _generation=_generation)
+
+    def _latch_robots_locked(self, robots):
+        new = set(robots) - self._invalidated
+        self._invalidated.update(new)
+        for robot in new:
+            self._proven.pop(robot, None)
+        return new
+
+    def _revoke_robots(self, robots):
         runtime = self._runtime
-        if runtime is None or not new:
+        if runtime is None or not robots:
             return
-        tasks = tuple(task for task, (robot, _session) in runtime._tasks.items() if robot in new)
+        tasks = tuple(task for task, (robot, _session) in runtime._tasks.items() if robot in robots)
         if tasks:
             try:
                 runtime.gate.invalidate_many(tasks)
@@ -125,19 +173,52 @@ class PhysicalStateWatcher:
                 self.last_error = type(exc).__name__
                 self._log('failed to invalidate stale physical state: %s' % type(exc).__name__)
 
-    def _on_disconnect(self, _client, _userdata, _flags, _reason_code, _properties):
-        self._connected.clear()
+    def _invalidate_robots(self, robots):
+        # Permanent local latch. A new message or MQTT reconnect cannot clear
+        # it; re-establishing physical state requires a separate protocol.
         with self._lock:
+            new = self._latch_robots_locked(robots)
+        self._revoke_robots(new)
+
+    def _on_disconnect(self, _client, _userdata, _flags, _reason_code, _properties, *, _generation=None):
+        with self._lock:
+            if _generation is not None and _generation != self._connection_generation:
+                return
+            self._connected.clear()
             self._connection_generation += 1
             self._latest.clear()
             self._proven.clear()
-        if self._runtime is not None:
-            self._invalidate_robots(self.robots)
+            self._online.clear()
+            self._pending_mid = None
+            self._subscription_done.set()
+            invalidated = self._latch_robots_locked(self.robots) if self._runtime is not None else set()
+        self._revoke_robots(invalidated)
 
-    def _on_message(self, _client, _userdata, message):
+    def _on_message(self, _client, _userdata, message, *, _generation=None):
         try:
             parts = message.topic.split('/')
-            if len(parts) != 3 or parts[0] != 'agv' or parts[2] != 'state' or parts[1] not in self.robots:
+            if len(parts) != 3 or parts[0] != 'agv' or parts[2] not in ('state', 'conn') or parts[1] not in self.robots:
+                return
+            if parts[2] == 'conn':
+                payload = getattr(message, 'payload', None)
+                valid = (type(getattr(message, 'retain', None)) is bool
+                         and type(getattr(message, 'qos', None)) is int
+                         and message.qos in (0, 1) and isinstance(payload, bytes)
+                         and payload in (b'online', b'offline'))
+                offline = not valid or payload == b'offline'
+                with self._lock:
+                    if _generation is not None and _generation != self._connection_generation:
+                        return
+                    if self._mqtt_started and not self._connected.is_set():
+                        return
+                    self._online[parts[1]] = not offline
+                    if offline:
+                        self._state_serial += 1
+                        self._latest.pop(parts[1], None)
+                        self._proven.pop(parts[1], None)
+                    invalidated = (self._latch_robots_locked((parts[1],))
+                                   if offline and self._runtime is not None else set())
+                self._revoke_robots(invalidated)
                 return
             if message.retain or not isinstance(message.payload, bytes) or len(message.payload) > MAX_STATE_BYTES:
                 return   # a retained state may belong to an earlier robot process
@@ -147,7 +228,9 @@ class PhysicalStateWatcher:
         except (ValueError, UnicodeError, AttributeError):
             return
         with self._lock:
-            if self._mqtt_started and not self._connected.is_set():
+            if _generation is not None and _generation != self._connection_generation:
+                return
+            if self._mqtt_started and (not self._connected.is_set() or not self._online.get(parts[1], False)):
                 return
             self._state_serial += 1
             self._latest[parts[1]] = (state, self._clock(), self._connection_generation, self._state_serial)
@@ -178,9 +261,10 @@ class PhysicalStateWatcher:
                     or (self._mqtt_started and not self._connected.is_set()))
             if stale:
                 self._latest.pop(robot, None)
+            invalidated = (self._latch_robots_locked((robot,))
+                           if stale and self._runtime is not None else set())
         if stale:
-            if self._runtime is not None:
-                self._invalidate_robots((robot,))
+            self._revoke_robots(invalidated)
             return None
         return None if item is None else dict(item[0])
 
@@ -235,18 +319,15 @@ class PhysicalStateWatcher:
         return tuple(task for task, (r, _s) in self._runtime._tasks.items() if r == robot)
 
     def _check_session(self, robot, state):
-        if robot in self._invalidated:
-            return False
-        if state['robot_session'] == self._sessions.get(robot):
-            return True
-        self._invalidated.add(robot)
-        tasks = self._robot_tasks(robot)
-        try:
-            if tasks:
-                self._runtime.gate.invalidate_many(tasks)
-        finally:
-            self._log('%s restarted (session %s -> %s); its tasks are blocked. Check the robot and '
-                      'restart the server runtime.' % (robot, self._sessions.get(robot), state['robot_session']))
+        with self._lock:
+            if robot in self._invalidated:
+                return False
+            if state['robot_session'] == self._sessions.get(robot):
+                return True
+            invalidated = self._latch_robots_locked((robot,))
+        self._revoke_robots(invalidated)
+        self._log('%s restarted (session %s -> %s); its tasks are blocked. Check the robot and '
+                  'restart the server runtime.' % (robot, self._sessions.get(robot), state['robot_session']))
         return False
 
     def _maybe_prove(self, robot, state):

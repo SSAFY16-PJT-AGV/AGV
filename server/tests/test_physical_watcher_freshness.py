@@ -31,6 +31,11 @@ class WatcherFreshnessTests(unittest.TestCase):
         self.w._mqtt_started = True
         self.client = SimpleNamespace(subscribe=lambda *_a, **_kw: (0, 1))
         self.w._on_connect(self.client, None, None, SimpleNamespace(is_failure=False), None)
+        self.w._on_subscribe(self.client, None, 1,
+                             [SimpleNamespace(is_failure=False, value=0),
+                              SimpleNamespace(is_failure=False, value=1)], None)
+        self.w._on_message(self.client, None, SimpleNamespace(
+            topic='agv/physical-1/conn', retain=True, qos=1, payload=b'online'))
         self.state = {'robot_session': 'boot-1', 'status': 'WAITING', 'order_id': 'T1',
                       'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'm@v1'}
 
