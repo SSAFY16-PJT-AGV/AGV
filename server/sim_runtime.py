@@ -333,10 +333,23 @@ class SimRuntime:
 
     def _start_physical_watcher(self):
         """Read each physical robot's live session and bind it into the static task mapping."""
+        from server.physical_initial_state import validate_initial_state
+        if (not isinstance(self._field_initial_positions, dict)
+                or any(r not in self._field_initial_positions for r in self._physical)):
+            raise ValueError('initial positions are required for every physical robot')
         watcher = PhysicalStateWatcher(self._physical, client=self._new_client(), host=self.host,
                                        port=self.port, connect_timeout=self.connect_timeout)
         self.physical_watcher = watcher.start()
         live = watcher.wait_sessions(self._physical_state_timeout)
+        expected_map = '{}@v{}'.format(self.map_data['map_id'], self.map_data['version'])
+        for robot in self._physical:
+            session = validate_initial_state(watcher.latest(robot), expected_map=expected_map,
+                                             expected_node=self._field_initial_positions[robot])
+            if live.get(robot) != session:
+                raise ValueError('physical session changed during discovery')
+            for configured in self._sessions[robot].values():
+                if configured != FROM_STATE and configured != session:
+                    raise ValueError('configured session of %s differs from its live state' % robot)
         self._physical_sessions = live
         for robot in self._physical:
             for task, session in list(self._sessions[robot].items()):
