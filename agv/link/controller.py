@@ -16,6 +16,7 @@
 상태 값: IDLE(주문 없음·작업 끝) | MOVING | WAITING(해제 노드에서 다음 해제를 기다림) | ERROR(error에 이유).
 표준 라이브러리만 쓴다. Python 3.6 호환.
 """
+import copy
 import json
 import math
 import time
@@ -57,6 +58,9 @@ class LinkController(object):
         self._last_status = None
         self.n_orders = 0
         self._anchor = None             # (노드, 경로 순번, odo): 마지막으로 선 해제 노드
+        get_generation = getattr(link, "disconnect_generation", None)
+        self._seen_disconnect_generation = get_generation() if get_generation is not None else None
+        self._strict_disconnect_latched = False
 
     # ---------- 연결 ----------
     def attach(self, runner):
@@ -69,15 +73,56 @@ class LinkController(object):
         if self._log is not None:
             self._log(msg, **kw)
 
+    def _consume_disconnect(self):
+        get_generation = getattr(self.link, "disconnect_generation", None)
+        if get_generation is None:
+            return
+        current = get_generation()
+        previous = self._seen_disconnect_generation
+        self._seen_disconnect_generation = current
+        pending = getattr(self.link, "disconnect_pending", lambda: False)()
+        if not pending and (previous is None or previous == current):
+            return
+        self._strict_disconnect_latched = True
+        if self.error is None:
+            self.error = "link_lost"
+            self._note("link_lost", state=None if self.runner is None else self.runner.state)
+        runner = self.runner
+        if runner is not None and runner.state != "hold" and runner.hold("link_lost"):
+            self._note("link_lost_hold")
+
+    def _handle_fenced(self, payload):
+        # Called while MqttLink holds its re-entrant connection lock.
+        self._consume_disconnect()
+        self._handle(payload)
+
+    def _watch_stop_fenced(self):
+        self._consume_disconnect()
+        self._watch_stop()
+
     # ---------- 한 스텝 ----------
     def step(self, now=None):
         now = self.clock() if now is None else now
         for msg, kw in getattr(self.link, "pop_notes", lambda: [])():
             self._note(msg, **kw)
-        for payload in self.link.poll():
-            self._handle(payload)
+        self._consume_disconnect()
         self._watch_link(now)
-        self._watch_stop()
+        poll_tagged = getattr(self.link, "poll_with_generation", None)
+        process = getattr(self.link, "process_if_current", None)
+        if poll_tagged is not None and process is not None:
+            for generation, payload in poll_tagged():
+                if not process(generation, payload, self._handle_fenced):
+                    self._note("link_stale_order_discarded")
+        else:
+            for payload in self.link.poll():
+                self._handle_fenced(payload)
+        self._consume_disconnect()
+        self._watch_link(now)
+        fence = getattr(self.link, "run_with_disconnect_fence", None)
+        if fence is None:
+            self._watch_stop_fenced()
+        else:
+            fence(self._watch_stop_fenced)
         st = self.state(now)
         if (self._last_pub is None or now - self._last_pub >= self.state_period - 1e-6
                 or st["status"] != self._last_status):
@@ -120,6 +165,16 @@ class LinkController(object):
         if d.kind == "duplicate":
             self._note("link_order_duplicate", order_id=o["order_id"], seq=o["seq"])
             return
+        if getattr(self.link, "disconnect_pending", lambda: False)():
+            self._strict_disconnect_latched = True
+            self.error = "link_lost"
+            self._reject(o, "order requires explicit recovery after disconnect")
+            return
+        # A previously queued first order must not start after link loss.
+        # Reconnect races are additionally fenced by MqttLink's queue lock.
+        if not self.link.connected:
+            self._reject(o, "order requires a connected link")
+            return
         if r is None or r.finished:
             self._reject(o, "robot stopped (%s)" % (r.finish_reason if r is not None else "not ready"))
             return
@@ -134,11 +189,61 @@ class LinkController(object):
                 self.nav.hold_at_end = True       # 마지막 노드에 닿아도 끝내지 않고 다음 작업을 기다림
                 self.nav.set_route(o["nodes"], o["released_until"])
             else:
+                if getattr(self.nav, "_strict_repeat", False):
+                    previous = self.book.current
+                    key = (previous["order_id"], previous["seq"])
+                    if (not self.link.connected or r.state != "hold" or r.hold_reason != "nav_hold"
+                            or self.nav.at_node != previous["released_until"]
+                            or key not in self._stopped):
+                        raise OrderRejected("repeated route requires stop before extend")
                 self.nav.extend(o["released_until"])
         except (OrderRejected, ValueError) as e:
             self._reject(o, e.args[0] if e.args else str(e))
             return
-        self.book.commit(d)
+        strict = getattr(self.nav, "_strict_repeat", False)
+        pending = getattr(self.link, "disconnect_pending", lambda: False)
+        def cancel(reason):
+            self.error = reason
+            if reason == "link_lost":
+                self._strict_disconnect_latched = True
+            cancel_start = getattr(r, "cancel_unstarted_motion", None)
+            if cancel_start is not None:
+                cancel_start(reason)
+            else:
+                r.hold(reason)
+            self._reject(o, "route start is uncertain")
+        if not self.link.connected or pending():
+            cancel("link_lost")
+            return
+        if strict:
+            if r.state != "hold" or r.hold_reason not in ("wait_order", "nav_hold"):
+                cancel("order_unconfirmed")
+                return
+            snapshot = copy.deepcopy(self.book.__dict__)
+            try:
+                arm = getattr(r, "arm_unstarted_disconnect_guard", None)
+                if arm is not None:
+                    arm(pending)
+                if r.resume() is False or r.state == "hold":
+                    raise RuntimeError("runner could not resume")
+                if pending():
+                    self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
+                    cancel("link_lost")
+                    return
+                self.book.commit(d)
+                if (self.book.current != o or self.book.current_digest != d.digest
+                        or self.book.seen.get((o["order_id"], o["seq"])) != d.digest):
+                    raise RuntimeError("order commit did not match decision")
+                if pending():
+                    self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
+                    cancel("link_lost")
+                    return
+            except Exception:
+                self.book.__dict__.clear(); self.book.__dict__.update(snapshot)
+                cancel("link_lost" if pending() else "order_unconfirmed")
+                return
+        else:
+            self.book.commit(d)
         if d.kind == "new":
             # 이전 작업에서 선 노드의 순번은 새 경로에서 의미가 없다. 새 경로의 첫 노드에 서 있다.
             self._anchor = (o["nodes"][0], 0, r.odo)
@@ -146,15 +251,24 @@ class LinkController(object):
         self.rejected = None
         self._note("link_order", kind=d.kind, order_id=o["order_id"], seq=o["seq"],
                    release=o["released_until"], nodes=o["nodes"])
-        if r.state == "hold" and r.hold_reason in ("wait_order", "nav_hold"):
-            r.resume()
-        else:
-            r.policy_changed()
+        if not strict:
+            if not self.link.connected or pending():
+                cancel("link_lost")
+                return
+            if r.state == "hold" and r.hold_reason in ("wait_order", "nav_hold"):
+                arm = getattr(r, "arm_unstarted_disconnect_guard", None)
+                if arm is not None:
+                    arm(pending)
+                r.resume()
+            else:
+                r.policy_changed()
 
     # ---------- 정지·끊김 ----------
     def _watch_stop(self):
         r, b = self.runner, self.book
         if r is None or b.current is None:
+            return
+        if getattr(self.nav, "_strict_repeat", False) and self.error is not None:
             return
         o = b.current
         key = (o["order_id"], o["seq"])
@@ -165,6 +279,20 @@ class LinkController(object):
         if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
                 or self.nav.at_node != release:
             return
+        if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
+            self.error = "event_unconfirmed"
+            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
+            return
+        if getattr(self.nav, "_strict_repeat", False) and not self.link.connected:
+            self.error = "event_unconfirmed"
+            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
+            return
+        if (getattr(self.nav, "_strict_repeat", False)
+                and getattr(self.link, "disconnect_pending", lambda: False)()):
+            self.error = "event_unconfirmed"
+            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
+            return
+        previous_anchor = self._anchor
         self._stopped.add(key)
         self._anchor = (release, b.release_i, r.odo)
         self._event_n += 1
@@ -172,7 +300,27 @@ class LinkController(object):
               "robot_session": self.session, "order_id": o["order_id"], "seq": o["seq"],
               "map_id": o["map_id"], "stopped_at": release,
               "cleared_resources": self.rules.cleared(o["nodes"], b.segment_start_i, b.release_i)}
-        self.link.publish_event(ev)
+        try:
+            if getattr(self.nav, "_strict_repeat", False):
+                one_shot = getattr(self.link, "publish_event_once", None)
+                accepted = one_shot(ev) if one_shot is not None else False
+            else:
+                accepted = self.link.publish_event(ev)
+        except Exception:
+            if not getattr(self.nav, "_strict_repeat", False):
+                raise
+            self._stopped.discard(key)
+            self._anchor = previous_anchor
+            self.error = "event_unconfirmed"
+            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
+            return
+        if (getattr(self.nav, "_strict_repeat", False)
+                and (accepted is not True or getattr(self.link, "disconnect_pending", lambda: False)())):
+            self._stopped.discard(key)
+            self._anchor = previous_anchor
+            self.error = "event_unconfirmed"
+            self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
+            return
         final = b.at_final_release
         if final:
             b.mark_finished()
@@ -197,9 +345,16 @@ class LinkController(object):
             return
         if self.error != "link_lost":
             return
+        if self._strict_disconnect_latched or getattr(self.nav, "_strict_repeat", False):
+            # Keep the disconnect latched even if the link returns during a
+            # pivot/reverse/park action that cannot stop immediately. As soon
+            # as the runner can hold, stop it and require manual recovery.
+            if r.state != "hold" and r.hold("link_lost"):
+                self._note("link_lost_hold")
+            return
         if r.state == "hold" and r.hold_reason == "link_lost":
             # 구간 가운데에 섰음: 남은 구간을 이어 갈지는 재동기화 규약이 정할 일(기본: 그대로 섬)
-            if self.resume_after_reconnect:
+            if self.resume_after_reconnect and not getattr(self.nav, "_strict_repeat", False):
                 self.error = None
                 self._note("link_restored", resumed=True)
                 r.resume()

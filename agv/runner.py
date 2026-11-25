@@ -253,6 +253,7 @@ class ExploreRunner(object):
         self._parked = None         # 스퍼 끝에 서 있음 {j, side} (재개하면 후진해 나옴)
         self.hold_reason = None
         self._stop_req = None       # 이동 정책이 요청한 정지 {pos, reason, hold, node}
+        self._unstarted_disconnect_guard = None
         self._resume_split = None   # 갈림길 앞에서 대기 중이면 그 갈림길 시작 (t, odo)
         self._resume_vee = None     # V자 앞에서 대기 중이면 그 판정
         self.rc = dict(RECOVER_DEFAULT)
@@ -465,6 +466,18 @@ class ExploreRunner(object):
         self._do_stop({"reason": reason, "hold": True})
         return True
 
+    def arm_unstarted_disconnect_guard(self, guard):
+        """Fence the first step of an order accepted from a held state."""
+        self._unstarted_disconnect_guard = guard
+
+    def cancel_unstarted_motion(self, reason):
+        """Cancel only a newly resumed plan before its first motor output."""
+        self._unstarted_disconnect_guard = None
+        self._stop_req = self.v_plan = self._piv = self._rev = None
+        self._resume_split = self._resume_vee = None
+        self.choice = self.decision = None
+        self._do_stop({"reason": reason, "hold": True})
+
     def resume(self):
         """대기를 풀고 다시 따라간다. 대기 중이 아니면 False."""
         if self.state != "hold" or self.finished:
@@ -483,6 +496,10 @@ class ExploreRunner(object):
         if hook is not None:
             hook()
         self.log.log("note", self._odo(), msg="resume")
+        if getattr(self.ex, "_strict_repeat", False) and getattr(self.ex, "_uturn", None) is not None:
+            # A branch observed before a scheduled U-turn cannot describe the
+            # road after the robot turns; execute the turn before new choices.
+            self._resume_split = self._resume_vee = None
         if self._resume_split is not None:
             onset, self._resume_split = self._resume_split, None
             self._decide_split(onset)
@@ -529,6 +546,20 @@ class ExploreRunner(object):
 
     # ---------- 한 스텝 ----------
     def step(self, frame, dt):
+        """Fence a newly resumed plan before returning its first motor output."""
+        guard = self._unstarted_disconnect_guard
+        if guard is not None and guard():
+            self.cancel_unstarted_motion("link_lost")
+            return 0.0, 0.0
+        result = self._step_unfenced(frame, dt)
+        if guard is not None:
+            if guard():
+                self.cancel_unstarted_motion("link_lost")
+                return 0.0, 0.0
+            self._unstarted_disconnect_guard = None
+        return result
+
+    def _step_unfenced(self, frame, dt):
         """프레임 하나 처리. 반환: (left, right) 모터 명령."""
         if self.finished:
             return 0.0, 0.0
@@ -725,6 +756,8 @@ class ExploreRunner(object):
         if suggestion is None:
             self._resume_split = onset
             self._poll_policy()
+            if self._stop_req is not None:
+                return  # follow to the requested junction before stopping
             if self.state != "hold":            # 정책이 정지를 안 줬으면 그냥 기본 방향
                 self._resume_split = None
                 suggestion = "left"
@@ -757,7 +790,7 @@ class ExploreRunner(object):
         if suggestion is None:
             self._resume_vee = raw_v
             self._poll_policy()
-            if self.state == "hold":
+            if self.state == "hold" or self._stop_req is not None:
                 return
             self._resume_vee = None
             suggestion = "left"
@@ -1021,6 +1054,9 @@ class ExploreRunner(object):
         kind = self._piv.get("kind", "recover")
         self.choice = None
         self.split_onset = None
+        if kind == "uturn":
+            # A pre-turn spur decision cannot describe a post-turn junction.
+            self.split_as_tee = None
         if self._piv.get("prefer") in ("left", "right"):
             # 회전 직후 바로 앞 갈림길: 이미 갈라져 보여 판정을 못 하니 그 가지를 고른 채로 따라간다
             self.choice = self._piv["prefer"]

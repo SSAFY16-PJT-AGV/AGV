@@ -15,6 +15,7 @@ import json
 import os
 import threading
 import time
+import uuid
 
 try:
     import paho.mqtt.client as mqtt
@@ -51,8 +52,12 @@ class MqttLink(object):
         self.robot_id = robot_id
         self.topic = lambda kind: "agv/%s/%s" % (robot_id, kind)
         self.host, self.port, self.keepalive = host, int(port), int(keepalive)
+        self._event_credentials = (username, password, tls_ca)
         self._log = log
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._connection_generation = 0
+        self._disconnect_generation = 0
+        self._disconnect_observed = threading.Event()
         self._orders = []
         self._notes = []
         self.connected = False
@@ -92,16 +97,25 @@ class MqttLink(object):
         if rc != 0:
             self._note("link_connect_failed", rc=rc)
             return
-        self.connected = True
-        self.ever_connected = True
-        self.disconnected_at = None
+        with self._lock:
+            self._connection_generation += 1
+            self.connected = True
+            self.ever_connected = True
+            self.disconnected_at = None
         client.publish(self.topic("conn"), "online", qos=1, retain=True)
         client.subscribe(self.topic("order"), qos=1)
         self._note("link_connected", host=self.host, port=self.port)
 
     def _on_disconnect(self, client, userdata, rc):
-        self.connected = False
-        self.disconnected_at = time.time()
+        # This must happen before waiting for the control/MQTT lock, which may
+        # be held while an event waits for its separate connection's PUBACK.
+        self._disconnect_observed.set()
+        with self._lock:
+            self.connected = False
+            self.disconnected_at = time.time()
+            self._disconnect_generation += 1
+            self._connection_generation += 1
+            self._orders = []  # never replay orders from a lost connection
         self._note("link_disconnected", rc=rc)
 
     def _on_message(self, client, userdata, msg):
@@ -112,8 +126,8 @@ class MqttLink(object):
             self.dropped_retained += 1
             return
         with self._lock:
-            if len(self._orders) < 64:
-                self._orders.append(bytes(msg.payload))
+            if self.connected and not self._disconnect_observed.is_set() and len(self._orders) < 64:
+                self._orders.append((self._connection_generation, bytes(msg.payload)))
 
     def start(self):
         self.c.connect_async(self.host, self.port, keepalive=self.keepalive)
@@ -130,7 +144,40 @@ class MqttLink(object):
         """받은 주문 payload(bytes) 목록을 꺼낸다."""
         with self._lock:
             out, self._orders = self._orders, []
-        return out
+        return [payload for _, payload in out]
+
+    def disconnect_pending(self):
+        """Sticky callback-start signal; only a fresh link clears it."""
+        return self._disconnect_observed.is_set()
+
+    def disconnect_generation(self):
+        """Count observed disconnects even when a reconnect clears the timestamp."""
+        with self._lock:
+            return self._disconnect_generation
+
+    def run_with_disconnect_fence(self, handler):
+        """Serialize a short control operation with connection callbacks."""
+        with self._lock:
+            return handler()
+
+    def poll_with_generation(self):
+        """Atomically return orders tagged with the connection they arrived on."""
+        with self._lock:
+            out, self._orders = self._orders, []
+            return out
+
+    def process_if_current(self, generation, payload, handler):
+        """Serialize processing with disconnect and reject stale queued input.
+
+        This fences callbacks already observed here; it cannot detect a
+        physical network loss before the MQTT callback is delivered.
+        """
+        with self._lock:
+            if (not self.connected or self._disconnect_observed.is_set()
+                    or generation != self._connection_generation):
+                return False
+            handler(payload)
+            return not self._disconnect_observed.is_set()
 
     def publish_state(self, state):
         if self.connected:
@@ -142,6 +189,61 @@ class MqttLink(object):
         info = self.c.publish(self.topic("event"), json.dumps(event, ensure_ascii=False, separators=(",", ":")),
                               qos=1, retain=False)
         return info.rc == mqtt.MQTT_ERR_SUCCESS
+
+    def publish_event_once(self, event, timeout=3.0):
+        """Use one temporary connection, require PUBACK, and never reconnect.
+
+        A lost acknowledgement is uncertain, not evidence of non-delivery.
+        This prevents this process from automatically replaying that event;
+        it does not promise exactly-once delivery or physical stop proof.
+        """
+        if not self.connected:
+            return False
+        username, password, tls_ca = self._event_credentials
+        client_id = "agv-event-" + uuid.uuid4().hex[:16]
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True)
+        else:
+            client = mqtt.Client(client_id=client_id, clean_session=True)
+        connected, acked = [], set()
+        def on_connect(_client, _userdata, _flags, code):
+            connected.append(code == 0)
+        def on_publish(_client, _userdata, mid):
+            acked.add(mid)
+        client.on_connect = on_connect
+        client.on_publish = on_publish
+        try:
+            if username:
+                client.username_pw_set(username, password)
+            if tls_ca:
+                client.tls_set(ca_certs=tls_ca)
+            if hasattr(client, "connect_timeout"):
+                client.connect_timeout = timeout
+            deadline = time.monotonic() + timeout
+            if client.connect(self.host, self.port, keepalive=self.keepalive) != mqtt.MQTT_ERR_SUCCESS:
+                return False
+            while not connected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
+                    return False
+            if not connected[0] or self.disconnect_pending():
+                return False
+            info = client.publish(self.topic("event"), json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                                  qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                return False
+            while info.mid not in acked:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
+                    return False
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+        finally:
+            try:
+                client.disconnect()
+            except (OSError, RuntimeError):
+                pass
 
     def stop(self):
         try:
@@ -178,6 +280,9 @@ class FakeLink(object):
     def publish_state(self, state):
         if self.connected:
             self.states.append(state)
+
+    def publish_event_once(self, event):
+        return self.publish_event(event)
 
     def publish_event(self, event):
         self.events.append(event)
