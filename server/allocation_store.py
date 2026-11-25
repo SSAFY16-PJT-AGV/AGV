@@ -279,11 +279,13 @@ class AllocationStore:
         return connection
 
     @contextmanager
-    def _write(self):
+    def _write(self, *, precommit=None):
         with closing(self._connect()) as db:
             db.execute('BEGIN IMMEDIATE')
             try:
                 yield db
+                if precommit is not None:
+                    precommit()
                 db.execute('COMMIT')
             except BaseException:
                 if db.in_transaction:
@@ -336,7 +338,7 @@ class AllocationStore:
             raise AllocationConflict('task already exists') from exc
 
     def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint,
-                 release_index=None, field_context=None):
+                 release_index=None, field_context=None, _precommit_guard=None):
         _fingerprint(map_fingerprint)
         try:
             nodes_copy, resources_copy, action_copy = copy.deepcopy((nodes, resources, action_at_end))
@@ -356,7 +358,7 @@ class AllocationStore:
             field_json = _field_route(field_context, map_id, nodes_copy, map_fingerprint)
         nodes_json = json.dumps(nodes_copy, ensure_ascii=False)
         try:
-            with self._write() as db:
+            with self._write(precommit=_precommit_guard) as db:
                 _verify_field_global(db, field_required=self._field_required)
                 row = db.execute('SELECT status FROM tasks WHERE task_id=?', (task_id,)).fetchone()
                 if row is None or row[0] != 'PENDING':

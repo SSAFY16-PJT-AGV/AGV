@@ -17,7 +17,7 @@ from server.order_publisher import validate_order
 from server.routing import MapGraph, UnsupportedRobotRoutingError
 from server.segments import plan_segment
 from server.route_occurrence import plan_occurrence_segment, visit_indices_from_orders
-from server.robot_ids import is_fleet_robot
+from server.robot_ids import is_fleet_robot, is_physical_robot
 
 
 _EVENT_KEYS = frozenset(('type', 'event_id', 'robot_session', 'order_id', 'seq',
@@ -408,7 +408,8 @@ class SegmentProgress:
                              (task_id, seq)).fetchone()
         return None if row is None else {'payload': row[0], 'state': row[1]}
 
-    def _verify_transition(self, db, task_id, seq, robot_session, expected_payload, expected_resources, source):
+    def _verify_transition(self, db, task_id, seq, robot_session, expected_payload, expected_resources, source,
+                           *, physical_ack=False):
         _id(task_id, 'task id'); _id(robot_session, 'robot session')
         if type(seq) is not int or seq < 2 or not isinstance(expected_payload, str):
             raise ValueError('invalid order transition')
@@ -430,7 +431,12 @@ class SegmentProgress:
         if prior_row is None:
             raise AllocationConflict('previous order missing')
         previous = _read_order(prior_row[0])
-        self._authorize(db, task_id, robot_session, seq - 1, previous['released_until'])
+        if physical_ack and is_physical_robot(robot):
+            self._gate.require_physical_ack(db, robot, task_id, robot_session, seq,
+                                            order['released_until'], order['map_id'],
+                                            previous['released_until'])
+        else:
+            self._authorize(db, task_id, robot_session, seq - 1, previous['released_until'])
 
     def verify_uncertain_in_transaction(self, db, task_id, seq, robot_session, expected_payload, expected_resources):
         """Recheck an uncertain order in the caller's active gate transaction.
@@ -441,10 +447,11 @@ class SegmentProgress:
         self._verify_transition(db, task_id, seq, robot_session, expected_payload,
                                 expected_resources, 'uncertain')
 
-    def _transition(self, task_id, seq, robot_session, expected_payload, expected_resources, source, target):
+    def _transition(self, task_id, seq, robot_session, expected_payload, expected_resources, source, target,
+                    *, physical_ack=False):
         with self._transaction() as db:
             self._verify_transition(db, task_id, seq, robot_session, expected_payload,
-                                    expected_resources, source)
+                                    expected_resources, source, physical_ack=physical_ack)
             updated = db.execute('UPDATE progress_orders SET state=? WHERE task_id=? AND seq=? AND state=?',
                                  (target, task_id, seq, source))
             if updated.rowcount != 1:
@@ -456,3 +463,10 @@ class SegmentProgress:
 
     def mark_broker_acked(self, task_id, seq, robot_session, expected_payload, expected_resources):
         self._transition(task_id, seq, robot_session, expected_payload, expected_resources, 'uncertain', 'acked')
+
+    def _mark_physical_broker_acked(self, task_id, seq, robot_session, expected_payload, expected_resources, info):
+        """Record an observed PUBACK only; this is never robot execution proof."""
+        if info.is_published() is not True:
+            raise ValueError('confirmed broker acknowledgement is required')
+        self._transition(task_id, seq, robot_session, expected_payload, expected_resources,
+                         'uncertain', 'acked', physical_ack=True)

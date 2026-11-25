@@ -46,7 +46,9 @@ class SubscriptionSafetyTests(unittest.TestCase):
             connect_timeout=0.01, log=lambda _message: None)
         self.watcher._mqtt_started = True
         self.watcher._on_connect(self.client, None, None, SimpleNamespace(is_failure=False), None)
-        self.state = {'robot_session': 's1', 'status': 'WAITING', 'order_id': 'T1', 'seq': 1}
+        self.state = {'robot_session': 's1', 'status': 'WAITING', 'order_id': 'T1', 'seq': 1,
+                      'map_id': 'field@v1', 'last_node': 'A', 'released_until': 'A',
+                      'error': None, 'rejected': None}
 
     def suback(self, *, mid=19, codes=(0, 1, 0, 1)):
         self.watcher._on_subscribe(self.client, None, mid,

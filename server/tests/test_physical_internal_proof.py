@@ -47,6 +47,7 @@ class PhysicalInternalProofTests(unittest.TestCase):
         watcher._subscription_done.set()
         watcher._online['physical-1'] = True
         runtime.physical_watcher = watcher
+        self.gate.bind_physical_watcher(watcher)
         self.state = {'robot_session': 'session', 'status': 'WAITING', 'order_id': 'T1',
                       'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'layout@v1',
                       'error': None, 'rejected': None}

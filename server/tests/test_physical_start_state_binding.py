@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from server.physical_state_proof import FROM_STATE
 from server.sim_runtime import SimRuntime
+from server.sim_handoff_store import SimHandoffStore
 from server.tests.test_field_map_planner import sample_map
 
 
@@ -19,10 +20,14 @@ class PhysicalStartStateBindingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.runtime = SimRuntime(Path(self.temp.name) / 'state.sqlite', sample_map(),
+        path = Path(self.temp.name) / 'state.sqlite'
+        positions = {'physical-1': 'A', 'physical-2': 'C'}
+        store = SimHandoffStore.create_new(path, simulation_enabled=True, idle_positions=positions,
+                                           physical_robots=True)
+        self.runtime = SimRuntime(path, sample_map(),
             {'physical-1': {'T1': FROM_STATE}, 'physical-2': {'T2': FROM_STATE}},
             port=1883, client_id='startup-check', field_simulation=True, physical_robots=True,
-            field_initial_positions={'physical-1': 'A', 'physical-2': 'C'})
+            field_initial_positions=positions, simulation_store=store)
         self.watcher = Mock()
         self.watcher.start.return_value = self.watcher
         self.watcher.wait_sessions.return_value = {'physical-1': 's1', 'physical-2': 's2'}

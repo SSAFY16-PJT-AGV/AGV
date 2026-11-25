@@ -11,6 +11,7 @@ from contextlib import closing
 from server.allocation_store import _id
 from server.order_publisher import OrderPublisher, OrderPublishingDisabled, validate_order
 from server.recovery import RecoveryGate
+from server.robot_ids import is_physical_robot
 from server.segment_progress import SegmentProgress, _read_order
 
 
@@ -94,6 +95,7 @@ class ProgressPublisher:
                 raise ProgressPublishingError('publisher is already in use or consumed')
             self._running = True
         claimed = False
+        robot_id = None
         try:
             robot_id, order, payload, resources = self._pending(task_id, seq)
             self._publisher.claim(self._owner)
@@ -106,14 +108,20 @@ class ProgressPublisher:
                 # A fresh gate in another process has a different local lock.
                 # The SQLite writer lock fences its epoch change and any
                 # occupancy update until this queue attempt has completed.
-                with gate.transaction() as db:
-                    current = self._fence(db, task_id, seq, robot_session, robot_id, payload, resources)
-                    self._publisher.validate(robot_id, copy.deepcopy(current), owner=self._owner)
-                    info = self._publisher.publish(robot_id, copy.deepcopy(current), owner=self._owner)
+                with gate.physical_queue_lock(robot_id):
+                    with gate.transaction() as db:
+                        current = self._fence(db, task_id, seq, robot_session, robot_id, payload, resources)
+                        self._publisher.validate(robot_id, copy.deepcopy(current), owner=self._owner)
+                        with gate.physical_stop_guard():
+                            info = self._publisher.publish(robot_id, copy.deepcopy(current), owner=self._owner)
+                            gate.record_physical_enqueued(robot_id, task_id, robot_session, current)
             info.wait_for_publish(timeout=self._timeout)
             if info.is_published() is not True:
                 raise TimeoutError('broker acknowledgement not confirmed; outcome uncertain')
-            self._progress.mark_broker_acked(task_id, seq, robot_session, payload, resources)
+            if is_physical_robot(robot_id):
+                self._progress._mark_physical_broker_acked(task_id, seq, robot_session, payload, resources, info)
+            else:
+                self._progress.mark_broker_acked(task_id, seq, robot_session, payload, resources)
             return {'task_id': task_id, 'seq': seq, 'state': 'acked'}
         except BaseException:
             if claimed:
@@ -123,6 +131,10 @@ class ProgressPublisher:
                 # blocked. A fresh challenge and a new client are required.
                 with self._lock:
                     self._used = True
+                if is_physical_robot(robot_id) and gate._physical_watcher is not None:
+                    # Latch locally before waiting on the gate; a worker that
+                    # already owns the gate must observe the invalidation.
+                    gate._physical_watcher._invalidate_robots((robot_id,))
                 try:
                     gate.invalidate(task_id)
                 except Exception as exc:

@@ -80,7 +80,7 @@ class Coordinator:
         segment = plan_segment(self._map, route)
         return self._prepare_choice(task_id, choice, route, segment, action_copy)
 
-    def prepare_field(self, task_id, destination, candidates, action_at_end):
+    def prepare_field(self, task_id, destination, candidates, action_at_end, *, _precommit_guard=None):
         """Prepare a field-map route only for an explicitly isolated simulator.
 
         Candidate entry edges are caller-supplied simulation assumptions, not
@@ -100,10 +100,11 @@ class Coordinator:
                          'incoming_edge': selected.incoming_edge, 'goal': destination}
         release_index = segment.end_index if len(set(route)) != len(route) else None
         return self._prepare_choice(task_id, choice, route, segment, action_copy,
-                                    release_index=release_index, field_context=field_context)
+                                    release_index=release_index, field_context=field_context,
+                                    _precommit_guard=_precommit_guard)
 
     def _prepare_choice(self, task_id, choice, route, segment, action_copy, *,
-                        release_index=None, field_context=None):
+                        release_index=None, field_context=None, _precommit_guard=None):
         expected_order = {'order_id': task_id, 'seq': 1, 'map_id': self._map_version,
                           'nodes': route, 'released_until': segment.released_until,
                           'action_at_end': action_copy}
@@ -136,6 +137,8 @@ class Coordinator:
             options = {'map_fingerprint': self._map_fingerprint}
             if field_context is not None:
                 options.update(release_index=release_index, field_context=field_context)
+            if _precommit_guard is not None:
+                options['_precommit_guard'] = _precommit_guard
             allocation = self._store.allocate(
                 task_id, choice.robot_id, self._map_version, route, segment.released_until,
                 segment.resources, action_copy, **options)
@@ -179,7 +182,7 @@ class Coordinator:
         self._wait_publish(attempt)
         return self._record_publish_ack(attempt)
 
-    def _queue_publish(self, task_id):
+    def _queue_publish(self, task_id, *, _before_enqueue=None):
         """Mark the durable attempt and enqueue once; do not wait for PUBACK."""
         if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError('task_id must be a non-empty string')
@@ -203,6 +206,8 @@ class Coordinator:
         robot_id = allocation['robot_id']
         self._publisher.validate(robot_id, copy.deepcopy(order), owner=self._publisher_owner)
         self._store.mark_attempted(task_id, prepared[1], prepared[0], prepared[2])
+        if _before_enqueue is not None:
+            _before_enqueue()
         info = self._publisher.publish(robot_id, copy.deepcopy(order), owner=self._publisher_owner)
         return _PublishAttempt(self, task_id, prepared, info)
 

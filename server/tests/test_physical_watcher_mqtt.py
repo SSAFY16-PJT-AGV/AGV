@@ -47,7 +47,8 @@ class WatcherMqttTests(unittest.TestCase):
                 try:
                     self.assertTrue(connected.wait(5))
                     state = {'robot_session': 'boot-1', 'status': 'WAITING', 'order_id': 'T1',
-                             'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'm@v1'}
+                             'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'm@v1',
+                             'error': None, 'rejected': None}
                     def send(topic, payload, *, retain=True):
                         info = robot.publish(topic, payload, qos=1, retain=retain)
                         info.wait_for_publish(timeout=5)

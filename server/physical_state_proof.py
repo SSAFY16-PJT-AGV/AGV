@@ -42,6 +42,19 @@ DEFAULT_MAX_STATE_AGE_S = 2.0
 STOPPED = ('WAITING', 'IDLE')
 
 
+def _unique_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError('duplicate state field')
+        result[key] = value
+    return result
+
+
+def _invalid_constant(_value):
+    raise ValueError('non-finite state number')
+
+
 class PhysicalStateWatcher:
     def __init__(self, robots, *, client, host, port, connect_timeout=5.0, refresh_s=15.0,
                  poll_s=0.2, log=None, clock=time.monotonic,
@@ -58,7 +71,7 @@ class PhysicalStateWatcher:
             raise ValueError('state_max_age_s must be finite and in (0, 30]')
         self._max_state_age = float(state_max_age_s)
         self._log = log or (lambda msg: print('[physical] ' + msg, flush=True))
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._latest = {}          # robot -> (state dict, monotonic time, connection generation, serial)
         self._connection_generation = 0
         self._state_serial = 0
@@ -66,6 +79,7 @@ class PhysicalStateWatcher:
         self._sessions = {}        # robot -> session bound into the runtime
         self._invalidated = set()  # robots whose session changed
         self._proven = {}          # robot -> ((task, seq), monotonic time)
+        self._motion_permits = {}  # robot -> queued (task, session, seq, map, release)
         self._runtime = None
         self._stop = threading.Event()
         self._thread = None
@@ -102,6 +116,7 @@ class PhysicalStateWatcher:
             generation = self._connection_generation
             self._latest.clear()
             self._proven.clear()
+            self._motion_permits.clear()
             self._online.clear()
             self._pending_mid = None
             self._subscription_done.clear()
@@ -156,6 +171,7 @@ class PhysicalStateWatcher:
         self._invalidated.update(new)
         for robot in new:
             self._proven.pop(robot, None)
+            self._motion_permits.pop(robot, None)
         return new
 
     def _revoke_robots(self, robots):
@@ -185,6 +201,7 @@ class PhysicalStateWatcher:
             self._connection_generation += 1
             self._latest.clear()
             self._proven.clear()
+            self._motion_permits.clear()
             self._online.clear()
             self._pending_mid = None
             self._subscription_done.set()
@@ -192,6 +209,7 @@ class PhysicalStateWatcher:
         self._revoke_robots(invalidated)
 
     def _on_message(self, _client, _userdata, message, *, _generation=None):
+        state_robot = None
         try:
             parts = message.topic.split('/')
             if len(parts) != 3 or parts[0] != 'agv' or parts[2] not in ('state', 'conn') or parts[1] not in self.robots:
@@ -217,20 +235,94 @@ class PhysicalStateWatcher:
                                    if offline and self._runtime is not None else set())
                 self._revoke_robots(invalidated)
                 return
-            if message.retain or not isinstance(message.payload, bytes) or len(message.payload) > MAX_STATE_BYTES:
+            if message.retain is True:
                 return   # a retained state may belong to an earlier robot process
-            state = json.loads(message.payload.decode('utf-8'))
-            if not isinstance(state, dict) or not isinstance(state.get('robot_session'), str):
-                return
-        except (ValueError, UnicodeError, AttributeError):
+            state_robot = parts[1]
+            if (type(message.retain) is not bool or not isinstance(message.payload, bytes)
+                    or len(message.payload) > MAX_STATE_BYTES):
+                raise ValueError('invalid live state payload')
+            state = json.loads(message.payload.decode('utf-8'), object_pairs_hook=_unique_pairs,
+                               parse_constant=_invalid_constant)
+            session = state.get('robot_session') if isinstance(state, dict) else None
+            if (not isinstance(session, str) or not session or session != session.strip()
+                    or len(session.encode('utf-8')) > 256):
+                raise ValueError('invalid live robot session')
+        except (ValueError, UnicodeError, AttributeError, RecursionError):
+            if state_robot is not None:
+                with self._lock:
+                    active = ((_generation is None or _generation == self._connection_generation)
+                              and (not self._mqtt_started or
+                                   (self._connected.is_set() and self._online.get(state_robot) is True)))
+                    if active:
+                        self._state_serial += 1
+                        self._latest.pop(state_robot, None)
+                        invalidated = (self._latch_robots_locked((state_robot,))
+                                       if self._runtime is not None else set())
+                    else:
+                        invalidated = set()
+                self._revoke_robots(invalidated)
             return
         with self._lock:
             if _generation is not None and _generation != self._connection_generation:
                 return
             if self._mqtt_started and (not self._connected.is_set() or not self._online.get(parts[1], False)):
                 return
+            robot = parts[1]
+            previous = self._proven.get(robot)
+            prior_item = self._latest.get(robot)
+            failed = (state.get('status') not in ('IDLE', 'WAITING', 'MOVING')
+                      or 'error' not in state or state['error'] is not None
+                      or 'rejected' not in state or state['rejected'] is not None
+                      or (self._runtime is not None and robot in self._sessions
+                          and state['robot_session'] != self._sessions[robot]))
+            if previous is not None and state.get('status') not in STOPPED:
+                expected_moving = (state.get('status') == 'MOVING'
+                                   and type(state.get('seq')) is int and state['seq'] > 0
+                                   and self._motion_permits.get(robot) ==
+                                       (state.get('order_id'), state['robot_session'], state['seq'],
+                                        state.get('map_id'), state.get('released_until'))
+                                   and state.get('error', object()) is None
+                                   and state.get('rejected', object()) is None)
+                self._proven.pop(robot, None)
+                if not expected_moving:
+                    failed = True
+            if state.get('status') == 'MOVING':
+                expected = (state.get('order_id'), state['robot_session'], state.get('seq'),
+                            state.get('map_id'), state.get('released_until'))
+                if self._motion_permits.get(robot) != expected:
+                    failed = True
+            elif state.get('status') in STOPPED and state.get('order_id') is not None:
+                current = (state.get('order_id'), state.get('seq'))
+                permit = (state.get('order_id'), state['robot_session'], state.get('seq'),
+                          state.get('map_id'), state.get('released_until'))
+                valid_stop = (type(state.get('seq')) is int and state['seq'] > 0
+                              and isinstance(state.get('last_node'), str)
+                              and state['last_node'] == state.get('released_until'))
+                if previous is not None and current == previous[0]:
+                    old = None if prior_item is None else prior_item[0]
+                    if (not valid_stop or old is None
+                            or any(old.get(key) != state.get(key)
+                                   for key in ('robot_session', 'order_id', 'seq', 'map_id',
+                                               'last_node', 'released_until'))):
+                        failed = True
+                elif previous is not None:
+                    if valid_stop and self._motion_permits.get(robot) == permit:
+                        # A queued next order may stop before MOVING is observed.
+                        # The old proof cannot authorize this new stop.
+                        self._proven.pop(robot, None)
+                    else:
+                        failed = True
+                elif self._motion_permits.get(robot) is not None:
+                    if not valid_stop or self._motion_permits[robot] != permit:
+                        failed = True
+            elif (state.get('status') in STOPPED
+                  and (previous is not None or self._motion_permits.get(robot) is not None)):
+                failed = True
+            invalidated = (self._latch_robots_locked((robot,))
+                           if failed and self._runtime is not None else set())
             self._state_serial += 1
-            self._latest[parts[1]] = (state, self._clock(), self._connection_generation, self._state_serial)
+            self._latest[robot] = (state, self._clock(), self._connection_generation, self._state_serial)
+        self._revoke_robots(invalidated)
 
     # Session discovery -----------------------------------------------------
     def wait_sessions(self, timeout):
@@ -276,11 +368,73 @@ class PhysicalStateWatcher:
                 return None
             return item[2], item[3]
 
+    def _start_evidence_locked(self, robot, session, node, map_id, *, source_task=None, source_seq=None,
+                               proof_ttl=30.0):
+        """Capture a fresh initial or handoff report; caller holds state lock."""
+        item = self._latest.get(robot)
+        age = None if item is None else self._clock() - item[1]
+        if (robot not in self.robots or robot in self._invalidated
+                or not self._mqtt_started or not self._connected.is_set()
+                or not self._subscription_done.is_set() or self._online.get(robot) is not True
+                or self._sessions.get(robot) != session
+                or item is None or item[2] != self._connection_generation
+                or age < 0 or age > self._max_state_age):
+            raise ValueError('fresh physical start evidence is unavailable')
+        state = item[0]
+        if (state.get('robot_session') != session or state.get('map_id') != map_id
+                or state.get('last_node') != node
+                or 'error' not in state or state['error'] is not None
+                or 'rejected' not in state or state['rejected'] is not None):
+            raise ValueError('physical start report does not match')
+        if source_task is None:
+            if (state.get('status') != 'IDLE' or 'order_id' not in state or state['order_id'] is not None
+                    or 'seq' not in state or state['seq'] is not None
+                    or 'released_until' not in state or state['released_until'] is not None):
+                raise ValueError('physical robot has no fresh initial idle report')
+        else:
+            proof = self._proven.get(robot)
+            if (state.get('status') not in STOPPED or state.get('order_id') != source_task
+                    or type(state.get('seq')) is not int or state['seq'] != source_seq
+                    or state.get('released_until') != node or proof is None
+                    or proof[0] != (source_task, source_seq)
+                    or self._clock() - proof[1] < 0 or self._clock() - proof[1] >= proof_ttl):
+                raise ValueError('physical robot has no fresh source stop report')
+        return (self._connection_generation, robot, session, node, map_id, source_task, source_seq)
+
+    def _queued_ack_evidence_locked(self, robot, session, order, original, *, proof_ttl=30.0):
+        """Validate live state for broker-ACK bookkeeping, not physical completion."""
+        try:
+            current = self._start_evidence_locked(
+                robot, session, original[3], original[4], source_task=original[5],
+                source_seq=original[6], proof_ttl=proof_ttl)
+            if current == original:
+                return True
+        except ValueError:
+            pass
+        item = self._latest.get(robot)
+        age = None if item is None else self._clock() - item[1]
+        expected = (order['order_id'], session, order['seq'], order['map_id'], order['released_until'])
+        if (robot in self._invalidated or not self._connected.is_set() or not self._subscription_done.is_set()
+                or self._online.get(robot) is not True or self._sessions.get(robot) != session
+                or self._motion_permits.get(robot) != expected or item is None
+                or item[2] != self._connection_generation or age < 0 or age > self._max_state_age):
+            raise ValueError('physical acknowledgement evidence is unavailable')
+        state = item[0]
+        if (state.get('robot_session') != session or state.get('order_id') != order['order_id']
+                or type(state.get('seq')) is not int or state['seq'] != order['seq']
+                or state.get('map_id') != order['map_id'] or state.get('released_until') != order['released_until']
+                or state.get('status') not in ('MOVING', 'WAITING', 'IDLE')
+                or state.get('error', object()) is not None or state.get('rejected', object()) is not None
+                or (state['status'] != 'MOVING' and state.get('last_node') != order['released_until'])):
+            raise ValueError('physical acknowledgement report does not match queued order')
+        return True
+
     # Runtime binding ------------------------------------------------------
     def bind(self, runtime, sessions):
         """Start proving stops for ``runtime`` with the bound ``sessions``."""
         self._runtime = runtime
         self._sessions = dict(sessions)
+        runtime.gate.bind_physical_watcher(self)
         self._thread = threading.Thread(target=self._run, name='physical-state-proof', daemon=True)
         self._thread.start()
 
@@ -333,6 +487,17 @@ class PhysicalStateWatcher:
             return
         task, seq = state.get('order_id'), state.get('seq')
         rt = self._runtime
+        # An expected next order in motion has no stop proof. A fresh stop at
+        # its sent sequence must later be proven against the durable order.
+        if (state.get('status') == 'MOVING' and state.get('error', object()) is None
+                and state.get('rejected', object()) is None):
+            with self._lock:
+                expected = (state.get('order_id'), state.get('robot_session'), state.get('seq'),
+                            state.get('map_id'), state.get('released_until'))
+                invalidated = (self._latch_robots_locked((robot,))
+                               if self._motion_permits.get(robot) != expected else set())
+            self._revoke_robots(invalidated)
+            return
         if (state.get('status') not in STOPPED or not isinstance(task, str) or type(seq) is not int
                 or 'error' not in state or state['error'] is not None
                 or 'rejected' not in state or state['rejected'] is not None

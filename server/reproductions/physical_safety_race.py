@@ -1,4 +1,4 @@
-"""Reproduce two unresolved physical safety windows; the assertions currently fail.
+"""Exercise two physical safety windows on isolated SQLite and MQTT fakes.
 
 Run from the repository root with the project virtual environment::
 
@@ -24,6 +24,7 @@ from server.order_publisher import OrderPublisher
 from server.physical_state_proof import PhysicalStateWatcher
 from server.progress_publisher import ProgressPublisher
 from server.recovery import RecoveryGate
+from server.sim_runtime import SimRuntime
 from server.segment_progress import SegmentProgress
 from server.segments import plan_segment
 from server.tests.test_progress_publisher import FakeClient as PublisherClient
@@ -61,11 +62,6 @@ class SafetyWindowTests(unittest.TestCase):
         self.store.mark_broker_acked('T1', order['payload'], allocated, first.resources)
         self.gate = RecoveryGate(self.path)
         self.gate.initialize()
-        token = self.gate.begin('T1', 'boot-1')
-        digest = hashlib.sha256(json.dumps(json.loads(order['payload']), sort_keys=True,
-            ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode('ascii')).hexdigest()
-        self.gate.complete('T1', 'boot-1', token, robot_id='physical-1', order_id='T1',
-                           seq=1, map_id='layout@v4', stopped_at='N3', order_digest=digest, stopped=True)
         self.progress = SegmentProgress(self.store, self.map, simulation_enabled=True, recovery_gate=self.gate)
         self.progress.initialize()
         self.event = {'type': 'rear_clear', 'event_id': 'E1', 'robot_session': 'boot-1',
@@ -78,12 +74,29 @@ class SafetyWindowTests(unittest.TestCase):
         self.watcher._mqtt_started = True
         self.watcher._connected.set()
         self.watcher._online['physical-1'] = True
-        self.watcher._runtime = SimpleNamespace(_tasks={'T1': ('physical-1', 'boot-1')}, gate=self.gate)
+        runtime = self.runtime = SimRuntime.__new__(SimRuntime)
+        runtime._lock = threading.RLock()
+        runtime.receiver = SimpleNamespace(_dispatch_lock=threading.RLock())
+        runtime._ready = lambda: None
+        runtime._tasks = {'T1': ('physical-1', 'boot-1')}
+        runtime._field_simulation = False
+        runtime.path = str(self.path)
+        runtime.gate = self.gate
+        runtime.physical_watcher = self.watcher
+        self.watcher._subscription_done.set()
+        self.watcher._runtime = runtime
         self.watcher._sessions = {'physical-1': 'boot-1'}
         self.state = {'robot_session': 'boot-1', 'status': 'WAITING', 'order_id': 'T1',
-                      'seq': 1, 'last_node': 'N3', 'released_until': 'N3', 'map_id': 'layout@v4'}
+                      'seq': 1, 'last_node': 'N3', 'released_until': 'N3', 'map_id': 'layout@v4',
+                      'error': None, 'rejected': None}
         self.watcher._on_message(None, None, message('state', self.state))
-        self.watcher._proven['physical-1'] = (('T1', 1), time.monotonic())
+        self.watcher._maybe_prove('physical-1', self.state)
+        self.assertEqual(self.watcher._proven['physical-1'][0], ('T1', 1))
+        self.gate.bind_physical_watcher(self.watcher)
+        with self.gate.transaction() as db:
+            self.assertTrue(self.gate.require_reconciled(
+                db, 'T1', 'boot-1', expected_seq=1, expected_stopped_at='N3'))
+        self.assertTrue(self.store.list_occupancy())
 
     def test_moving_state_must_block_automatic_receiver_progress(self):
         inbox = SimEventInbox(self.path, robot_tasks={'physical-1': ('T1',)}, simulation_enabled=True)
@@ -100,7 +113,9 @@ class SafetyWindowTests(unittest.TestCase):
                          'MOVING state must not allow old stop proof to transfer occupancy')
 
     def test_observed_offline_latch_must_block_worker_publish(self):
-        self.progress.advance('physical-1', self.event)
+        advanced = self.progress.advance('physical-1', self.event)
+        self.assertEqual((advanced['status'], advanced['next_seq']), ('advanced', 2))
+        self.assertEqual(self.progress.get_order('T1', 2)['state'], 'pending')
         self.client = PublisherClient()
         publisher = OrderPublisher(self.client, enabled=True)
         runner = ProgressPublisher(self.progress, publisher, ack_timeout=1)
@@ -136,6 +151,7 @@ class SafetyWindowTests(unittest.TestCase):
                 self.assertFalse(thread.is_alive(), 'gate invalidation stuck')
         self.assertEqual(self.client.publications, [],
                          'worker must not enqueue a command after offline was observed')
+        self.assertEqual(len(worker), 1, 'publication must reach the disconnect hook')
 
 
 if __name__ == '__main__':

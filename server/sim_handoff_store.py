@@ -272,7 +272,7 @@ class SimHandoffStore(AllocationStore):
             raise ValueError('fresh simulation database is unavailable') from exc
 
     def allocate(self, task_id, robot_id, map_id, nodes, released_until, resources, action_at_end, *, map_fingerprint,
-                 release_index=None, field_context=None):
+                 release_index=None, field_context=None, _precommit_guard=None):
         _topic(robot_id)
         if self._idle_enabled:
             self.validate_bound(self.path)
@@ -293,7 +293,7 @@ class SimHandoffStore(AllocationStore):
                         or (release_index is not None and release_index != segment.end_index)):
                     raise InvalidAllocation('field first segment differs from route')
             try:
-                with self._write() as db:
+                with self._write(precommit=_precommit_guard) as db:
                     if field_json is not None or self._field_required:
                         self._verify_field_fleet(db)
                     _verify_field_global(db, field_required=self._field_required)
@@ -343,7 +343,8 @@ class SimHandoffStore(AllocationStore):
             return self.get_allocation(task_id)
         return super().allocate(task_id, robot_id, map_id, nodes, released_until, resources,
                                 action_at_end, map_fingerprint=map_fingerprint,
-                                release_index=release_index, field_context=field_context)
+                                release_index=release_index, field_context=field_context,
+                                _precommit_guard=_precommit_guard)
 
     def _check_resource_availability(self, db, resources, *, ignore_task=None, ignore_idle_robot=None):
         """Check under the caller's write transaction; only known occupancy is retryable."""

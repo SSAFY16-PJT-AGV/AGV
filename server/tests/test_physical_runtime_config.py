@@ -18,16 +18,32 @@ def make(robots, **options):
     return SimRuntime(Path(folder) / 'db.sqlite3', sample_map(), robots, port=1883, client_id='cfg-test', **options)
 
 
+def make_physical(robots):
+    from server.sim_handoff_store import SimHandoffStore
+    folder = tempfile.mkdtemp()
+    path = Path(folder) / 'db.sqlite3'
+    positions = {robot: node for robot, node in zip(robots, ('A', 'C'))}
+    store = SimHandoffStore.create_new(path, simulation_enabled=True,
+                                       idle_positions=positions, physical_robots=True)
+    return SimRuntime(path, sample_map(), robots, port=1883, client_id='cfg-test',
+                      field_simulation=True, physical_robots=True,
+                      simulation_store=store, field_initial_positions=positions)
+
+
 class PhysicalRuntimeConfigTests(unittest.TestCase):
+    def test_physical_runtime_requires_explicit_idle_store_and_all_start_positions(self):
+        with self.assertRaisesRegex(ValueError, 'physical.*store'):
+            make({'physical-1': {'P1': FROM_STATE}}, field_simulation=True, physical_robots=True)
+
     def test_physical_runtime_cannot_start_or_contact_broker(self):
-        runtime = make({'physical-1': {'P1': FROM_STATE}}, field_simulation=True, physical_robots=True)
+        runtime = make_physical({'physical-1': {'P1': FROM_STATE}})
         with patch.object(runtime, '_start_physical_watcher') as watcher, \
                 patch.object(runtime._owner, 'acquire', side_effect=AssertionError('owner acquired')) as acquire:
             with self.assertRaisesRegex(RuntimeError, 'physical.*disabled'):
                 runtime.start()
         watcher.assert_not_called()
         acquire.assert_not_called()
-        self.assertFalse(Path(runtime.path).exists())
+        self.assertTrue(Path(runtime.path).exists())
 
     def test_physical_config_does_not_create_database(self):
         from server.main import load_sim_runtime
@@ -52,7 +68,7 @@ class PhysicalRuntimeConfigTests(unittest.TestCase):
             make(robots, field_simulation=True)
         with self.assertRaisesRegex(ValueError, 'field simulation'):
             make(robots, physical_robots=True)
-        runtime = make(robots, field_simulation=True, physical_robots=True)
+        runtime = make_physical(robots)
         self.assertEqual(runtime._physical, ('physical-1',))
 
     def test_only_physical_robots_may_take_session_from_state(self):
@@ -138,7 +154,9 @@ class PhysicalHandoffStoreTests(unittest.TestCase):
     def test_physical_runtime_needs_a_physical_handoff_store(self):
         from server.sim_handoff_store import SimHandoffStore
         folder = Path(tempfile.mkdtemp())
-        store = SimHandoffStore.create_new(folder / 'd.sqlite3', simulation_enabled=True)
+        store = SimHandoffStore.create_new(folder / 'd.sqlite3', simulation_enabled=True,
+                                           idle_positions={'sim-r1': 'A'})
         with self.assertRaisesRegex(ValueError, 'physical_robots=True'):
             SimRuntime(folder / 'd.sqlite3', sample_map(), {'physical-1': {'P1': FROM_STATE}}, port=1883,
-                       client_id='cfg', field_simulation=True, physical_robots=True, simulation_store=store)
+                       client_id='cfg', field_simulation=True, physical_robots=True, simulation_store=store,
+                       field_initial_positions={'physical-1': 'A'})

@@ -108,6 +108,11 @@ class SimRuntime:
             raise ValueError('physical- robots require physical_robots=True')
         if physical and (not field_simulation or command_observations):
             raise ValueError('physical- robots are supported only with field simulation')
+        if physical and (simulation_store is None or not getattr(simulation_store, '_idle_enabled', False)
+                         or not isinstance(field_initial_positions, dict)
+                         or set(field_initial_positions) != set(self._sessions)
+                         or len(set(field_initial_positions.values())) != len(field_initial_positions)):
+            raise ValueError('physical robots require an idle fleet store and all distinct start positions')
         if physical and simulation_store is not None and not getattr(simulation_store, '_physical_robots', False):
             raise ValueError('physical- robots need a handoff store created with physical_robots=True')
         if (isinstance(physical_state_timeout, bool) or not isinstance(physical_state_timeout, (int, float))
@@ -155,6 +160,7 @@ class SimRuntime:
         self._started = False
         self._stopped = False
         self._prepared = {}
+        self._physical_prepared = {}
         self.store = self.gate = self.progress = self.inbox = self.receiver = self.workflow = self._client = None
         self.command_observations = self.command_observation_receiver = None
         self.investigation_notes = None
@@ -401,6 +407,7 @@ class SimRuntime:
                 self.workflow = self.receiver = self._client = None
                 self._receiver_cancel = None
                 self._prepared.clear()
+                self._physical_prepared.clear()
 
             client = receiver = workflow = None
             cancel = threading.Event()
@@ -1013,11 +1020,39 @@ class SimRuntime:
                         if task_id in self.gate._blocked:
                             raise RuntimeError('robot recovery is blocked')
                         generation = self.gate._generations.get(task_id, 0)
-                    result = coordinator.prepare_field(task_id, destination, checked, action)
+                    if is_physical_robot(robot):
+                        watcher = self.physical_watcher
+                        if watcher is None:
+                            raise ValueError('physical watcher is not bound')
+                        source = None if handoff_store is None else handoff_store._context['source_task_id']
+                        source_seq = None if handoff_store is None else handoff_store._context['seq']
+                        with self.gate.physical_queue_lock(robot):
+                            evidence = watcher._start_evidence_locked(
+                                robot, _session, checked[0].node,
+                                '{}@v{}'.format(self.map_data['map_id'], self.map_data['version']),
+                                source_task=source, source_seq=source_seq, proof_ttl=self.gate._ttl)
+                            def recheck_before_commit():
+                                if watcher._start_evidence_locked(
+                                    robot, _session, checked[0].node, evidence[4],
+                                    source_task=source, source_seq=source_seq,
+                                    proof_ttl=self.gate._ttl) != evidence:
+                                    raise RuntimeError('physical evidence changed during preparation')
+                            if source is None:
+                                result = coordinator.prepare_field(task_id, destination, checked, action,
+                                                                   _precommit_guard=recheck_before_commit)
+                            else:
+                                # The handoff gate transaction rechecks source
+                                # evidence itself immediately before COMMIT.
+                                result = coordinator.prepare_field(task_id, destination, checked, action)
+                    else:
+                        evidence = None
+                        result = coordinator.prepare_field(task_id, destination, checked, action)
             except BaseException:
                 self._close_client(client)
                 raise
             self._prepared[task_id] = (coordinator, client, generation)
+            if evidence is not None:
+                self._physical_prepared[task_id] = evidence
             return result
 
     def prepare_field_next(self, task_id, source_task_id, destination):
@@ -1071,6 +1106,8 @@ class SimRuntime:
         # the database owner from underneath it.
         with self._runtime_read_operation():
             client = None
+            watcher = robot = None
+            attempted = False
             try:
                 with self._lock:
                     self._ready()
@@ -1078,13 +1115,39 @@ class SimRuntime:
                     if pair is None:
                         raise ValueError('task was not prepared by this runtime')
                     coordinator, client, generation = pair
+                    robot, session = self._tasks[task_id]
+                    evidence = self._physical_prepared.pop(task_id, None)
                     receiver = self.receiver
                     with receiver._dispatch_lock, self.gate.serialized():
                         self._ready()
                         with self.gate._state_lock:
                             if task_id in self.gate._blocked or self.gate._generations.get(task_id, 0) != generation:
                                 raise RuntimeError('robot connection or recovery changed after preparation')
-                        attempt = coordinator._queue_publish(task_id)
+                        if is_physical_robot(robot):
+                            watcher = self.physical_watcher
+                            if watcher is None or evidence is None:
+                                raise RuntimeError('physical start evidence is unavailable')
+                            with self.gate.physical_queue_lock(robot):
+                                current = watcher._start_evidence_locked(
+                                    robot, session, evidence[3], evidence[4],
+                                    source_task=evidence[5], source_seq=evidence[6], proof_ttl=self.gate._ttl)
+                                if current != evidence:
+                                    raise RuntimeError('physical start evidence changed')
+                                def recheck_start():
+                                    if watcher._start_evidence_locked(
+                                            robot, session, evidence[3], evidence[4],
+                                            source_task=evidence[5], source_seq=evidence[6],
+                                            proof_ttl=self.gate._ttl) != evidence:
+                                        raise RuntimeError('physical start evidence changed before enqueue')
+                                # Once queueing begins its outcome may be
+                                # unknown even if the call raises.
+                                attempted = True
+                                attempt = coordinator._queue_publish(task_id, _before_enqueue=recheck_start)
+                                order = json.loads(attempt.prepared[1])
+                                watcher._motion_permits[robot] = (
+                                    task_id, session, order['seq'], order['map_id'], order['released_until'])
+                        else:
+                            attempt = coordinator._queue_publish(task_id)
                 # No runtime, dispatch or gate lock across network waiting.
                 coordinator._wait_publish(attempt)
                 with self._lock:
@@ -1096,7 +1159,16 @@ class SimRuntime:
                         with self.gate._state_lock:
                             if task_id in self.gate._blocked or self.gate._generations.get(task_id, 0) != generation:
                                 raise RuntimeError('robot connection or recovery changed during publication')
+                        if is_physical_robot(robot):
+                            with self.gate.physical_queue_lock(robot):
+                                watcher._queued_ack_evidence_locked(robot, session, order, evidence,
+                                                                    proof_ttl=self.gate._ttl)
+                                return coordinator._record_publish_ack(attempt)
                         return coordinator._record_publish_ack(attempt)
+            except BaseException:
+                if attempted and watcher is not None and robot is not None:
+                    watcher._invalidate_robots((robot,))
+                raise
             finally:
                 if client is not None:
                     self._close_client(client)
@@ -1158,7 +1230,10 @@ class SimRuntime:
                 self._ready()
                 if self.receiver is not receiver:
                     return False
-                with watcher._lock, self.gate.serialized():
+                # Common order: dispatch -> gate operation -> watcher state.
+                # Watcher callbacks latch under their lock, release it, then
+                # revoke under the gate; they never hold the locks in reverse.
+                with self.gate.serialized(), watcher._lock:
                     item = watcher._latest.get(robot)
                     age = None if item is None else watcher._clock() - item[1]
                     stop_fields = ('robot_session', 'status', 'order_id', 'seq', 'map_id',
@@ -1312,6 +1387,7 @@ class SimRuntime:
             actions.extend(lambda client=client: self._close_client(client)
                            for _coordinator, client, _generation in self._prepared.values())
             self._prepared.clear()
+            self._physical_prepared.clear()
             # Network shutdown may itself wait on SQLite. Let admitted
             # references finish and let other callers observe _stopped.
             self._reference_condition.release()

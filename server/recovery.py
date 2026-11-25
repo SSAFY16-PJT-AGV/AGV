@@ -17,7 +17,7 @@ from contextlib import closing, contextmanager
 
 from server.allocation_store import _validate_json, _stored_field_route, _verify_field_global
 from server.route_occurrence import visit_indices_from_orders
-from server.robot_ids import is_fleet_robot
+from server.robot_ids import is_fleet_robot, is_physical_robot
 
 
 class RecoveryError(ValueError):
@@ -209,6 +209,132 @@ class RecoveryGate:
         self._moving_permits = {}
         self._generations = {}
         self._token_generations = {}
+        self._physical_watcher = None
+
+    def bind_physical_watcher(self, watcher):
+        """Bind one in-process evidence source; absence fails closed."""
+        from server.physical_state_proof import PhysicalStateWatcher
+        if (not isinstance(watcher, PhysicalStateWatcher)
+                or getattr(getattr(watcher, '_runtime', None), 'gate', None) is not self):
+            raise RecoveryError('physical watcher must belong to this gate')
+        with self._operation_lock:
+            if self._physical_watcher is not None and self._physical_watcher is not watcher:
+                raise RecoveryError('physical watcher is already bound')
+            self._physical_watcher = watcher
+
+    def _check_physical_stop_locked(self, watcher, requirement):
+        """Validate a report while caller holds the watcher lock."""
+        robot, task, session, seq, node, map_id = requirement
+        item = watcher._latest.get(robot)
+        age = None if item is None else watcher._clock() - item[1]
+        if (watcher is not self._physical_watcher
+                or getattr(getattr(watcher, '_runtime', None), 'gate', None) is not self
+                or robot not in watcher.robots or robot in watcher._invalidated
+                or not watcher._mqtt_started or not watcher._connected.is_set()
+                or not watcher._subscription_done.is_set() or watcher._online.get(robot) is not True
+                or item is None or item[2] != watcher._connection_generation
+                or age < 0 or age > watcher._max_state_age
+                or watcher._sessions.get(robot) != session
+                or getattr(watcher._runtime, '_tasks', {}).get(task) != (robot, session)):
+            raise RecoveryError('fresh physical stop evidence is unavailable')
+        state = item[0]
+        if (state.get('robot_session') != session or state.get('status') not in ('WAITING', 'IDLE')
+                or 'error' not in state or state['error'] is not None
+                or 'rejected' not in state or state['rejected'] is not None
+                or state.get('order_id') != task or type(state.get('seq')) is not int or state['seq'] != seq
+                or state.get('map_id') != map_id or state.get('last_node') != node
+                or state.get('released_until') != node
+                or watcher._proven.get(robot, (None,))[0] != (task, seq)):
+            raise RecoveryError('physical state does not match the stopped order')
+
+    def _check_physical_ack_locked(self, watcher, requirement):
+        """Check live state for recording a broker ACK, never a drive proof."""
+        robot, task, session, seq, node, map_id, prior_node = requirement
+        item = watcher._latest.get(robot)
+        age = None if item is None else watcher._clock() - item[1]
+        if (watcher is not self._physical_watcher
+                or getattr(getattr(watcher, '_runtime', None), 'gate', None) is not self
+                or robot not in watcher.robots or robot in watcher._invalidated
+                or not watcher._mqtt_started or not watcher._connected.is_set()
+                or not watcher._subscription_done.is_set() or watcher._online.get(robot) is not True
+                or item is None or item[2] != watcher._connection_generation
+                or age < 0 or age > watcher._max_state_age
+                or watcher._sessions.get(robot) != session
+                or getattr(watcher._runtime, '_tasks', {}).get(task) != (robot, session)):
+            raise RecoveryError('fresh physical acknowledgement evidence is unavailable')
+        state = item[0]
+        if (state.get('robot_session') != session or state.get('order_id') != task
+                or state.get('map_id') != map_id or type(state.get('seq')) is not int
+                or 'error' not in state or state['error'] is not None
+                or 'rejected' not in state or state['rejected'] is not None):
+            raise RecoveryError('physical acknowledgement state does not match')
+        if state['seq'] == seq - 1:
+            self._check_physical_stop_locked(watcher, (robot, task, session, seq - 1, prior_node, map_id))
+        elif (state['seq'] != seq or state.get('released_until') != node
+              or state.get('status') not in ('MOVING', 'WAITING', 'IDLE')
+              or (state.get('status') != 'MOVING' and state.get('last_node') != node)):
+            raise RecoveryError('physical acknowledgement state is unexpected')
+
+    def require_physical_ack(self, db, robot, task, session, seq, node, map_id, prior_node):
+        """Require a live bound report for an already observed broker ACK."""
+        if not isinstance(db, sqlite3.Connection) or not db.in_transaction or getattr(self._local, 'db', None) is not db:
+            raise RecoveryError('the gate transaction is required')
+        with self._state_lock:
+            if task in self._blocked:
+                raise RecoveryError('physical recovery is blocked')
+        watcher = self._physical_watcher
+        if watcher is None:
+            raise RecoveryError('physical watcher is not bound')
+        requirement = (robot, task, session, seq, node, map_id, prior_node)
+        with watcher._lock:
+            self._check_physical_ack_locked(watcher, requirement)
+        self._local.physical_requirements.append(('ack', requirement))
+
+    def record_physical_enqueued(self, robot, task, session, order):
+        """Record the exact queued order while the caller holds the stop guard."""
+        if not is_physical_robot(robot):
+            return
+        watcher = self._physical_watcher
+        requirements = getattr(self._local, 'physical_requirements', ())
+        if (watcher is None or not any(kind == 'stop' and req[0] == robot and req[1] == task
+                                       and req[2] == session for kind, req in requirements)):
+            raise RecoveryError('physical enqueue has no stop evidence')
+        if (order.get('order_id') != task or type(order.get('seq')) is not int
+                or not isinstance(order.get('map_id'), str)
+                or not isinstance(order.get('released_until'), str)):
+            raise RecoveryError('physical queued order is invalid')
+        watcher._motion_permits[robot] = (task, session, order['seq'], order['map_id'],
+                                           order['released_until'])
+
+    @contextmanager
+    def physical_stop_guard(self):
+        """Hold evidence stable through one commit or MQTT queue operation."""
+        requirements = getattr(self._local, 'physical_requirements', ())
+        if not requirements:
+            yield
+            return
+        watcher = self._physical_watcher
+        if watcher is None:
+            raise RecoveryError('physical watcher is not bound')
+        with watcher._lock:
+            for kind, requirement in requirements:
+                if kind == 'stop':
+                    self._check_physical_stop_locked(watcher, requirement)
+                else:
+                    self._check_physical_ack_locked(watcher, requirement)
+            yield
+
+    @contextmanager
+    def physical_queue_lock(self, robot):
+        """Keep watcher callbacks ordered across enqueue and its DB commit."""
+        if not is_physical_robot(robot):
+            yield
+            return
+        watcher = self._physical_watcher
+        if watcher is None:
+            raise RecoveryError('physical watcher is not bound')
+        with watcher._lock:
+            yield
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -467,13 +593,16 @@ class RecoveryGate:
                 try:
                     self._active(db)
                     self._local.db = db
+                    self._local.physical_requirements = []
                     yield db
-                    db.execute('COMMIT')
+                    with self.physical_stop_guard():
+                        db.execute('COMMIT')
                 except BaseException:
                     if db.in_transaction:
                         db.execute('ROLLBACK')
                     raise
                 finally:
+                    self._local.physical_requirements = None
                     self._local.db = None
 
     def require_reconciled(self, db, task_id, robot_session, *, expected_seq, expected_stopped_at):
@@ -538,4 +667,12 @@ class RecoveryGate:
         with self._state_lock:
             if task_id in self._blocked:
                 raise RecoveryError('simulated recovery proof is blocked')
+        if is_physical_robot(row[6]):
+            watcher = self._physical_watcher
+            if watcher is None:
+                raise RecoveryError('physical watcher is not bound')
+            requirement = (row[6], task_id, robot_session, expected_seq, expected_stopped_at, row[7])
+            with watcher._lock:
+                self._check_physical_stop_locked(watcher, requirement)
+            self._local.physical_requirements.append(('stop', requirement))
         return True
