@@ -28,6 +28,7 @@ robot's rear actually left a resource, and it does not authenticate the robot.
 Use broker authentication/ACLs for identity (``server/mqtt_security.py``).
 """
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -40,12 +41,14 @@ from server.robot_ids import is_physical_robot
 
 FROM_STATE = 'from_state'
 MAX_STATE_BYTES = 64 * 1024
+DEFAULT_MAX_STATE_AGE_S = 2.0
 STOPPED = ('WAITING', 'IDLE')
 
 
 class PhysicalStateWatcher:
     def __init__(self, robots, *, client, host, port, connect_timeout=5.0, refresh_s=15.0,
-                 poll_s=0.2, log=None, clock=time.monotonic):
+                 poll_s=0.2, log=None, clock=time.monotonic,
+                 state_max_age_s=DEFAULT_MAX_STATE_AGE_S):
         robots = tuple(robots)
         if not robots or any(not is_physical_robot(r) for r in robots) or len(set(robots)) != len(robots):
             raise ValueError('unique physical- robot IDs are required')
@@ -53,9 +56,16 @@ class PhysicalStateWatcher:
         self._client, self._host, self._port = client, host, port
         self._timeout, self._refresh, self._poll = float(connect_timeout), float(refresh_s), float(poll_s)
         self._clock = clock
+        if (isinstance(state_max_age_s, bool) or not isinstance(state_max_age_s, (int, float))
+                or not math.isfinite(state_max_age_s) or not 0 < state_max_age_s <= 30):
+            raise ValueError('state_max_age_s must be finite and in (0, 30]')
+        self._max_state_age = float(state_max_age_s)
         self._log = log or (lambda msg: print('[physical] ' + msg, flush=True))
         self._lock = threading.Lock()
-        self._latest = {}          # robot -> (state dict, monotonic time)
+        self._latest = {}          # robot -> (state dict, monotonic time, connection generation, serial)
+        self._connection_generation = 0
+        self._state_serial = 0
+        self._mqtt_started = False
         self._sessions = {}        # robot -> session bound into the runtime
         self._invalidated = set()  # robots whose session changed
         self._proven = {}          # robot -> ((task, seq), monotonic time)
@@ -69,6 +79,8 @@ class PhysicalStateWatcher:
     def start(self):
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
+        self._client.on_disconnect = self._on_disconnect
+        self._mqtt_started = True
         if self._client.connect(self._host, self._port, keepalive=15) != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError('physical state connection failed')
         if self._client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
@@ -80,10 +92,47 @@ class PhysicalStateWatcher:
 
     def _on_connect(self, client, _userdata, _flags, code, _properties):
         if code.is_failure:
+            self._on_disconnect(client, None, None, code, None)
             return
+        repeated = self._connected.is_set()
+        self._connected.clear()
+        with self._lock:
+            self._connection_generation += 1
+            self._latest.clear()
+            self._proven.clear()
+        if repeated and self._runtime is not None:
+            self._invalidate_robots(self.robots)
         for robot in self.robots:
             client.subscribe('agv/%s/state' % robot, qos=0)
         self._connected.set()
+
+    def _invalidate_robots(self, robots):
+        # Permanent local latch. A new message or MQTT reconnect cannot clear
+        # it; re-establishing physical state requires a separate protocol.
+        with self._lock:
+            new = set(robots) - self._invalidated
+            self._invalidated.update(new)
+            for robot in new:
+                self._proven.pop(robot, None)
+        runtime = self._runtime
+        if runtime is None or not new:
+            return
+        tasks = tuple(task for task, (robot, _session) in runtime._tasks.items() if robot in new)
+        if tasks:
+            try:
+                runtime.gate.invalidate_many(tasks)
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self._log('failed to invalidate stale physical state: %s' % type(exc).__name__)
+
+    def _on_disconnect(self, _client, _userdata, _flags, _reason_code, _properties):
+        self._connected.clear()
+        with self._lock:
+            self._connection_generation += 1
+            self._latest.clear()
+            self._proven.clear()
+        if self._runtime is not None:
+            self._invalidate_robots(self.robots)
 
     def _on_message(self, _client, _userdata, message):
         try:
@@ -98,15 +147,21 @@ class PhysicalStateWatcher:
         except (ValueError, UnicodeError, AttributeError):
             return
         with self._lock:
-            self._latest[parts[1]] = (state, self._clock())
+            if self._mqtt_started and not self._connected.is_set():
+                return
+            self._state_serial += 1
+            self._latest[parts[1]] = (state, self._clock(), self._connection_generation, self._state_serial)
 
     # Session discovery -----------------------------------------------------
     def wait_sessions(self, timeout):
         """Return {robot: robot_session} from live states, or raise after timeout."""
         deadline = self._clock() + float(timeout)
         while True:
-            with self._lock:
-                found = {r: self._latest[r][0]['robot_session'] for r in self.robots if r in self._latest}
+            found = {}
+            for robot in self.robots:
+                state = self.latest(robot)
+                if state is not None:
+                    found[robot] = state['robot_session']
             if len(found) == len(self.robots):
                 return found
             if self._clock() >= deadline:
@@ -117,7 +172,28 @@ class PhysicalStateWatcher:
     def latest(self, robot):
         with self._lock:
             item = self._latest.get(robot)
+            age = None if item is None else self._clock() - item[1]
+            stale = item is not None and (item[2] != self._connection_generation
+                    or age < 0 or age > self._max_state_age
+                    or (self._mqtt_started and not self._connected.is_set()))
+            if stale:
+                self._latest.pop(robot, None)
+        if stale:
+            if self._runtime is not None:
+                self._invalidate_robots((robot,))
+            return None
         return None if item is None else dict(item[0])
+
+    def _token(self, robot, state):
+        # Freshness is checked again after the DB lookup and challenge.
+        current = self.latest(robot)
+        if current is None or current != state:
+            return None
+        with self._lock:
+            item = self._latest.get(robot)
+            if item is None or item[0] != state or robot in self._invalidated:
+                return None
+            return item[2], item[3]
 
     # Runtime binding ------------------------------------------------------
     def bind(self, runtime, sessions):
@@ -174,6 +250,9 @@ class PhysicalStateWatcher:
         return False
 
     def _maybe_prove(self, robot, state):
+        token = self._token(robot, state)
+        if token is None or not self._check_session(robot, state):
+            return
         task, seq = state.get('order_id'), state.get('seq')
         rt = self._runtime
         if (state.get('status') not in STOPPED or not isinstance(task, str) or type(seq) is not int
@@ -194,7 +273,11 @@ class PhysicalStateWatcher:
         if (expected['robot_id'] != robot or expected['seq'] != seq
                 or expected['stopped_at'] != state['last_node'] or expected['map_id'] != state.get('map_id')):
             return   # the server has already moved on, or the robot reports another order
+        if self._token(robot, state) != token:
+            return
         challenge = rt.begin(task, session)['challenge']
+        if self._token(robot, state) != token:
+            return
         rt.complete(task, session, challenge, robot, task, seq, expected['map_id'],
                     expected['stopped_at'], expected['order_digest'], True)
         self._proven[robot] = (key, self._clock())
@@ -208,6 +291,12 @@ class PhysicalStateWatcher:
         for item in events:
             robot, event_id, task = item['robot_id'], item['event_id'], item['task_id']
             if robot not in self.robots or robot in self._invalidated:
+                continue
+            state = self.latest(robot)
+            if (state is None or not self._check_session(robot, state)
+                    or state.get('status') not in STOPPED or state.get('order_id') != task
+                    or self._token(robot, state) is None
+                    or self._proven.get(robot, (None,))[0] != (task, state.get('seq'))):
                 continue
             key = (robot, event_id)
             try:
