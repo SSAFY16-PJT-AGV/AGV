@@ -1139,6 +1139,115 @@ class SimRuntime:
                 raise ValueError('manual recovery is unavailable for physical robots')
             return {'challenge': self.gate.begin(task_id, session)}
 
+    def _physical_prove(self, watcher, robot, state, token):
+        """Reconcile one observed stop, fenced against processed receiver events.
+
+        This is an internal experiment, not authority to drive a physical robot.
+        The physical runtime remains disabled until all downstream operations
+        use the same evidence boundary and the team validates its contract.
+        """
+        from server.physical_state_proof import STOPPED
+        from server.recovery import _snapshot
+
+        with self._lock:
+            self._ready()
+            if watcher is not self.physical_watcher or not is_physical_robot(robot):
+                raise ValueError('physical watcher does not belong to this runtime')
+            receiver = self.receiver
+            with receiver._dispatch_lock:
+                self._ready()
+                if self.receiver is not receiver:
+                    return False
+                with watcher._lock, self.gate.serialized():
+                    item = watcher._latest.get(robot)
+                    age = None if item is None else watcher._clock() - item[1]
+                    stop_fields = ('robot_session', 'status', 'order_id', 'seq', 'map_id',
+                                   'last_node', 'released_until', 'error', 'rejected')
+                    same_stop = (item is not None and all(
+                        field in item[0] and field in state
+                        and type(item[0][field]) is type(state[field])
+                        and item[0][field] == state[field]
+                        for field in stop_fields))
+                    state_current = item is not None and item[0] == state and same_stop
+                    fresh = (item is not None and 0 <= age <= watcher._max_state_age
+                             and item[2] == watcher._connection_generation)
+                    connected = (watcher._mqtt_started and watcher._connected.is_set()
+                                 and watcher._subscription_done.is_set()
+                                 and watcher._online.get(robot) is True)
+                    session = watcher._sessions.get(robot)
+                    usable = (robot in watcher.robots and robot not in watcher._invalidated
+                              and connected and fresh and state_current and item[2:4] == token
+                              and state.get('robot_session') == session
+                              and state.get('status') in STOPPED
+                              and 'error' in state and state['error'] is None
+                              and 'rejected' in state and state['rejected'] is None
+                              and isinstance(state.get('order_id'), str) and bool(state['order_id'].strip())
+                              and type(state.get('seq')) is int and state['seq'] > 0
+                              and state.get('last_node') is not None
+                              and state.get('last_node') == state.get('released_until'))
+                    robot_tasks = tuple(task for task, (owner, _session) in self._tasks.items()
+                                        if owner == robot)
+                    def revoke():
+                        watcher._latch_robots_locked((robot,))
+                        if robot_tasks:
+                            self.gate.invalidate_many(robot_tasks)
+                    if not usable:
+                        # Same state in a newer sample is a benign race: the
+                        # caller must retry with its new token. Losing contact,
+                        # freshness or the matching stopped state is different.
+                        if (not connected or not fresh or item is None
+                                or not same_stop or robot in watcher._invalidated
+                                or state.get('robot_session') != session
+                                or state.get('status') not in STOPPED
+                                or 'error' not in state or state['error'] is not None
+                                or 'rejected' not in state or state['rejected'] is not None
+                                or not isinstance(state.get('order_id'), str)
+                                or not state['order_id'].strip()
+                                or type(state.get('seq')) is not int or state['seq'] < 1
+                                or state.get('last_node') is None
+                                or state.get('last_node') != state.get('released_until')):
+                            revoke()
+                        return False
+                    task, seq = state['order_id'], state['seq']
+                    if self._tasks.get(task) != (robot, session):
+                        revoke()
+                        return False
+                    with self.gate._state_lock:
+                        # A processed offline callback already blocked this
+                        # task. Cached online state must never unblock it.
+                        if task in self.gate._blocked:
+                            return False
+                    try:
+                        uri = Path(self.path).resolve().as_uri() + '?mode=ro'
+                        with closing(sqlite3.connect(uri, uri=True)) as db:
+                            db.execute('BEGIN')
+                            expected = _snapshot(db, task, field_required=self._field_simulation)
+                        if (expected['robot_id'] != robot or expected['seq'] != seq
+                                or expected['stopped_at'] != state['last_node']
+                                or expected['map_id'] != state.get('map_id')):
+                            revoke()
+                            return False
+                        challenge = self.gate.begin(task, session)
+                        age = watcher._clock() - item[1]
+                        if age < 0 or age > watcher._max_state_age:
+                            revoke()
+                            return False
+                        self.gate.complete(task, session, challenge, robot_id=robot, order_id=task, seq=seq,
+                                           map_id=expected['map_id'], stopped_at=expected['stopped_at'],
+                                           order_digest=expected['order_digest'], stopped=True)
+                        age = watcher._clock() - item[1]
+                        if age < 0 or age > watcher._max_state_age:
+                            revoke()
+                            return False
+                    except BaseException:
+                        try:
+                            revoke()
+                        except Exception:
+                            pass  # gate blocks locally before attempting its DB update
+                        raise
+                    watcher._proven[robot] = ((task, seq), watcher._clock())
+                    return True
+
     def complete(self, task_id, session, challenge, robot_id, order_id, seq, map_id, stopped_at, order_digest, stopped):
         with self._lock, self.receiver._dispatch_lock:
             self._ready()

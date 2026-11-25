@@ -2,7 +2,6 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from server.physical_state_proof import PhysicalStateWatcher
 
@@ -12,14 +11,6 @@ class Message:
         self.topic = 'agv/physical-1/state'
         self.retain = False
         self.payload = json.dumps(state).encode('utf-8')
-
-
-class FakeDB:
-    def execute(self, _sql):
-        return None
-
-    def close(self):
-        pass
 
 
 class WatcherFreshnessTests(unittest.TestCase):
@@ -37,7 +28,8 @@ class WatcherFreshnessTests(unittest.TestCase):
         self.w._on_message(self.client, None, SimpleNamespace(
             topic='agv/physical-1/conn', retain=True, qos=1, payload=b'online'))
         self.state = {'robot_session': 'boot-1', 'status': 'WAITING', 'order_id': 'T1',
-                      'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'm@v1'}
+                      'seq': 1, 'last_node': 'B', 'released_until': 'B', 'map_id': 'm@v1',
+                      'error': None, 'rejected': None}
 
     def receive(self, state=None):
         self.w._on_message(self.client, None, Message(self.state if state is None else state))
@@ -85,42 +77,16 @@ class WatcherFreshnessTests(unittest.TestCase):
         self.w._maybe_prove('physical-1', dict(self.state))
         self.assertEqual(attempted, [])
 
-    def test_new_state_between_begin_and_complete_does_not_finish_proof(self):
+    def test_fresh_stopped_state_is_delegated_to_runtime_fence(self):
         self.bind_runtime()
         self.receive()
-        complete = []
-        def begin(*_args):
-            self.receive(dict(self.state, status='MOVING'))
-            return {'challenge': 'challenge'}
-        self.w._runtime.path = 'unused'
-        self.w._runtime._field_simulation = True
-        self.w._runtime.begin = begin
-        self.w._runtime.complete = lambda *_args: complete.append(True)
-        expected = {'robot_id': 'physical-1', 'seq': 1, 'stopped_at': 'B',
-                    'map_id': 'm@v1', 'order_digest': 'digest'}
-        with patch('server.physical_state_proof.sqlite3.connect', return_value=FakeDB()), \
-             patch('server.physical_state_proof._snapshot', return_value=expected):
-            self.w._maybe_prove('physical-1', dict(self.state))
-        self.assertEqual(complete, [])
-
-    def test_disconnect_between_begin_and_complete_revokes_challenge(self):
-        blocked = self.bind_runtime()
-        self.receive()
-        completed = []
-        def begin(*_args):
-            self.w._on_disconnect(self.client, None, None, None, None)
-            return {'challenge': 'challenge'}
-        self.w._runtime.path = 'unused'
-        self.w._runtime._field_simulation = True
-        self.w._runtime.begin = begin
-        self.w._runtime.complete = lambda *_args: completed.append(True)
-        expected = {'robot_id': 'physical-1', 'seq': 1, 'stopped_at': 'B',
-                    'map_id': 'm@v1', 'order_digest': 'digest'}
-        with patch('server.physical_state_proof.sqlite3.connect', return_value=FakeDB()), \
-             patch('server.physical_state_proof._snapshot', return_value=expected):
-            self.w._maybe_prove('physical-1', dict(self.state))
-        self.assertEqual(completed, [])
-        self.assertEqual(blocked, [('T1',)])
+        observed = []
+        self.w._runtime._physical_prove = lambda *args: observed.append(args) or False
+        self.w._maybe_prove('physical-1', dict(self.state))
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][0], self.w)
+        self.assertEqual(observed[0][1:3], ('physical-1', self.state))
+        self.assertEqual(observed[0][3], self.w._token('physical-1', self.state))
 
     def test_stale_state_does_not_retry_pending_event(self):
         self.bind_runtime()

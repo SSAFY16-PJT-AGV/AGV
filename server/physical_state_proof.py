@@ -29,14 +29,11 @@ Use broker authentication/ACLs for identity (``server/mqtt_security.py``).
 """
 import json
 import math
-import sqlite3
 import threading
 import time
-from contextlib import closing
 
 import paho.mqtt.client as mqtt
 
-from server.recovery import _snapshot
 from server.robot_ids import is_physical_robot
 
 FROM_STATE = 'from_state'
@@ -337,33 +334,24 @@ class PhysicalStateWatcher:
         task, seq = state.get('order_id'), state.get('seq')
         rt = self._runtime
         if (state.get('status') not in STOPPED or not isinstance(task, str) or type(seq) is not int
+                or 'error' not in state or state['error'] is not None
+                or 'rejected' not in state or state['rejected'] is not None
                 or rt._tasks.get(task, (None,))[0] != robot
                 or state.get('last_node') is None or state.get('last_node') != state.get('released_until')):
+            # When this robot has a prior proof, let the shared boundary revoke
+            # it. This remains a poll-time check, not an authorization fence
+            # for other event or publishing paths.
+            if self._proven.get(robot) is not None:
+                rt._physical_prove(self, robot, state, token)
             return
         key = (task, seq)
         previous = self._proven.get(robot)
         if previous is not None and previous[0] == key and self._clock() - previous[1] < self._refresh:
             return
-        session = rt._tasks[task][1]
-        try:
-            with closing(sqlite3.connect('file:%s?mode=ro' % rt.path, uri=True)) as db:
-                db.execute('BEGIN')
-                expected = _snapshot(db, task, field_required=rt._field_simulation)
-        except Exception:
-            return   # no active allocation (finished task) or the order is still being sent
-        if (expected['robot_id'] != robot or expected['seq'] != seq
-                or expected['stopped_at'] != state['last_node'] or expected['map_id'] != state.get('map_id')):
-            return   # the server has already moved on, or the robot reports another order
-        if self._token(robot, state) != token:
+        if not rt._physical_prove(self, robot, state, token):
             return
-        challenge = rt.begin(task, session)['challenge']
-        if self._token(robot, state) != token:
-            return
-        rt.complete(task, session, challenge, robot, task, seq, expected['map_id'],
-                    expected['stopped_at'], expected['order_digest'], True)
-        self._proven[robot] = (key, self._clock())
         if previous is None or previous[0] != key:   # refreshes of the same stop stay quiet
-            self._log('%s stop proof: %s#%d at %s' % (robot, task, seq, expected['stopped_at']))
+            self._log('%s stop proof: %s#%d at %s' % (robot, task, seq, state['last_node']))
 
     def _retry_events(self):
         rt = self._runtime
