@@ -74,6 +74,18 @@ class RepeatedRecoveryTests(unittest.TestCase):
         self.assertEqual(self.inbox.get('sim-r1', 'event-3')['state'], 'pending')
         self.assertEqual(self.fixture.store.list_occupancy(), before)
 
+    def test_retry_rejects_changed_intermediate_release(self):
+        before = self.fixture.store.list_occupancy()
+        with sqlite3.connect(self.fixture.store.path) as db:
+            payload = db.execute("SELECT payload FROM progress_orders WHERE task_id='T1' AND seq=2").fetchone()[0]
+            changed = json.loads(payload)
+            changed['released_until'] = 'B'
+            db.execute("UPDATE progress_orders SET payload=? WHERE task_id='T1' AND seq=2", (json.dumps(changed),))
+        with self.assertRaises(AllocationConflict):
+            self.inbox.retry('sim-r1', 'event-3', self.progress)
+        self.assertEqual(self.inbox.get('sim-r1', 'event-3')['state'], 'pending')
+        self.assertEqual(self.fixture.store.list_occupancy(), before)
+
 
 if __name__ == '__main__':
     unittest.main()
