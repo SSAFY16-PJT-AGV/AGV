@@ -222,6 +222,11 @@ class SimRuntime:
         with self._lock:
             if self._started or self._stopped:
                 raise RuntimeError('runtime may only be started once')
+            # Physical stop/session evidence and disconnect handling have not
+            # yet been validated. Do not connect or reserve anything for real
+            # robots until those paths can be fenced end to end.
+            if self._physical:
+                raise RuntimeError('physical robot runtime disabled pending stop and disconnect validation')
             if self._simulation_store is not None:
                 self._simulation_store.validate_bound(self.path)
             self._owner.acquire()

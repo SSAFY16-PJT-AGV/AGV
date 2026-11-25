@@ -43,6 +43,10 @@ def load_sim_runtime():
             or type(config.get('investigation_notes', False)) is not bool
             or (config.get('command_observations', False) and not config.get('field_simulation', False))):
         raise ValueError('invalid simulation configuration fields')
+    # Fail before creating the physical handoff database or connecting its
+    # runtime; opt-in alone is not sufficient evidence for physical movement.
+    if config.get('physical_robots', False):
+        raise RuntimeError('physical robot runtime disabled pending stop and disconnect validation')
     for key in ('database', 'map_file'):
         if not isinstance(config[key], str) or not config[key].strip() or config[key] == ':memory:':
             raise ValueError('invalid simulation file path')

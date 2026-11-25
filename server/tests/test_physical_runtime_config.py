@@ -1,10 +1,12 @@
 """Opt-in rules for physical- robots in SimRuntime and the state-proof watcher (no broker)."""
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from server.physical_state_proof import FROM_STATE, PhysicalStateWatcher
 from server.sim_runtime import SimRuntime
@@ -17,6 +19,33 @@ def make(robots, **options):
 
 
 class PhysicalRuntimeConfigTests(unittest.TestCase):
+    def test_physical_runtime_cannot_start_or_contact_broker(self):
+        runtime = make({'physical-1': {'P1': FROM_STATE}}, field_simulation=True, physical_robots=True)
+        with patch.object(runtime, '_start_physical_watcher') as watcher, \
+                patch.object(runtime._owner, 'acquire', side_effect=AssertionError('owner acquired')) as acquire:
+            with self.assertRaisesRegex(RuntimeError, 'physical.*disabled'):
+                runtime.start()
+        watcher.assert_not_called()
+        acquire.assert_not_called()
+        self.assertFalse(Path(runtime.path).exists())
+
+    def test_physical_config_does_not_create_database(self):
+        from server.main import load_sim_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / 'map.json').write_text(json.dumps(sample_map()), encoding='utf-8')
+            config = {'database': 'physical.db', 'map_file': 'map.json',
+                      'robots': {'physical-1': {'P1': FROM_STATE}}, 'mqtt_port': 1883,
+                      'mqtt_client_id': 'physical-test', 'field_simulation': True,
+                      'physical_robots': True, 'start_positions': {'physical-1': 'A'}}
+            config_path = folder / 'config.json'
+            config_path.write_text(json.dumps(config), encoding='utf-8')
+            with patch.dict(os.environ, {'AGV_SIM_CONFIG': str(config_path),
+                                        'AGV_SIM_API_TOKEN': 'x' * 32}):
+                with self.assertRaisesRegex(RuntimeError, 'physical.*disabled'):
+                    load_sim_runtime()
+            self.assertFalse((folder / 'physical.db').exists())
+
     def test_physical_robots_need_explicit_opt_in_and_field_simulation(self):
         robots = {'physical-1': {'P1': FROM_STATE}}
         with self.assertRaisesRegex(ValueError, 'physical_robots'):
