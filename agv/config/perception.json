@@ -58,6 +58,6 @@
     "front_x_mm": 170.0,
     "max_box_setback_mm": 15.0,
     "slot_marker_ids": [1, 2, 3, 4],
-    "slot_marker_z_below_top_mm": 15.0
+    "slot_marker_z_below_top_mm": 18.0
   }
 }
