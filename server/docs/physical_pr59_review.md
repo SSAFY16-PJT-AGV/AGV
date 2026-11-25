@@ -7,6 +7,13 @@
 
 ## 후속 작업 (2026-11-25)
 
+- 추가 격리 재동기화: 로봇은 `feature/robot-recovery`, 서버는
+  `feature/physical-review-safeguards`에 구현했다. 서명된 challenge·snapshot·
+  commit·ACK로 같은 세션의 이벤트 원본을 별도 비실행 장부에 기록하며, 점유와
+  운행 차단은 유지한다. 실제 팀 컨트롤러·MQTT 코드와 격리 Mosquitto, 합성
+  주행기를 이용한 브로커 중단·재기동 후 교환과 오류 회귀를 확인했다. 기존
+  서버의 일반 physical 실행에 연결된 것은 아니다. 사용법·제한은
+  [`isolated_physical_reconciliation.md`](isolated_physical_reconciliation.md).
 - 검토 브랜치 `7039198`에는 초기 상태·구독 승인·연결·상태 유효기간 검사,
   수동 복구 우회 차단과 함께 정지 증명·구간 진행·인계·명령 발행에 공통 증거
   검사를 추가했다. 각 로봇의 대기 위치를 점유에 반영하고 브로커 응답 불명·
