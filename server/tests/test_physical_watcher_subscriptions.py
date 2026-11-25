@@ -92,6 +92,30 @@ class SubscriptionSafetyTests(unittest.TestCase):
         self.assertFalse(w._connected.is_set())
         self.assertTrue(w._client.disconnected)
 
+    def test_restarting_watcher_waits_for_new_subscription_after_old_disconnect(self):
+        client = FakeClient()
+        w = PhysicalStateWatcher(['physical-1'], client=client, host='127.0.0.1', port=1,
+                                 connect_timeout=0.5, log=lambda _message: None)
+        # A previous disconnect signalled the prior subscription attempt.
+        w._subscription_done.set()
+        w._connection_generation = 1
+        def loop_start():
+            def on_network():
+                import time
+                time.sleep(.05)
+                client.on_connect(client, None, None, SimpleNamespace(is_failure=False), None)
+                client.on_subscribe(client, None, 19,
+                    [SimpleNamespace(value=0, is_failure=False), SimpleNamespace(value=1, is_failure=False)], None)
+            thread = threading.Thread(target=on_network)
+            thread.start()
+            self.addCleanup(thread.join, 2)
+            return 0
+        client.loop_start = loop_start
+        self.assertIs(w.start(), w)
+        self.assertTrue(w._connected.is_set())
+        with self.assertRaisesRegex(RuntimeError, 'fresh MQTT client'):
+            w.start()
+
     def test_offline_invalidates_only_that_robot_and_online_does_not_revive_it(self):
         self.ready()
         blocked = []

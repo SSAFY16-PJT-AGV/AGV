@@ -76,6 +76,7 @@ class PhysicalStateWatcher:
         self._connection_generation = 0
         self._state_serial = 0
         self._mqtt_started = False
+        self._started_client = None
         self._sessions = {}        # robot -> session bound into the runtime
         self._invalidated = set()  # robots whose session changed
         self._proven = {}          # robot -> ((task, seq), monotonic time)
@@ -91,11 +92,21 @@ class PhysicalStateWatcher:
 
     # MQTT -----------------------------------------------------------------
     def start(self):
+        # Paho's loop_start allocates a socketpair each time. A disconnected
+        # client must not be reused: a new client is also a new MQTT generation.
+        if self._started_client is self._client:
+            raise RuntimeError('physical watcher requires a fresh MQTT client')
+        self._started_client = self._client
         self._client.on_connect = self._on_connect
         self._client.on_subscribe = self._on_subscribe
         self._client.on_message = self._on_message
         self._client.on_disconnect = self._on_disconnect
         self._mqtt_started = True
+        # A previous disconnect signals the old subscription wait. Never let
+        # that stale event stand in for the new connection's SUBACK.
+        with self._lock:
+            self._connected.clear()
+            self._subscription_done.clear()
         if self._client.connect(self._host, self._port, keepalive=15) != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError('physical state connection failed')
         if self._client.loop_start() != mqtt.MQTT_ERR_SUCCESS:
