@@ -924,6 +924,8 @@ class SimRuntime:
                 raise ValueError('task is not statically mapped')
             if type(reset_unallocated) is not bool:
                 raise ValueError('reset_unallocated must be boolean')
+            if reset_unallocated and is_physical_robot(self._tasks[task_id][0]):
+                raise ValueError('manual recovery is unavailable for physical robots')
             with self.receiver._dispatch_lock:
                 self._ready()
                 # A duplicate insert must fail before any recovery reset.
@@ -1089,7 +1091,8 @@ class SimRuntime:
         """Explicitly unblock a never-allocated simulation task; no movement proof."""
         with self._lock, self.receiver._dispatch_lock:
             self._ready()
-            self._identity(task_id, session)
+            if is_physical_robot(self._identity(task_id, session)):
+                raise ValueError('manual recovery is unavailable for physical robots')
             self.gate.reset_unallocated(task_id)
             return {'task_id': task_id, 'reset': True}
 
@@ -1111,7 +1114,9 @@ class SimRuntime:
 
     def begin(self, task_id, session):
         with self._lock, self.receiver._dispatch_lock:
-            self._ready(); self._identity(task_id, session)
+            self._ready()
+            if is_physical_robot(self._identity(task_id, session)):
+                raise ValueError('manual recovery is unavailable for physical robots')
             return {'challenge': self.gate.begin(task_id, session)}
 
     def complete(self, task_id, session, challenge, robot_id, order_id, seq, map_id, stopped_at, order_digest, stopped):
@@ -1119,6 +1124,8 @@ class SimRuntime:
             self._ready()
             if self._identity(task_id, session) != robot_id or order_id != task_id:
                 raise ValueError('recovery identity is not configured')
+            if is_physical_robot(robot_id):
+                raise ValueError('manual recovery is unavailable for physical robots')
             self.gate.complete(task_id, session, challenge, robot_id=robot_id, order_id=order_id,
                                seq=seq, map_id=map_id, stopped_at=stopped_at,
                                order_digest=order_digest, stopped=stopped)
