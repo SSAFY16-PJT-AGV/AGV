@@ -11,6 +11,7 @@ from types import MappingProxyType
 from server.allocation_store import AllocationConflict, _id, _validate_json
 from server.segment_progress import _EVENT_KEYS, _canonical, _resources, _read_order
 from server.order_publisher import validate_order
+from server.route_occurrence import plan_occurrence_segment, visit_indices_from_orders
 from server.segments import plan_segment
 from server.robot_ids import is_fleet_robot
 
@@ -231,6 +232,31 @@ class SimEventInbox:
                     or {k:v for k,v in previous.items() if k not in ('seq','released_until')}
                     != {k:v for k,v in first.items() if k not in ('seq','released_until')}):
                 raise AllocationConflict('previous order disagrees with event')
+            repeated_index = None
+            if len(set(path)) != len(path):
+                # A node name alone cannot identify a repeated stop. Rebuild
+                # the complete sequence and verify each release against the
+                # next actual waiting occurrence before recovering the event.
+                rows = db.execute('SELECT seq,payload FROM progress_orders '
+                                  'WHERE task_id=? AND seq<=? ORDER BY seq',
+                                  (event['order_id'], event['seq'])).fetchall()
+                try:
+                    if ([row[0] for row in rows] != list(range(1, event['seq'] + 1))
+                            or rows[0][1] != initial_row[0]):
+                        raise ValueError('incomplete order history')
+                    history = [_read_order(row[1]) for row in rows]
+                    indices = visit_indices_from_orders(history)
+                    start = 0
+                    for index in indices:
+                        segment = plan_occurrence_segment(progress._map, path, start)
+                        if segment.end_index != index:
+                            raise ValueError('order skips a waiting occurrence')
+                        start = index
+                    repeated_index = indices[-1]
+                    if path[repeated_index] != event['stopped_at']:
+                        raise ValueError('event stop disagrees with order history')
+                except (ValueError, KeyError, TypeError, IndexError) as exc:
+                    raise AllocationConflict('invalid repeated order history') from exc
             next_payload = None
             if journal[4] == 'advanced':
                 if journal[3] != event['seq'] + 1:
@@ -242,7 +268,10 @@ class SimEventInbox:
                 next_order = _read_order(row[0])
                 validate_order(robot_id, next_order)
                 try:
-                    expected_stop = plan_segment(progress._map, path[path.index(event['stopped_at']):]).released_until
+                    if repeated_index is None:
+                        expected_stop = plan_segment(progress._map, path[path.index(event['stopped_at']):]).released_until
+                    else:
+                        expected_stop = plan_occurrence_segment(progress._map, path, repeated_index).released_until
                 except (ValueError, KeyError, TypeError) as exc:
                     raise AllocationConflict('invalid next segment') from exc
                 if (next_order['seq'] != journal[3] or next_order['released_until'] != expected_stop
@@ -250,7 +279,8 @@ class SimEventInbox:
                         != {k:v for k,v in first.items() if k not in ('seq','released_until')}):
                     raise AllocationConflict('next order does not match progress journal')
                 next_payload = row[0]
-            elif journal[3] is not None or not path or event['stopped_at'] != path[-1]:
+            elif (journal[3] is not None or not path or event['stopped_at'] != path[-1]
+                  or (repeated_index is not None and repeated_index != len(path) - 1)):
                 raise AllocationConflict('invalid final progress journal')
             result = {'status':'duplicate', 'task_id':event['order_id'],
                       'next_seq':journal[3], 'payload':next_payload}
