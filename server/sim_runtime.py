@@ -960,21 +960,41 @@ class SimRuntime:
             return result
 
     def publish(self, task_id):
-        with self._lock:
-            self._ready()
-            pair = self._prepared.pop(task_id, None)
-            if pair is None:
-                raise ValueError('task was not prepared by this runtime')
-            coordinator, client, generation = pair
+        # Pin database ownership and this publisher until the ACK wait and
+        # cleanup finish. Shutdown can still invalidate the receiver while the
+        # publisher waits, but cannot close this in-flight client or release
+        # the database owner from underneath it.
+        with self._runtime_read_operation():
+            client = None
             try:
-                with self.receiver._dispatch_lock, self.gate.serialized():
+                with self._lock:
                     self._ready()
-                    with self.gate._state_lock:
-                        if task_id in self.gate._blocked or self.gate._generations.get(task_id, 0) != generation:
-                            raise RuntimeError('robot connection or recovery changed after preparation')
-                    return coordinator.publish(task_id)
+                    pair = self._prepared.pop(task_id, None)
+                    if pair is None:
+                        raise ValueError('task was not prepared by this runtime')
+                    coordinator, client, generation = pair
+                    receiver = self.receiver
+                    with receiver._dispatch_lock, self.gate.serialized():
+                        self._ready()
+                        with self.gate._state_lock:
+                            if task_id in self.gate._blocked or self.gate._generations.get(task_id, 0) != generation:
+                                raise RuntimeError('robot connection or recovery changed after preparation')
+                        attempt = coordinator._queue_publish(task_id)
+                # No runtime, dispatch or gate lock across network waiting.
+                coordinator._wait_publish(attempt)
+                with self._lock:
+                    self._ready()
+                    if self.receiver is not receiver:
+                        raise RuntimeError('simulation receiver changed during publication')
+                    with receiver._dispatch_lock, self.gate.serialized():
+                        self._ready()
+                        with self.gate._state_lock:
+                            if task_id in self.gate._blocked or self.gate._generations.get(task_id, 0) != generation:
+                                raise RuntimeError('robot connection or recovery changed during publication')
+                        return coordinator._record_publish_ack(attempt)
             finally:
-                self._close_client(client)
+                if client is not None:
+                    self._close_client(client)
 
     def _identity(self, task_id, session):
         pair = self._tasks.get(task_id)

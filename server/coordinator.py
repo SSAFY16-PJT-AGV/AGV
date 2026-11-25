@@ -23,6 +23,14 @@ class CoordinatorError(RuntimeError):
     """A task cannot be safely prepared or published by this instance."""
 
 
+class _PublishAttempt:
+    """One in-process queue attempt; confirmation can be recorded only once."""
+    def __init__(self, owner, task_id, prepared, info):
+        self.owner, self.task_id, self.prepared, self.info = owner, task_id, prepared, info
+        self.lock = threading.Lock()
+        self.state = 'queued'
+
+
 class Coordinator:
     """One coordinator instance authorizes only tasks that it prepared."""
 
@@ -167,6 +175,12 @@ class Coordinator:
 
     def publish(self, task_id):
         """Send one locally prepared order; uncertain outcomes are never retried."""
+        attempt = self._queue_publish(task_id)
+        self._wait_publish(attempt)
+        return self._record_publish_ack(attempt)
+
+    def _queue_publish(self, task_id):
+        """Mark the durable attempt and enqueue once; do not wait for PUBACK."""
         if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError('task_id must be a non-empty string')
         with self._lock:
@@ -190,8 +204,36 @@ class Coordinator:
         self._publisher.validate(robot_id, copy.deepcopy(order), owner=self._publisher_owner)
         self._store.mark_attempted(task_id, prepared[1], prepared[0], prepared[2])
         info = self._publisher.publish(robot_id, copy.deepcopy(order), owner=self._publisher_owner)
-        info.wait_for_publish(timeout=self._ack_timeout)
-        if info.is_published() is not True:
-            raise TimeoutError('MQTT broker acknowledgement not confirmed; outcome uncertain')
+        return _PublishAttempt(self, task_id, prepared, info)
+
+    def _wait_publish(self, attempt):
+        """Wait outside runtime/dispatch locks; acknowledgement is not authorization."""
+        if not isinstance(attempt, _PublishAttempt) or attempt.owner is not self:
+            raise CoordinatorError('publication attempt does not belong to this coordinator')
+        with attempt.lock:
+            if attempt.state != 'queued':
+                raise CoordinatorError('publication attempt has already been waited')
+            attempt.state = 'waiting'
+        try:
+            attempt.info.wait_for_publish(timeout=self._ack_timeout)
+            if attempt.info.is_published() is not True:
+                raise TimeoutError('MQTT broker acknowledgement not confirmed; outcome uncertain')
+        except BaseException:
+            with attempt.lock:
+                attempt.state = 'failed'
+            raise
+        with attempt.lock:
+            attempt.state = 'confirmed'
+
+    def _record_publish_ack(self, attempt):
+        """Record PUBACK once, after the caller has rechecked its own fences."""
+        if not isinstance(attempt, _PublishAttempt) or attempt.owner is not self:
+            raise CoordinatorError('publication attempt does not belong to this coordinator')
+        with attempt.lock:
+            if attempt.state != 'confirmed':
+                raise CoordinatorError('publication is not awaiting acknowledgement recording')
+            # Consume before database I/O: failure must not be retried silently.
+            attempt.state = 'consumed'
+        task_id, prepared = attempt.task_id, attempt.prepared
         self._store.mark_broker_acked(task_id, prepared[1], prepared[0], prepared[2])
         return {'task_id': task_id, 'state': 'acked'}
