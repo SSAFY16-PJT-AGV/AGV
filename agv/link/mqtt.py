@@ -44,7 +44,8 @@ def settings_from(cfg=None, env=None):
 
 class MqttLink(object):
     def __init__(self, robot_id, host="127.0.0.1", port=1883, username=None, password=None,
-                 tls_ca=None, keepalive=10, client_id=None, log=None):
+                 tls_ca=None, keepalive=10, client_id=None, log=None,
+                 reconcile_isolated=False, reconcile_key=None):
         """log: 연결 소식을 바로 받을 함수(네트워크 스레드에서 불림, print 정도만). 로그 파일에는
         LinkController가 pop_notes()로 주행 루프에서 남긴다."""
         if mqtt is None:
@@ -52,6 +53,25 @@ class MqttLink(object):
         self.robot_id = robot_id
         self.topic = lambda kind: "agv/%s/%s" % (robot_id, kind)
         self.host, self.port, self.keepalive = host, int(port), int(keepalive)
+        if not reconcile_isolated and os.environ.get('AGV_RECONCILE_ISOLATED') == '1':
+            reconcile_isolated = True
+            try:
+                reconcile_key = bytes.fromhex(os.environ.get('AGV_RECONCILE_KEY_HEX', ''))
+            except ValueError:
+                raise ValueError('invalid isolated reconciliation key')
+        if type(reconcile_isolated) is not bool:
+            raise ValueError('invalid reconciliation mode')
+        if reconcile_isolated:
+            if host != '127.0.0.1' or not isinstance(reconcile_key, bytes) or len(reconcile_key) < 32:
+                raise ValueError('reconciliation requires loopback and an isolated 32-byte key')
+        elif reconcile_key is not None:
+            raise ValueError('reconciliation requires explicit isolated mode')
+        self.reconcile_key = reconcile_key if reconcile_isolated else None
+        self._reconcile_queue = []
+        self._reconcile_ready = False
+        self._reconcile_mid = None
+        self._signal_lock = threading.Lock()
+        self._disconnect_signal = 0
         self._event_credentials = (username, password, tls_ca)
         self._log = log
         self._lock = threading.RLock()
@@ -80,6 +100,7 @@ class MqttLink(object):
         self.c.on_connect = self._on_connect
         self.c.on_disconnect = self._on_disconnect
         self.c.on_message = self._on_message
+        self.c.on_subscribe = self._on_subscribe
 
     def _note(self, msg, **kw):
         # 네트워크 스레드에서 부름: 로그 파일은 주행 루프가 쓰도록 모아 둔다(pop_notes)
@@ -99,26 +120,58 @@ class MqttLink(object):
             return
         with self._lock:
             self._connection_generation += 1
+            self._reconcile_ready = False
+            self._reconcile_mid = None
+            self._reconcile_queue = []
             self.connected = True
             self.ever_connected = True
             self.disconnected_at = None
         client.publish(self.topic("conn"), "online", qos=1, retain=True)
         client.subscribe(self.topic("order"), qos=1)
+        if self.reconcile_key is not None:
+            rc, mid = client.subscribe([(self.topic('reconcile/request'), 1),
+                                        (self.topic('reconcile/commit'), 1)])
+            with self._lock:
+                if rc == 0 and type(mid) is int and mid > 0:
+                    self._reconcile_mid = (self._connection_generation, mid)
         self._note("link_connected", host=self.host, port=self.port)
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos):
+        with self._lock:
+            if self._reconcile_mid != (self._connection_generation, mid):
+                return
+            self._reconcile_mid = None
+            self._reconcile_ready = list(granted_qos) == [1, 1]
 
     def _on_disconnect(self, client, userdata, rc):
         # This must happen before waiting for the control/MQTT lock, which may
         # be held while an event waits for its separate connection's PUBACK.
-        self._disconnect_observed.set()
+        with self._signal_lock:
+            self._disconnect_signal += 1
+            self._disconnect_observed.set()
         with self._lock:
             self.connected = False
             self.disconnected_at = time.time()
             self._disconnect_generation += 1
             self._connection_generation += 1
             self._orders = []  # never replay orders from a lost connection
+            self._reconcile_ready = False
+            self._reconcile_queue = []
         self._note("link_disconnected", rc=rc)
 
     def _on_message(self, client, userdata, msg):
+        if msg.topic in (self.topic('reconcile/request'), self.topic('reconcile/commit')):
+            from .reconcile import MAX_MESSAGE
+            if (type(msg.retain) is not bool or msg.retain or type(msg.qos) is not int or msg.qos != 1
+                    or not isinstance(msg.payload, bytes) or len(msg.payload) > MAX_MESSAGE):
+                return
+            with self._lock:
+                if self.connected and self._reconcile_ready and len(self._reconcile_queue) < 16:
+                    with self._signal_lock:
+                        signal = self._disconnect_signal
+                    self._reconcile_queue.append((self._connection_generation, signal,
+                                                  msg.topic.rsplit('/', 1)[-1], bytes(msg.payload)))
+            return
         if msg.topic != self.topic("order"):
             return
         if msg.retain:
@@ -166,6 +219,35 @@ class MqttLink(object):
             out, self._orders = self._orders, []
             return out
 
+    def poll_reconcile(self):
+        with self._lock:
+            out, self._reconcile_queue = self._reconcile_queue, []
+            return out
+
+    def process_reconcile(self, generation, signal, kind, payload, handler):
+        with self._lock:
+            with self._signal_lock:
+                valid = (self.connected and self._reconcile_ready and generation == self._connection_generation
+                         and signal == self._disconnect_signal)
+            if not valid:
+                return False
+            response = handler(kind, payload, generation)
+            if response is None:
+                return False
+        # Never queue a QoS 1 response on the auto-reconnecting main client.
+        return self.publish_reconcile_once(response, generation, signal)
+
+    def _reconcile_current(self, generation, signal):
+        with self._lock:
+            with self._signal_lock:
+                return (self.connected and self._reconcile_ready and generation == self._connection_generation
+                        and signal == self._disconnect_signal)
+
+    def publish_reconcile_once(self, response, generation, signal, timeout=3.0):
+        return self._publish_once('reconcile/response', response,
+                                  lambda: self._reconcile_current(generation, signal),
+                                  'agv-reconcile-', timeout)
+
     def process_if_current(self, generation, payload, handler):
         """Serialize processing with disconnect and reject stale queued input.
 
@@ -197,12 +279,18 @@ class MqttLink(object):
         This prevents this process from automatically replaying that event;
         it does not promise exactly-once delivery or physical stop proof.
         """
-        if not self.connected:
+        return self._publish_once('event', event,
+                                  lambda: self.connected and not self.disconnect_pending(),
+                                  'agv-event-', timeout)
+
+    def _publish_once(self, kind, payload, valid, prefix, timeout):
+        if not valid():
             return False
         username, password, tls_ca = self._event_credentials
-        client_id = "agv-event-" + uuid.uuid4().hex[:16]
+        client_id = prefix + uuid.uuid4().hex[:16]
         if hasattr(mqtt, "CallbackAPIVersion"):
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True)
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True,
+                                 reconnect_on_failure=False)
         else:
             client = mqtt.Client(client_id=client_id, clean_session=True)
         connected, acked = [], set()
@@ -226,15 +314,16 @@ class MqttLink(object):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
                     return False
-            if not connected[0] or self.disconnect_pending():
+            if not connected[0] or not valid():
                 return False
-            info = client.publish(self.topic("event"), json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+            info = client.publish(self.topic(kind), json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                                   qos=1, retain=False)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 return False
             while info.mid not in acked:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS:
+                if (not valid() or remaining <= 0
+                        or client.loop(timeout=min(0.1, remaining)) != mqtt.MQTT_ERR_SUCCESS):
                     return False
             return True
         except (OSError, RuntimeError, ValueError):

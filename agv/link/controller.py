@@ -61,6 +61,11 @@ class LinkController(object):
         get_generation = getattr(link, "disconnect_generation", None)
         self._seen_disconnect_generation = get_generation() if get_generation is not None else None
         self._strict_disconnect_latched = False
+        self._reconcile_event = None
+        self._reconcile = None
+        if getattr(link, 'reconcile_key', None) is not None:
+            from .reconcile import ReconcileRobot
+            self._reconcile = ReconcileRobot(link.robot_id, link.reconcile_key)
 
     # ---------- 연결 ----------
     def attach(self, runner):
@@ -107,6 +112,11 @@ class LinkController(object):
             self._note(msg, **kw)
         self._consume_disconnect()
         self._watch_link(now)
+        poll_reconcile = getattr(self.link, 'poll_reconcile', None)
+        process_reconcile = getattr(self.link, 'process_reconcile', None)
+        if self._reconcile is not None and poll_reconcile is not None and process_reconcile is not None:
+            for generation, signal, kind, payload in poll_reconcile():
+                process_reconcile(generation, signal, kind, payload, self._handle_reconcile)
         poll_tagged = getattr(self.link, "poll_with_generation", None)
         process = getattr(self.link, "process_if_current", None)
         if poll_tagged is not None and process is not None:
@@ -140,6 +150,46 @@ class LinkController(object):
             return self.nav.at_node
         if r.hold_reason == "wait_order" and self.book.current is None:
             return self.start_node
+        return None
+
+    def _reconcile_snapshot(self):
+        r, o = self.runner, self.book.current
+        if (r is None or r.finished or r.state != 'hold' or r.hold_reason != 'nav_hold'
+                or o is None or self.nav.at_node != o['released_until']
+                or o.get('action_at_end') != {'type': 'none'}
+                or self.error not in (None, 'link_lost', 'event_unconfirmed')
+                or self.rejected is not None or self._reconcile_event is None
+                or not (self._strict_disconnect_latched
+                        or getattr(self.link, 'disconnect_pending', lambda: False)()
+                        or self.error == 'event_unconfirmed')):
+            return None
+        if getattr(self.nav, '_strict_repeat', False):
+            index = self.book.release_i
+            route = self.nav.route
+            if (type(index) is not int or not isinstance(route, list) or route != o['nodes']
+                    or not 0 <= index < len(route) or route[index] != o['released_until']
+                    or type(self.nav._target_i) is not int or self.nav._target_i != index
+                    or type(self.nav._route_pos) is not int or self.nav._route_pos != index
+                    or self.nav.target != o['released_until']):
+                return None
+        return {'robot_session': self.session, 'map_id': self.book.map_ref,
+                'order_id': o['order_id'], 'seq': o['seq'], 'order_digest': self.book.current_digest,
+                'release_index': self.book.release_i, 'stopped_at': self.nav.at_node,
+                'event': copy.deepcopy(self._reconcile_event), 'safe_hold': True,
+                'error_reason': self.error, 'book_finished': self.book.finished,
+                'disconnect_pending': getattr(self.link, 'disconnect_pending', lambda: False)()}
+
+    def _handle_reconcile(self, kind, payload, generation):
+        from .reconcile import decode_message
+        try:
+            request = decode_message(payload)
+            snapshot = self._reconcile_snapshot()
+            if kind == 'request':
+                return self._reconcile.probe(request, snapshot, generation)
+            if kind == 'commit':
+                return self._reconcile.commit(request, snapshot, generation)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            return None
         return None
 
     def _reject(self, payload_order, reason):
@@ -248,6 +298,8 @@ class LinkController(object):
             # 이전 작업에서 선 노드의 순번은 새 경로에서 의미가 없다. 새 경로의 첫 노드에 서 있다.
             self._anchor = (o["nodes"][0], 0, r.odo)
         self.n_orders += 1
+        if self._reconcile is not None:
+            self._reconcile_event = None
         self.rejected = None
         self._note("link_order", kind=d.kind, order_id=o["order_id"], seq=o["seq"],
                    release=o["released_until"], nodes=o["nodes"])
@@ -268,7 +320,10 @@ class LinkController(object):
         r, b = self.runner, self.book
         if r is None or b.current is None:
             return
-        if getattr(self.nav, "_strict_repeat", False) and self.error is not None:
+        if ((getattr(self.nav, "_strict_repeat", False) or self._reconcile is not None)
+                and self.error is not None
+                and not (self._reconcile is not None and self.error == 'link_lost'
+                         and self._reconcile_event is None)):
             return
         o = b.current
         key = (o["order_id"], o["seq"])
@@ -280,6 +335,15 @@ class LinkController(object):
                 or self.nav.at_node != release:
             return
         if not self.link.connected or getattr(self.link, "disconnect_pending", lambda: False)():
+            if self._reconcile is not None and self._reconcile_event is None:
+                # Keep a stable, local-only stop observation. It has not been
+                # published and does not prove that the physical rear cleared.
+                self._event_n += 1
+                self._reconcile_event = {
+                    'type': 'rear_clear', 'event_id': '%s-%d' % (self.session, self._event_n),
+                    'robot_session': self.session, 'order_id': o['order_id'], 'seq': o['seq'],
+                    'map_id': o['map_id'], 'stopped_at': release,
+                    'cleared_resources': self.rules.cleared(o['nodes'], b.segment_start_i, b.release_i)}
             self.error = "event_unconfirmed"
             self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
             return
@@ -300,21 +364,23 @@ class LinkController(object):
               "robot_session": self.session, "order_id": o["order_id"], "seq": o["seq"],
               "map_id": o["map_id"], "stopped_at": release,
               "cleared_resources": self.rules.cleared(o["nodes"], b.segment_start_i, b.release_i)}
+        if self._reconcile is not None:
+            self._reconcile_event = copy.deepcopy(ev)
         try:
-            if getattr(self.nav, "_strict_repeat", False):
+            if getattr(self.nav, "_strict_repeat", False) or self._reconcile is not None:
                 one_shot = getattr(self.link, "publish_event_once", None)
                 accepted = one_shot(ev) if one_shot is not None else False
             else:
                 accepted = self.link.publish_event(ev)
         except Exception:
-            if not getattr(self.nav, "_strict_repeat", False):
+            if not getattr(self.nav, "_strict_repeat", False) and self._reconcile is None:
                 raise
             self._stopped.discard(key)
             self._anchor = previous_anchor
             self.error = "event_unconfirmed"
             self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
             return
-        if (getattr(self.nav, "_strict_repeat", False)
+        if ((getattr(self.nav, "_strict_repeat", False) or self._reconcile is not None)
                 and (accepted is not True or getattr(self.link, "disconnect_pending", lambda: False)())):
             self._stopped.discard(key)
             self._anchor = previous_anchor
