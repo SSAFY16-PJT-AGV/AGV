@@ -1,0 +1,37 @@
+--- a/agv/tests/test_sequence_visit_patch.py
++++ b/agv/tests/test_sequence_visit_patch.py
+@@ -205,11 +205,12 @@
+   ctl._handle(json.dumps(order(2,"D")).encode()); self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1)
+  def test_event_publish_exception_is_not_retried(self):
+   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
++  initial_anchor=ctl._anchor
+   nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop(); nav.on_patch("red",200); nav.pop_stop()
+   runner.state="hold"; runner.hold_reason="nav_hold"
+   def fail(_event): raise RuntimeError("send failure")
+   link.publish_event=fail; ctl._watch_stop(); self.assertEqual(ctl.error,"event_unconfirmed")
+-  self.assertEqual(ctl._stopped,set()); self.assertIsNone(ctl._anchor)
++  self.assertEqual(ctl._stopped,set()); self.assertEqual(ctl._anchor,initial_anchor)
+   link.publish_event=lambda event: self.fail("event must not be retried"); ctl._watch_stop()
+  def test_reconnect_does_not_auto_resume_even_if_enabled(self):
+   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+@@ -392,7 +393,7 @@
+   self.assertEqual(ctl.error,"order_unconfirmed")
+   self.assertEqual(ctl.book.current["seq"],1)
+   self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+- def test_old_disconnect_requires_fresh_link_for_new_repeat_but_not_generic(self):
++ def test_old_disconnect_requires_fresh_link_for_all_orders(self):
+   class Client(object):
+    def publish(self,*args,**kwargs): pass
+    def subscribe(self,*args,**kwargs): pass
+@@ -407,10 +408,7 @@
+    if not repeated: payload["nodes"]=["A","B","C"]
+    msg=Msg(); msg.payload=json.dumps(payload).encode()
+    link._on_message(client,None,msg); ctl.step(now=100.1)
+-   if repeated:
+-    self.assertEqual(ctl.error,"link_lost"); self.assertIsNone(ctl.book.current)
+-   else:
+-    self.assertIsNone(ctl.error); self.assertEqual(ctl.book.current["seq"],1)
++   self.assertEqual(ctl.error,"link_lost"); self.assertIsNone(ctl.book.current)
+  def test_one_shot_event_waits_for_puback_without_reconnect(self):
+   class EventClient(object):
+    def __init__(self,ack): self.ack=ack; self.connects=0; self.publishes=0; self.loops=0; self.closed=0
