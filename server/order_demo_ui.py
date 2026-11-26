@@ -298,6 +298,22 @@ HTML_PAGE = r'''<!doctype html>
     entry.inFlight = true;
     return entry;
   }
+  async function unknownOrderDetails(requestId, controller) {
+    // The ID is obtained from the original-key lookup, never inferred from a
+    // robot or task. This GET observes only; failure cannot unblock ordering.
+    try {
+      const response = await fetch('/order-demo/api/orders/' + encodeURIComponent(requestId),
+                                   observationOptions(controller));
+      if (!response.ok) return null;
+      const order = await response.json();
+      const states = {queued: '대기', dispatching: '배정 중', active: '진행 중',
+                      completed: '완료', failed: '실패', unknown: '결과 불명'};
+      if (!order || order.request_id !== requestId || !Object.hasOwn(states, order.status)) return null;
+      const bounded = value => typeof value === 'string' && value.length <= 256 && value &&
+                               !/[\u0000-\u001f\u007f]/.test(value) ? value : '확인 불가';
+      return `저장된 주문: ${states[order.status]} · 로봇 ${bounded(order.assigned_robot)} · 선반 ${bounded(order.shelf_id)}`;
+    } catch (_) { return null; }
+  }
   async function refreshStoredAttempt(entry) {
     if (!storedAttempts.has(entry.key) || entry.inFlight ||
         (entry.id && pendingSubmissions.has(entry.id))) return;
@@ -314,7 +330,15 @@ HTML_PAGE = r'''<!doctype html>
     try {
       const options = observationOptions(controller);
       options.headers = {'Idempotency-Key': entry.key};
-      const result = await readJson(await fetch('/order-demo/api/submission-lookup', options));
+      const response = await fetch('/order-demo/api/submission-lookup', options);
+      if (response.status === 404) {
+        if (generation !== entry.generation || !storedAttempts.has(entry.key)) return;
+        entry.uncertain = true;
+        entry.row.textContent = `${entry.label} · 기존 요청 기록을 찾지 못했습니다`;
+        message(entry.feedback, '기록이 없다는 사실만으로 미접수를 확인할 수 없습니다. 확인 전 재주문하지 마세요.');
+        return;
+      }
+      const result = await readJson(response);
       if (generation !== entry.generation || !storedAttempts.has(entry.key)) return;
       if (observationExpired(entry.started, 5000)) throw new Error('lookup expired');
       if (!result || typeof result.request_id !== 'string' ||
@@ -339,6 +363,11 @@ HTML_PAGE = r'''<!doctype html>
         entry.uncertain = true;
         entry.row.textContent = `${entry.label} · 결과 확인 필요 (${result.request_id})`;
         message(entry.feedback, '기존 주문의 결과가 불명입니다. 확인 전 재주문하지 마세요.');
+        if (result.status === 'unknown') {
+          const details = await unknownOrderDetails(result.request_id, controller);
+          if (generation !== entry.generation || !storedAttempts.has(entry.key)) return;
+          entry.row.textContent = `${entry.label} · 결과 불명 (${result.request_id}) · ${details || '주문 상세 확인 불가'}`;
+        }
       }
     } catch (_) {
       if (generation === entry.generation && storedAttempts.has(entry.key)) {
