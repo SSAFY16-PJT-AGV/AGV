@@ -14,7 +14,8 @@ def sample_map():
         'nodes': [
             {'id': 'A', 'pos': [0, 0]},
             {'id': 'B', 'pos': [10, 0], 'crossing': True, 'through': [['E1', 'E2'], ['E3', 'E4']]},
-            {'id': 'C', 'pos': [20, 0], 'kind': 'patch', 'uturn': True},
+            {'id': 'C', 'pos': [20, 0], 'kind': 'patch', 'uturn': True,
+             'spur': {'side': 'left', 'node': 'D_C'}},
             {'id': 'H', 'pos': [10, -10]}, {'id': 'D', 'pos': [10, 10]},
             {'id': 'D_C', 'pos': [30, 0], 'kind': 'spur_end'},
         ],
@@ -81,11 +82,9 @@ class FieldMapPlannerTests(unittest.TestCase):
             with self.subTest(start=start, ref=ref), self.assertRaises(ValueError):
                 self.plan(sample_map(), start, 'C', ref)
 
-    def test_destination_spur_is_explicitly_unsupported(self):
-        with self.assertRaises(ValueError):
-            self.plan(sample_map(), 'E1', 'D_C')
-        with self.assertRaises(ValueError):
-            self.plan(sample_map(), 'ED', 'C')
+    def test_destination_spur_is_included_in_the_candidate(self):
+        self.assertEqual(self.plan(sample_map(), 'E1', 'D_C').nodes, ('B', 'C', 'D_C'))
+        self.assertEqual(self.plan(sample_map(), 'ED', 'C').nodes, ('D_C', 'C'))
 
     def test_spur_end_cannot_be_used_as_a_mainline_incoming_edge(self):
         data = sample_map()
@@ -93,8 +92,9 @@ class FieldMapPlannerTests(unittest.TestCase):
         data['edges'].append({'id': 'ES', 'from': 'D_C', 'to': 'C',
                               'length_mm': 10, 'bidirectional': True,
                               'shape': [[30, 0], [20, 0]]})
+        self.assertEqual(self.plan(data, 'ES', 'C').nodes, ('D_C', 'C'))
         with self.assertRaisesRegex(ValueError, 'incoming|spur'):
-            self.plan(data, 'ES', 'C')
+            self.plan(data, 'ES~r', 'C')
 
     def test_malformed_or_incomplete_crossing_rules_are_rejected(self):
         for through in (None, [], [['E1', 'missing']], [['E1', 'E4'], ['E3', 'E4']],
