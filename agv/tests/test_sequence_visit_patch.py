@@ -1,0 +1,537 @@
+# -*- coding: utf-8 -*-
+import io
+import json
+import os
+import threading
+import time
+import unittest
+from unittest.mock import patch as mock_patch
+from types import SimpleNamespace
+from agv.link import FakeLink, LinkController, MqttLink
+from agv.nav import NavMap, Navigator
+from agv.runner import ExploreRunner
+from agv.tests.test_link import TestSimServe
+
+DATA = {"map_id":"m", "version":1, "nodes":[
+ {"id":"X"}, {"id":"A","kind":"patch","color":"orange"}, {"id":"B","kind":"merge","inputs":{"left":"E1","right":"E3"}},
+ {"id":"C","kind":"patch","color":"red","uturn":True}, {"id":"D","kind":"patch","color":"blue"}],
+ "edges":[
+ {"id":"E0","from":"X","to":"A","length_mm":100,"bidirectional":True},
+ {"id":"E1","from":"A","to":"B","length_mm":100,"bidirectional":True},
+ {"id":"E2","from":"B","to":"C","length_mm":100,"bidirectional":True},
+ {"id":"E3","from":"D","to":"B","length_mm":100,"bidirectional":True}]}
+ROUTE=["A","B","C","B","D"]
+
+class Runner(object):
+ state="hold"; hold_reason="wait_order"; finished=False; odo=0; resumes=0
+ def hold(self, reason): self.state,self.hold_reason="hold",reason
+ def resume(self): self.resumes+=1; self.state="running"
+ def cancel_unstarted_motion(self,reason): self.state,self.hold_reason="hold",reason
+ def policy_changed(self): pass
+
+def order(seq,release):
+ return {"order_id":"T1","seq":seq,"map_id":"m@v1","nodes":ROUTE,"released_until":release,"action_at_end":{"type":"none"}}
+
+class SequenceTests(unittest.TestCase):
+ def test_uturn_clears_stale_spur_marker_without_affecting_recovery(self):
+  for kind,expected in (("uturn",None),("recover","left")):
+   r=ExploreRunner.__new__(ExploreRunner)
+   r.follow=SimpleNamespace(); r.junc=SimpleNamespace(); r.tee=SimpleNamespace()
+   r.patch=SimpleNamespace(); r.cfg={"patch":{"off_frac":0.1}}
+   r.rc={"suppress_mm":20}; r.odo=100; r.t=5; r.mode="drive"
+   r._piv={"kind":kind,"prefer":"right"}; r.split_as_tee="left"
+   r.log=SimpleNamespace(log=lambda *args,**kwargs:None)
+   r.ex=SimpleNamespace(); r._poll_policy=lambda:None
+   r._rejoin(SimpleNamespace(patch_fracs={}),10)
+   self.assertEqual(r.split_as_tee,expected)
+   self.assertEqual(r.choice,"right")
+ def test_runner_cancels_unstarted_pivot_before_first_motor_output(self):
+  for when in ("before","during"):
+   r=ExploreRunner.__new__(ExploreRunner); lost=threading.Event()
+   r._stop_req={"x":1}; r.v_plan={"x":1}; r._piv={"x":1}; r._rev={"x":1}
+   r._resume_split=(1,2); r._resume_vee=(1,2); r.choice="left"; r.decision={"x":1}
+   stops=[]; r._do_stop=lambda request:stops.append(request)
+   def output(_frame,_dt):
+    if when=="during": lost.set()
+    return 0.4,0.4
+   r._step_unfenced=output
+   r.arm_unstarted_disconnect_guard(lost.is_set)
+   if when=="before": lost.set()
+   self.assertEqual(r.step(None,.1),(0.0,0.0))
+   self.assertEqual(stops,[{"reason":"link_lost","hold":True}])
+   self.assertIsNone(r._piv); self.assertIsNone(r.v_plan)
+   self.assertIsNone(r._rev); self.assertIsNone(r._unstarted_disconnect_guard)
+ def fresh(self):
+  nav=Navigator(NavMap(DATA),start="A",hold_at_end=True)
+  runner=Runner(); link=FakeLink("sim-r1"); ctl=LinkController(link,nav,DATA,start_node="A"); ctl.attach(runner)
+  return nav,runner,link,ctl
+ def test_segment_whitelist_cannot_skip_visit_and_extends_after_hold(self):
+  nav,runner,link,ctl=self.fresh()
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(nav.allowed,{"E1","E2"})
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop(); nav.on_patch("red",200)
+  stop=nav.pop_stop(); self.assertEqual(stop["reason"],"nav_hold")
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=200; ctl._watch_stop()
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(nav.allowed,{"E2~r","E3~r"})
+  self.assertEqual(nav._target_i,4); self.assertEqual(nav._route_pos,2)
+  turn=nav.pop_stop(); self.assertEqual(turn["type"],"uturn")
+  nav.resumed(); nav.uturned(220)
+  side=nav.choose_split(240); self.assertEqual(side,"left")
+  nav.on_split(side,250); nav.pop_stop(); nav.on_patch("blue",350)
+  stop=nav.pop_stop(); self.assertEqual((stop["node"],stop["reason"]),("D","nav_hold"))
+  self.assertEqual(nav._route_pos,4)
+ def test_early_extension_is_rejected_and_keeps_old_route(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  old=set(nav.allowed); ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(nav.allowed,old)
+ def test_repeat_inside_one_segment_visits_each_node_before_destination(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(runner.resumes,1)
+  nav.on_patch("orange",0); nav.pop_stop()
+  nav.on_merge(100); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("red",200); turn=nav.pop_stop()
+  self.assertEqual(turn["type"],"uturn")
+  nav.uturned(220)
+  side=nav.choose_split(240); self.assertEqual(side,"left")
+  nav.on_split(side,250); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("blue",350); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("D","nav_hold"))
+  self.assertEqual(nav._route_pos,4)
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=350
+  ctl._watch_stop()
+  self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"D")])
+ def test_gap_stops_and_duplicate_does_not_restart(self):
+  nav,runner,link,ctl=self.fresh(); payload=json.dumps(order(1,"C")).encode(); ctl._handle(payload)
+  resumes=runner.resumes; ctl._handle(payload); self.assertEqual(runner.resumes,resumes)
+  nav.on_gap(); stop=nav.pop_stop(); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+  self.assertIsNone(nav.at_node)
+ def test_unexpected_cross_or_tee_in_repeat_segment_stops(self):
+  for event in ("cross","tee"):
+   nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+   nav.on_patch("orange",0); nav.pop_stop()
+   getattr(nav,"on_"+event)(50); stop=nav.pop_stop()
+   self.assertIsNotNone(stop,event)
+   self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+   self.assertEqual(nav._route_pos,0); self.assertIsNone(nav.at_node)
+ def test_wrong_branch_after_uturn_stops_without_skipping_visit(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+  self.assertIsNone(ctl.rejected)
+  nav.on_patch("orange",0); nav.pop_stop()
+  nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); self.assertEqual(nav.pop_stop()["type"],"uturn")
+  nav.uturned(220)
+  nav.on_split("right",250); stop=nav.pop_stop()
+  self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+  self.assertLess(nav._route_pos,3); self.assertIsNone(nav.at_node)
+ def test_unexpected_visit_after_target_does_not_move_cursor(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav._route_advance("D"); stop=nav.pop_stop()
+  self.assertEqual(nav._route_pos,0); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+ def test_repeat_route_with_via_is_rejected(self):
+  data=json.loads(json.dumps(DATA)); data["nodes"][2]["kind"]="via"
+  nav=Navigator(NavMap(data),start="A")
+  with self.assertRaises(ValueError): nav.set_route(ROUTE,release="C")
+ def test_same_node_repeat_within_one_release_requires_a_real_loop(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"B")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100)
+  self.assertEqual(nav.pop_stop()["reason"],"nav_hold")
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=100; ctl._watch_stop()
+  ctl._handle(json.dumps(order(2,"B")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],2)
+  self.assertEqual(nav._target_i,3); self.assertEqual(nav._route_pos,1)
+  self.assertIsNone(nav.pop_stop())
+  nav.resumed(); nav.on_patch("red",200); turn=nav.pop_stop()
+  self.assertEqual(turn["type"],"uturn")
+  nav.uturned(220)
+  self.assertIsNone(nav.choose_split(240)); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("B","nav_hold"))
+  self.assertEqual(nav._route_pos,3)
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=250; ctl._watch_stop()
+  self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"B"),(2,"B")])
+  ctl._handle(json.dumps(order(3,"D")).encode())
+  self.assertIsNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],3)
+  nav.resumed(); side=nav.choose_split(260); self.assertEqual(side,"left")
+  nav.on_split(side,260); self.assertIsNone(nav.pop_stop())
+  nav.on_patch("blue",350); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("D","nav_hold"))
+ def test_team_map_out_and_back_in_separate_confirmed_segments(self):
+  root=os.path.abspath(os.path.join(os.path.dirname(__file__),"..",".."))
+  with io.open(os.path.join(root,"maps","sim_ssafy_v2.json"),encoding="utf-8") as f: raw=json.load(f)
+  nav=Navigator(NavMap(raw),start="P_orange",hold_at_end=True)
+  runner=Runner(); link=FakeLink("sim-r1"); ctl=LinkController(link,nav,raw,start_node="P_orange",waiting="all"); ctl.attach(runner)
+  route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
+  def msg(seq,release): return json.dumps({"order_id":"T2","seq":seq,"map_id":ctl.book.map_ref,"nodes":route,"released_until":release,"action_at_end":{"type":"none"}}).encode()
+  ctl._handle(msg(1,"P_purple")); self.assertIsNone(ctl.rejected)
+  nav.on_patch("orange",0); nav.pop_stop(); side=nav.choose_split(370); self.assertEqual(side,"left")
+  nav.on_split(side,470); nav.on_merge(820); nav.on_patch("purple",860)
+  self.assertEqual(nav.pop_stop()["reason"],"nav_hold")
+  runner.state="hold"; runner.hold_reason="nav_hold"; runner.odo=860; ctl._watch_stop()
+  ctl._handle(msg(2,"P_orange")); self.assertIsNone(ctl.rejected)
+  turn=nav.pop_stop(); self.assertEqual(turn["type"],"uturn")
+  nav.resumed(); nav.uturned(940); nav.on_split("right",970); nav.on_merge(1320)
+  nav.on_patch("orange",1700); stop=nav.pop_stop()
+  self.assertEqual((stop["node"],stop["reason"]),("P_orange","nav_hold"))
+  self.assertEqual(nav._route_pos,6)
+ def test_unknown_split_does_not_choose_a_default_branch(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.hyps=[]
+  self.assertIsNone(nav.choose_split(0))
+  self.assertEqual(nav.pop_stop()["reason"],"nav_off_route")
+ def test_unconfirmed_early_and_unexpected_patch_do_not_fake_arrival(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch_early("red",0); self.assertIsNone(nav.pop_stop()); self.assertIsNone(nav.at_node)
+  nav.on_patch("blue",10); stop=nav.pop_stop()
+  self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True)); self.assertIsNone(nav.at_node)
+ def test_unknown_start_direction_is_rejected_without_mutation(self):
+  nav,runner,link,ctl=self.fresh(); nav.hyps=[]; ctl._handle(json.dumps(order(1,"C")).encode())
+  self.assertIsNotNone(ctl.rejected); self.assertEqual(runner.resumes,0); self.assertIsNone(nav.route)
+ def test_incompatible_crossing_direction_is_rejected(self):
+  data=json.loads(json.dumps(DATA)); data["nodes"][2].update(crossing=True,through=[["E1","E3"]])
+  nav=Navigator(NavMap(data),start="A")
+  with self.assertRaises(ValueError): nav.set_route(ROUTE,release="C")
+ def test_disconnected_stop_event_does_not_replay_after_reconnect(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop(); nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; link.connected=False; ctl._watch_stop()
+  self.assertEqual(ctl.error,"event_unconfirmed"); self.assertEqual(link.events,[])
+  link.connected=True; ctl._watch_stop(); self.assertEqual(link.events,[])
+  ctl._handle(json.dumps(order(2,"D")).encode()); self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1)
+ def test_failed_queue_acceptance_blocks_extension(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop(); nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; link.publish_event=lambda event: False; ctl._watch_stop()
+  self.assertEqual(ctl.error,"event_unconfirmed")
+  ctl._handle(json.dumps(order(2,"D")).encode()); self.assertIsNotNone(ctl.rejected); self.assertEqual(ctl.book.current["seq"],1)
+ def test_event_publish_exception_is_not_retried(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  initial_anchor=ctl._anchor
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop(); nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"
+  def fail(_event): raise RuntimeError("send failure")
+  link.publish_event=fail; ctl._watch_stop(); self.assertEqual(ctl.error,"event_unconfirmed")
+  self.assertEqual(ctl._stopped,set()); self.assertEqual(ctl._anchor,initial_anchor)
+  link.publish_event=lambda event: self.fail("event must not be retried"); ctl._watch_stop()
+ def test_reconnect_does_not_auto_resume_even_if_enabled(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  ctl.resume_after_reconnect=True; ctl.error="link_lost"; runner.state="hold"; runner.hold_reason="link_lost"
+  resumes=runner.resumes; ctl._watch_link(100)
+  self.assertEqual(ctl.error,"link_lost"); self.assertEqual(runner.resumes,resumes)
+ def test_link_loss_during_pivot_remains_latched_after_reconnect(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"D")).encode())
+  self.assertIsNone(ctl.rejected); runner.state="pivot"
+  def hold_when_possible(reason):
+   if runner.state!="follow": return False
+   runner.state="hold"; runner.hold_reason=reason
+   return True
+  runner.hold=hold_when_possible
+  link.connected=False; link.disconnected_at=100; ctl._watch_link(110)
+  self.assertEqual(ctl.error,"link_lost"); self.assertEqual(runner.state,"pivot")
+  link.connected=True; ctl._watch_link(111)
+  self.assertEqual(ctl.error,"link_lost")
+  runner.state="follow"; ctl._watch_link(112)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","link_lost"))
+  ctl._watch_link(113); self.assertEqual(ctl.error,"link_lost")
+ def test_disconnect_reconnect_between_steps_latches_before_queued_extension(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+  ctl.link=link
+  ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  self.assertEqual(ctl.book.current["seq"],1)
+  resumes=runner.resumes
+  # Both callbacks and a new-generation order arrive before the next tick.
+  link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+  link._on_message(client,None,Msg()); ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(runner.resumes,resumes)
+ def test_disconnect_reconnect_after_tick_check_still_fences_new_order(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+  ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  resumes=runner.resumes
+  poll=link.poll_with_generation
+  def racing_poll():
+   link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+   link._on_message(client,None,Msg())
+   return poll()
+  link.poll_with_generation=racing_poll
+  ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(ctl.book.current["seq"],1); self.assertEqual(runner.resumes,resumes)
+ def test_disconnect_reconnect_before_stop_never_publishes_rear_clear(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  sent=[]; link.publish_event_once=lambda event:sent.append(event) or True
+  link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"
+  link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+  ctl.step(now=100.1)
+  self.assertEqual(ctl.error,"link_lost")
+  self.assertEqual(sent,[]); self.assertEqual(ctl._stopped,set())
+ def test_disconnect_callback_during_puback_keeps_event_unconfirmed(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  nav,runner,_fake,ctl=self.fresh()
+  link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+  link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"
+  started=threading.Event(); workers=[]; sent=[]
+  def disconnect():
+   started.set(); link._on_disconnect(client,None,1)
+  def one_shot(event):
+   sent.append(event); t=threading.Thread(target=disconnect); workers.append(t); t.start()
+   self.assertTrue(started.wait(1))
+   pending=getattr(link,"disconnect_pending",None)
+   if pending is None:
+    time.sleep(.05)  # original callback blocks on the held MQTT lock
+   else:
+    deadline=time.monotonic()+1
+    while not pending() and time.monotonic()<deadline: time.sleep(.001)
+    self.assertTrue(pending())
+   return True  # server may have received it despite the disconnect
+  link.publish_event_once=one_shot
+  link.run_with_disconnect_fence(ctl._watch_stop_fenced)
+  for t in workers: t.join(2); self.assertFalse(t.is_alive())
+  self.assertEqual(len(sent),1)  # sending cannot be undone
+  self.assertEqual(ctl.error,"event_unconfirmed")
+  self.assertEqual(ctl._stopped,set())
+  self.assertFalse(ctl.book.finished)
+ def test_disconnect_during_extend_or_resume_does_not_start_or_commit(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(2,"D")).encode()
+  for when in ("extend","resume"):
+   nav,runner,_fake,ctl=self.fresh()
+   link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+   link.publish_event_once=lambda event:True; link.publish_state=lambda state:None
+   ctl.link=link; ctl.step(now=100)
+   ctl._handle(json.dumps(order(1,"C")).encode())
+   nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+   nav.on_patch("red",200); nav.pop_stop()
+   runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+   before=runner.resumes
+   if when=="extend":
+    original=nav.extend
+    def interrupted(release):
+     original(release); link._disconnect_observed.set()
+    nav.extend=interrupted
+   else:
+    original=runner.resume
+    def interrupted():
+     original(); runner.state="pivot"; link._disconnect_observed.set()
+    runner.resume=interrupted
+   link._on_message(client,None,Msg()); ctl.step(now=100.1)
+   self.assertEqual(ctl.error,"link_lost",when)
+   self.assertEqual(ctl.book.current["seq"],1,when)
+   self.assertEqual((runner.state,runner.hold_reason),("hold","link_lost"),when)
+   if when=="extend": self.assertEqual(runner.resumes,before)
+ def test_failed_order_commit_cancels_new_motion_and_restores_book(self):
+  nav,runner,link,ctl=self.fresh()
+  ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  commit=ctl.book.commit
+  def fail_after_commit(decision):
+   commit(decision)
+   raise RuntimeError("commit interrupted")
+  ctl.book.commit=fail_after_commit
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertNotIn(("T1",2),ctl.book.seen)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+ def test_inconsistent_order_commit_cancels_new_motion(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  ctl.book.commit=lambda _decision:None
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+ def test_resume_that_stays_held_does_not_commit(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_merge(100); nav.pop_stop()
+  nav.on_patch("red",200); nav.pop_stop()
+  runner.state="hold"; runner.hold_reason="nav_hold"; ctl._watch_stop()
+  runner.resume=lambda:True
+  ctl._handle(json.dumps(order(2,"D")).encode())
+  self.assertEqual(ctl.error,"order_unconfirmed")
+  self.assertEqual(ctl.book.current["seq"],1)
+  self.assertEqual((runner.state,runner.hold_reason),("hold","order_unconfirmed"))
+ def test_old_disconnect_requires_fresh_link_for_all_orders(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False
+  for repeated in (True,False):
+   nav,runner,_fake,ctl=self.fresh()
+   link=MqttLink("sim-r1"); client=Client(); link._on_connect(client,None,None,0)
+   link.publish_state=lambda state:None; ctl.link=link; ctl.step(now=100)
+   link._on_disconnect(client,None,1); link._on_connect(client,None,None,0)
+   payload=order(1,"C")
+   if not repeated: payload["nodes"]=["A","B","C"]
+   msg=Msg(); msg.payload=json.dumps(payload).encode()
+   link._on_message(client,None,msg); ctl.step(now=100.1)
+   self.assertEqual(ctl.error,"link_lost"); self.assertIsNone(ctl.book.current)
+ def test_one_shot_event_waits_for_puback_without_reconnect(self):
+  class EventClient(object):
+   def __init__(self,ack): self.ack=ack; self.connects=0; self.publishes=0; self.loops=0; self.closed=0
+   def connect(self,*args,**kwargs): self.connects+=1; return 0
+   def publish(self,*args,**kwargs):
+    self.publishes+=1
+    return SimpleNamespace(rc=0,mid=7)
+   def loop(self,timeout=0):
+    self.loops+=1
+    if self.loops==1: self.on_connect(self,None,None,0); return 0
+    if self.ack: self.on_publish(self,None,7); return 0
+    return 4  # disconnected after publish but before PUBACK
+   def disconnect(self): self.closed+=1
+  link=MqttLink("sim-r1"); link.connected=True
+  self.assertTrue(callable(getattr(link,"publish_event_once",None)))
+  for ack in (True,False):
+   one=EventClient(ack)
+   with mock_patch("agv.link.mqtt.mqtt.Client",return_value=one):
+    self.assertEqual(link.publish_event_once({"event_id":"e"}),ack)
+   self.assertEqual((one.connects,one.publishes,one.closed),(1,1,1))
+   self.assertEqual(one.loops,2)
+  # Paho 1.x has no CallbackAPIVersion; this validates its API shape only.
+  legacy=EventClient(True)
+  legacy_api=SimpleNamespace(Client=lambda **kwargs:legacy, MQTT_ERR_SUCCESS=0)
+  with mock_patch("agv.link.mqtt.mqtt",legacy_api):
+   self.assertTrue(link.publish_event_once({"event_id":"legacy"}))
+  self.assertEqual((legacy.connects,legacy.publishes,legacy.closed),(1,1,1))
+  interrupted=EventClient(True)
+  base_loop=interrupted.loop
+  def disconnect_before_publish(timeout=0):
+   result=base_loop(timeout)
+   if interrupted.loops==1: link._disconnect_observed.set()
+   return result
+  interrupted.loop=disconnect_before_publish
+  with mock_patch("agv.link.mqtt.mqtt.Client",return_value=interrupted):
+   self.assertFalse(link.publish_event_once({"event_id":"interrupted"}))
+  self.assertEqual(interrupted.publishes,0)
+ def test_unexpected_dead_end_stops_repeat_sequence(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_dead_end("left",100); stop=nav.pop_stop()
+  self.assertIsNotNone(stop); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+  self.assertIsNone(nav.at_node); self.assertEqual(nav._route_pos,0)
+ def test_disconnect_discards_queued_and_already_polled_orders(self):
+  class Client(object):
+   def publish(self,*args,**kwargs): pass
+   def subscribe(self,*args,**kwargs): pass
+  class Msg(object):
+   topic="agv/sim-r1/order"; retain=False; payload=json.dumps(order(1,"C")).encode()
+  link=MqttLink("sim-r1")
+  client=Client(); link._on_connect(client,None,None,0)
+  link._on_message(client,None,Msg()); polled=link.poll_with_generation()
+  self.assertEqual(len(polled),1)
+  link._on_message(client,None,Msg()); link._on_disconnect(client,None,1)
+  link._on_connect(client,None,None,0)
+  self.assertEqual(link.poll(),[])
+  seen=[]; self.assertFalse(link.process_if_current(polled[0][0],polled[0][1],seen.append)); self.assertEqual(seen,[])
+ def test_unconfirmed_intermediate_does_not_advance_cursor(self):
+  nav,runner,link,ctl=self.fresh(); ctl._handle(json.dumps(order(1,"C")).encode())
+  nav.on_patch("orange",0); nav.pop_stop(); nav.on_patch("red",200)
+  stop=nav.pop_stop(); self.assertEqual((stop["reason"],stop["hold"]),("nav_off_route",True))
+  self.assertLess(nav._route_pos,2); self.assertNotEqual(nav.at_node,"C")
+ def test_disconnected_queued_initial_order_does_not_start(self):
+  nav,runner,link,ctl=self.fresh(); link.send(order(1,"C")); link.connected=False; link.disconnected_at=100
+  ctl.step(now=100); self.assertEqual(runner.resumes,0); self.assertIsNone(ctl.book.current); self.assertEqual(runner.state,"hold")
+
+class SequenceMatTests(TestSimServe):
+ def test_team_mat_repeated_release_never_fakes_a_missed_junction(self):
+  route=["P_orange","S1","M1","P_purple","M1"]
+  for seed in (2,3,5):
+   pending={0:self._o(1,"M1",route),1:self._o(2,"M1",route)}; sent=set()
+   def script(link,ctl,runner,t,state):
+    n=len(link.events)
+    if n in pending and n not in sent and (n==0 or state["status"]=="WAITING"):
+     sent.add(n); link.send(pending[n])
+    if n==2 and state["status"]=="IDLE": runner.stop("test_done")
+    if state["status"]=="ERROR": runner.stop("test_error")
+   link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
+   if gt["finish_reason"]=="test_error":
+    # Pending observations can arrive only after the requested M1 stop;
+    # an observed later patch is not evidence that the robot stopped at M1.
+    self.assertEqual(ctl.error,"nav_off_route")
+    self.assertEqual(link.events,[])
+   else:
+    self.assertEqual(gt["finish_reason"],"test_done",repr((seed,ctl.error,notes[-10:])))
+    self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"M1"),(2,"M1")])
+ def test_team_mat_single_release_revisits_each_junction(self):
+  route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
+  for seed in (2,3,5):
+   sent=set()
+   def script(link,ctl,runner,t,state):
+    if not sent:
+     sent.add(1); link.send(self._o(1,"P_orange",route))
+    if len(link.events)==1 and state["status"]=="IDLE": runner.stop("test_done")
+    if state["status"]=="ERROR": runner.stop("test_error")
+   link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
+   self.assertEqual(gt["finish_reason"],"test_done",repr((seed,ctl.error,notes[-10:])))
+   self.assertEqual([(e["seq"],e["stopped_at"]) for e in link.events],[(1,"P_orange")])
+   with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
+    events=[json.loads(line) for line in f]
+   turn=next(i for i,e in enumerate(events) if e.get("msg")=="uturn_done")
+   split=next(e for e in events[turn+1:] if e.get("type") in ("split","merge","patch"))
+   self.assertEqual((split["type"],split.get("choice")),("split","right"))
+ def test_team_mat_revisit_completes_with_observed_split(self):
+  route=["P_orange","S1","M1","P_purple","M1","S1","P_orange"]
+  for seed in (2,3,5):
+   pending={0:self._o(1,"P_purple",route),1:self._o(2,"P_orange",route)}; sent=set()
+   def script(link,ctl,runner,t,state):
+    n=len(link.events)
+    if n in pending and n not in sent and (n==0 or state["status"]=="WAITING"):
+     sent.add(n); link.send(pending[n])
+    if n==2 and state["status"]=="IDLE": runner.stop("test_done")
+    if n==1 and state["status"]=="ERROR" and ctl.error=="nav_off_route": runner.stop("expected_hold")
+   link,ctl,notes,gt=self._run(script,seed=seed,max_time=120)
+   if gt["finish_reason"] != "test_done":
+    with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
+     tail=[x.strip() for x in f.readlines() if "nav_sequence_ambiguous" in x or "nav_off_route" in x or '"type": "' in x][-12:]
+    self.fail(repr((seed,[x for x in notes if x[0] != "link_order"],tail)))
+   observed=[(e["seq"],e["stopped_at"]) for e in link.events]
+   self.assertEqual(observed,[(1,"P_purple"),(2,"P_orange")])
+   with io.open(os.path.join(self.tmp,"events.jsonl"),encoding="utf-8") as f:
+    events=[json.loads(line) for line in f]
+   turn=next(i for i,e in enumerate(events) if e.get("msg")=="uturn_done")
+   split=next(e for e in events[turn+1:] if e.get("type") in ("split","merge","patch"))
+   self.assertEqual((split["type"],split.get("choice")),("split","right"))
+
+if __name__=="__main__": unittest.main()
