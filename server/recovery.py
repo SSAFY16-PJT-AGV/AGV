@@ -68,7 +68,7 @@ def _digest_json(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _snapshot(db, task_id, *, field_required=False):
+def _snapshot(db, task_id, *, field_required=False, _physical_observation=False):
     """Read an internally consistent order history and currently held resources."""
     row = db.execute(
         "SELECT j.robot_id,j.map_id,j.nodes_json,j.released_until,o.payload,o.state,t.status "
@@ -78,7 +78,10 @@ def _snapshot(db, task_id, *, field_required=False):
     if row is None or row[6] != 'ASSIGNED':
         raise RecoveryError('task has no active allocation')
     robot, map_id, nodes_json, released, first_payload, first_state, status = row
-    if not isinstance(robot, str) or not robot.startswith('sim-') or not robot[4:].strip():
+    simulated = isinstance(robot, str) and robot.startswith('sim-') and bool(robot[4:].strip())
+    physical_observation = (_physical_observation is True and isinstance(robot, str)
+                            and robot.startswith('physical-') and bool(robot[9:].strip()))
+    if not simulated and not physical_observation:
         raise RecoveryError('only isolated simulation robots can be reconciled')
     _id(robot, 'robot_id'); _id(map_id, 'map_id')
     active = db.execute("SELECT value FROM allocation_meta WHERE key='active_map'").fetchone()
@@ -208,6 +211,9 @@ class RecoveryGate:
         self._moving_permits = {}
         self._generations = {}
         self._token_generations = {}
+        # Optional physical observation source; it never enables gate proofs
+        # or changes the simulator-only checks in the public recovery methods.
+        self._physical_watcher = None
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=5, isolation_level=None)
