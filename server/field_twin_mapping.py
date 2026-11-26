@@ -57,6 +57,13 @@ class FieldTwinMapping:
         if (not isinstance(unreal_map, dict) or unreal_map.get('coordinate_unit') != 'meter'
                 or unreal_map.get('map_id') != _name(config['unreal_map_id'], 'Unreal map')):
             raise ValueError('Unreal map does not match the explicitly selected snapshot')
+        if graph.map_id == 'mat_ssafy_v3':
+            # The team's original warehouse_01 map shares IDs but differs in
+            # geometry and even in N07's role. Two anchors cannot detect that.
+            # A v3 demo therefore needs the exact v3-derived synthetic world.
+            from server.field_map_compatibility import compare_field_twin_maps
+            if not compare_field_twin_maps(field_map, unreal_map)['compatible']:
+                raise ValueError('v3 field and Unreal map snapshots do not match')
         if type(config['reflect_y']) is not bool:
             raise ValueError('reflection must be explicit')
         self.reflect_y = config['reflect_y']
