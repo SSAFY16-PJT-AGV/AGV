@@ -1,0 +1,60 @@
+diff --git a/Source/agvSimulation/AGVRobot.cpp b/Source/agvSimulation/AGVRobot.cpp
+index 37708d8..968babc 100644
+--- a/Source/agvSimulation/AGVRobot.cpp
++++ b/Source/agvSimulation/AGVRobot.cpp
+@@ -130,9 +130,39 @@ void AAGVRobot::BeginPlay()
+     }
+ }
+ 
++// The old warehouse level is roughly 10x larger than the v3 metre map.
++// Wait until one map loader has successfully loaded its data; actor and
++// loader BeginPlay ordering is not guaranteed. Never alter an unknown map.
++void AAGVRobot::UpdateV3DisplayScale()
++{
++    if (!GetWorld()) return;
++    AWarehouseMapLoader* UniqueLoader = nullptr;
++    for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
++    {
++        if (!IsValid(*It) || UniqueLoader) return;
++        UniqueLoader = *It;
++    }
++    if (!UniqueLoader || UniqueLoader->LoadedMapId.IsEmpty()) return;
++    if (UniqueLoader->LoadedMapId == TEXT("mat_ssafy_v3"))
++    {
++        if (!bV3DisplayScaleActive)
++        {
++            DisplayScaleBeforeV3 = GetActorScale3D();
++            SetActorScale3D(FVector(0.1f));
++            bV3DisplayScaleActive = true;
++        }
++    }
++    else if (bV3DisplayScaleActive)
++    {
++        SetActorScale3D(DisplayScaleBeforeV3);
++        bV3DisplayScaleActive = false;
++    }
++}
++
+ void AAGVRobot::Tick(float DeltaTime)
+ {
+     Super::Tick(DeltaTime);
++    UpdateV3DisplayScale();
+ 
+     // 이동 방식에 따라 위치 제어 로직을 분리한다.
+     switch (MovementMode)
+diff --git a/Source/agvSimulation/AGVRobot.h b/Source/agvSimulation/AGVRobot.h
+index cd3d0cd..642316c 100644
+--- a/Source/agvSimulation/AGVRobot.h
++++ b/Source/agvSimulation/AGVRobot.h
+@@ -279,6 +279,11 @@ protected:
+ 
+ #pragma region Private
+ private:
++    // Transient visual scale; restored if the loaded map changes away from v3.
++    bool bV3DisplayScaleActive = false;
++    FVector DisplayScaleBeforeV3 = FVector::OneVector;
++    void UpdateV3DisplayScale();
++
+     float MoveInput = 0.0f;
+     float TurnInput = 0.0f;
+ 
