@@ -163,7 +163,7 @@ class LinkController(object):
             self.error = r.hold_reason
             self._note("link_error", reason=self.error)
         if key in self._stopped or r.state != "hold" or r.hold_reason != "nav_hold" \
-                or self.nav.at_node != release:
+                or not self.nav.holds_for(release):
             return
         self._stopped.add(key)
         self._anchor = (release, b.release_i, r.odo)
