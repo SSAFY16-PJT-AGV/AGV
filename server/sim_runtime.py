@@ -648,6 +648,11 @@ class SimRuntime:
             return {'events': [dict(zip(('robot_id', 'event_id', 'task_id', 'seq'), row))
                                for row in rows[:100]], 'truncated': len(rows) > 100}
 
+    def wait_graph(self):
+        """Read classified simulator waits; never issue commands or release."""
+        from server.sim_wait_graph import observe_wait_graph
+        return observe_wait_graph(self)
+
     def task_status(self, task_id):
         """Read a bounded, consistent allocation snapshot; never authorize movement."""
         with self._runtime_read_operation():

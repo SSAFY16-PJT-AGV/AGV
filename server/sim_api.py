@@ -154,6 +154,11 @@ def status(runtime=Depends(_runtime)):
     return _invoke(runtime, "status")
 
 
+@router.get("/wait-graph")
+def wait_graph(runtime=Depends(_runtime)):
+    return _invoke(runtime, "wait_graph")
+
+
 @router.post("/tasks/{task_id}")
 def create_task(task_id: str, runtime=Depends(_runtime)):
     return _invoke(runtime, "create_task", task_id)
