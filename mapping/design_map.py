@@ -39,10 +39,21 @@ from agv.topo import build_map, read_events, read_trace, to_agv_map_v1, twin_pro
 from agv.topo.shape import read_truth, shape_from_truth  # noqa: E402
 
 
-def _patch_length(design):
-    """진행 방향 패치 길이: 패치가 놓인 선 방향의 변. 도안은 가로 선 위 패치라 size[0]."""
+def _patch_lengths(design):
+    """진행 방향 패치 길이: 패치가 놓인 선 방향의 변(가로선 위면 size[0], 세로선 위면 size[1]).
+    반환: (가장 흔한 길이, 그와 5% 넘게 다른 색만 {색: 길이}) - 로봇 설정 patch.length_mm, length_mm_by_color.
+    몇 mm 차이(예전 매트 154~163)는 손으로 붙인 오차라 하나로 본다. 새 매트 충전 패치(149 대 160)는 따로."""
     ps = design.get("patches") or []
-    return round(sum(p["size"][0] for p in ps) / len(ps), 1) if ps else None
+    if not ps:
+        return None, {}
+    lens = {}
+    for p in ps:
+        h = design_heading(design, p["center"])
+        horiz = h is None or abs(h[0]) >= abs(h[1])
+        lens[p["color"]] = float(p["size"][0] if horiz else p["size"][1])
+    vals = sorted(lens.values())
+    main = max(set(vals), key=vals.count)
+    return round(main, 1), dict((c, round(v, 1)) for c, v in lens.items() if abs(v - main) > 0.05 * main)
 
 
 def explore(mat_path, seeds, work, quiet=False):
@@ -50,12 +61,13 @@ def explore(mat_path, seeds, work, quiet=False):
     import run_sim
     with io.open(mat_path, encoding="utf-8") as f:
         design = json.load(f)
-    plen = _patch_length(design)
+    plen, by_color = _patch_lengths(design)
+    override = {"patch": {"length_mm": plen, "length_mm_by_color": by_color}} if plen else None
     best = None
     for seed in seeds:
         out = os.path.join(work, "seed%d" % seed)
         ev, gt = run_sim.run(mat_path, out, seed=seed, max_time_s=480, speed_scale=1.0,
-                             cfg_override={"patch": {"length_mm": plen}} if plen else None)
+                             cfg_override=override)
         m = build_map([read_events(ev)], run_names=["r"])
         ok = gt["finish_reason"] == "explore_explored" and m["explore"]["complete"]
         score = (0 if ok else 1, len(m["warnings"]))
@@ -153,12 +165,23 @@ def main():
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--map-id", default=None, help="기본: 출력 파일 이름")
     ap.add_argument("--seeds", type=int, default=6, help="시도할 탐색 난수 개수")
+    ap.add_argument("--twin-map", default=None, metavar="트윈_맵_JSON",
+                    help="노드 이름·좌표를 트윈 맵(예: maps/twin/warehouse_01.json)에 맞춤(mapping/twin_ids.py)")
     ap.add_argument("--twin", default=None, metavar="트윈_프로젝트_폴더",
                     help="Content/Data/warehouse_map.json으로 복사(원래 파일은 .bak)")
     a = ap.parse_args()
     map_id = a.map_id or os.path.splitext(os.path.basename(a.out))[0]
     print(u"도안을 시뮬레이터로 탐색해 위상을 만들어요: %s" % a.mat)
     doc, m = build(a.mat, map_id, range(a.seeds))
+    if a.twin_map:
+        import twin_ids
+        with io.open(a.mat, encoding="utf-8") as f:
+            design = json.load(f)
+        with io.open(a.twin_map, encoding="utf-8") as f:
+            twin = json.load(f)
+        doc = twin_ids.apply(doc, design, twin)
+        m["warnings"] = doc["warnings"]
+        print(u"트윈 맵 이름으로: %s" % u", ".join("%s->%s" % kv for kv in sorted(doc["twin_ids"]["renamed"].items())))
     d = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(d):
         os.makedirs(d)
@@ -166,10 +189,10 @@ def main():
         f.write(json.dumps(doc, ensure_ascii=False, indent=1))
     probs = twin_problems(doc)
     print(u"형식: agv-map-v1 (좌표: 도안, 원점 %s) / 트윈 로더 검사: %s" % (
-        doc["origin_node"], u"통과" if not probs else u"문제 %d개" % len(probs)))
+        doc["origin_node"] or doc.get("origin"), u"통과" if not probs else u"문제 %d개" % len(probs)))
     for p in probs:
         print(u"  " + p)
-    print(u"도안 좌표로 고정한 노드: %s" % u", ".join(doc["design"]["snapped"]))
+    print(u"도안 좌표로 고정한 노드: %s" % u", ".join(sorted(doc["design"]["snapped"])))
     print(u"노드 %d개, 엣지 %d개 -> %s" % (len(doc["nodes"]), len(doc["edges"]), a.out))
     for e in doc["edges"]:
         if e["type"] == "main":

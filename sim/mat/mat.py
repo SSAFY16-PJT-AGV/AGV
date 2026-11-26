@@ -13,6 +13,8 @@ COLORS_BGR = {
     "purple": (150, 35, 95),
     "red": (40, 40, 200),
     "blue": (190, 90, 30),
+    "pink": (160, 70, 235),      # ssafy_v3 충전 패치(N07). HSV H 약 164
+    "skyblue": (235, 185, 70),   # ssafy_v3 충전 패치(N08). HSV H 약 99
 }
 BG_BGR = (222, 232, 240)
 LINE_BGR = (28, 28, 28)
