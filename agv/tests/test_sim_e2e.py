@@ -421,8 +421,8 @@ class TestAutoColor(unittest.TestCase):
             for f in frames:
                 col.add(f)
             res, info = ac.solve(col, DEFAULT_CONFIG)
-            self.assertEqual(sorted(c["name"] for c in info["clusters"]),
-                             sorted(DEFAULT_CONFIG["patch"]["colors"]), info["warnings"])
+            on_mat = sorted(set(p["color"] for p in Mat(MAT_V2).d["patches"]))     # ssafy_v2는 6색
+            self.assertEqual(sorted(c["name"] for c in info["clusters"]), on_mat, info["warnings"])
             ev, gt = run_sim.run(MAT_V2, os.path.join(self.tmp, "run"), seed=3, max_time_s=300,
                                  cfg_override=res)
         finally:
@@ -460,7 +460,18 @@ class TestAutoColor(unittest.TestCase):
 
     def test_names_follow_hue_order(self):
         from agv.tools.autocolor import _assign_names, _range_center
-        nominal = dict((k, _range_center(v)) for k, v in DEFAULT_CONFIG["patch"]["colors"].items())
+        nominal8 = dict((k, _range_center(v)) for k, v in DEFAULT_CONFIG["patch"]["colors"].items())
+        # 새 매트(ssafy_v3) 8색: 조명 때문에 전부 8 정도 밀려도 순서대로
+        hs = [11, 20, 36, 68, 105, 121, 148, 171]
+        got = _assign_names(hs, nominal8)
+        self.assertEqual([got[h] for h in hs],
+                         ["red", "orange", "yellow", "green", "skyblue", "blue", "purple", "pink"])
+        hs = [175, 4, 20, 52, 89, 105, 132, 155]
+        got = _assign_names(hs, nominal8)
+        self.assertEqual([got[h] for h in hs],
+                         ["red", "orange", "yellow", "green", "skyblue", "blue", "purple", "pink"])
+        # 예전 6색 매트(분홍·하늘 없음)는 그 6색 이름만 후보로
+        nominal = dict((k, v) for k, v in nominal8.items() if k not in ("pink", "skyblue"))
         # 조명 때문에 전부 8 정도 밀려도 순서대로 이름이 붙는다
         got = _assign_names([8, 20, 36, 73, 117, 155], nominal)
         self.assertEqual([got[h] for h in [8, 20, 36, 73, 117, 155]],
