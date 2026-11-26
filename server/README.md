@@ -68,6 +68,8 @@ TLS만 쓴다면 사용자명과 비밀번호 설정을 모두 제거한다. 인
 [팀 맵 웹·Unreal 시연](docs/field_web_unreal_demo.md)을 참고한다.
 #62 새 팀 맵의 격리 예제와 실제 Unreal 맵과의 차이는
 [v3 맵 격리 시연](docs/field_v3_simulation.md)을 참고한다.
+실제 Unreal 프로젝트의 v3 시연 사본 구성과 렌더링 시험은
+[v3 Unreal 시연](docs/field_v3_unreal.md)을 참고한다.
 
 팀의 최신 로봇 MQTT 구현과 서버의 주문·상태·이벤트 차이, 시험용 주문
 사전검증과 실물 연동의 남은 조건은 [팀 로봇 연동 대조](docs/field_robot_interop.md)를
