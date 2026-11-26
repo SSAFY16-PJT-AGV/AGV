@@ -1,0 +1,53 @@
+{
+  "field_map_file": "mat_ssafy_v3_simulated_waits.json",
+  "field_map_sha256": "31212f98cd1bc38231c416d9feb2656ff2a0af490afc1cde7ee91d965afd361e",
+  "unreal_map_id": "mat_ssafy_v3",
+  "anchors": [
+    {
+      "field_node": "N01",
+      "unreal_node": "N01"
+    },
+    {
+      "field_node": "N05",
+      "unreal_node": "N05"
+    }
+  ],
+  "reflect_y": false,
+  "tolerance_m": 0.001,
+  "robots": {
+    "sim-r1": {
+      "node": "N07",
+      "incoming_edge": "E11"
+    },
+    "sim-r2": {
+      "node": "N08",
+      "incoming_edge": "E5"
+    }
+  },
+  "products": [
+    {
+      "id": "red",
+      "label": "red",
+      "product_type": "Red",
+      "pickup_node": "N01",
+      "destination_node": "N04",
+      "unreal_pickup_node": "N01",
+      "unreal_destination_node": "N04",
+      "shelf_id": "SHELF_RED",
+      "slot_index": 0,
+      "slot_count": 6
+    },
+    {
+      "id": "blue",
+      "label": "blue",
+      "product_type": "Blue",
+      "pickup_node": "N02",
+      "destination_node": "N03",
+      "unreal_pickup_node": "N02",
+      "unreal_destination_node": "N03",
+      "shelf_id": "SHELF_BLUE",
+      "slot_index": 0,
+      "slot_count": 6
+    }
+  ]
+}
