@@ -1,0 +1,112 @@
+--- a/Source/agvSimulation/WarehouseMapLoader.h
++++ b/Source/agvSimulation/WarehouseMapLoader.h
+@@ -30,6 +30,8 @@
+ public:
+     AWarehouseMapLoader();
+     UFUNCTION(BlueprintCallable, Category = "Warehouse") bool LoadMap();
++    // Set only after a whole map has been successfully parsed.
++    UPROPERTY(BlueprintReadOnly, Category = "Warehouse") FString LoadedMapId;
+     UPROPERTY(BlueprintReadOnly, Category = "Warehouse") TArray<FWarehouseNode> Nodes;
+     UPROPERTY(BlueprintReadOnly, Category = "Warehouse") TArray<FWarehouseEdge> Edges;
+     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Warehouse") TSubclassOf<AActor> NodeMarkerClass;
+--- a/Source/agvSimulation/WarehouseMapLoader.cpp
++++ b/Source/agvSimulation/WarehouseMapLoader.cpp
+@@ -48,6 +48,13 @@
+         return false;
+     }
+ 
++    FString ParsedMapId;
++    if (!JsonObject->TryGetStringField(TEXT("map_id"), ParsedMapId) || ParsedMapId.IsEmpty())
++    {
++        UE_LOG(LogTemp, Error, TEXT("map_id not found"));
++        return false;
++    }
++
+     // JSON 배열 포인터 (멤버변수 Nodes와 구분)
+     const TArray<TSharedPtr<FJsonValue>>* JsonNodes = nullptr;
+ 
+@@ -197,6 +204,7 @@
+     }
+ 
+     // 파싱 완료 후 저장
++    LoadedMapId = MoveTemp(ParsedMapId);
+     Nodes = MoveTemp(ParsedNodes);
+     Edges = MoveTemp(ParsedEdges);
+ 
+--- a/Source/agvSimulation/AGVRobot.cpp
++++ b/Source/agvSimulation/AGVRobot.cpp
+@@ -398,10 +398,12 @@
+ 
+     int32 LoaderCount = 0;
+     int32 NodeCount = 0;
++    bool bV3Map = false;
+     for (TActorIterator<AWarehouseMapLoader> It(World); It; ++It)
+     {
+         if (!IsValid(*It)) return false;
+         ++LoaderCount;
++        bV3Map = It->LoadedMapId == TEXT("mat_ssafy_v3");
+         for (const FWarehouseNode& Node : It->Nodes)
+         {
+             if (Node.Id == NodeId) { OutCenter = Node.Position; ++NodeCount; }
+@@ -428,7 +430,9 @@
+         if (bOnShelf) continue;
+         const FVector Position = Candidate->GetActorLocation();
+         if (Position.ContainsNaN()) return false;
+-        if (FVector::Dist2D(Position, OutCenter) <= 200.0)
++        // The v3 test floor is only ~2m wide: the old 200cm radius would
++        // count products across sources. Legacy warehouse_01 is unchanged.
++        if (FVector::Dist2D(Position, OutCenter) <= (bV3Map ? 12.0 : 200.0))
+             OutCandidates.Add(Candidate);
+     }
+     return true;
+@@ -634,6 +638,37 @@
+         *GetAGVId());
+ 
+     return true;
++}
++
++// v3 scene coordinates are an explicit simulation arrangement, not measured
++// physical warehouse coordinates. Do not acknowledge a place into a shelf
++// that is not near the mapped node, or a robot that has not reached it.
++static bool V3ShelfLocationMatches(UWorld* World, const AAGVDisplayShelf* Shelf,
++    const FVector& RobotPosition)
++{
++    if (!IsValid(World) || !IsValid(Shelf) || !IsInGameThread() || RobotPosition.ContainsNaN()) return false;
++    AWarehouseMapLoader* Loader = nullptr;
++    for (TActorIterator<AWarehouseMapLoader> It(World); It; ++It)
++    {
++        if (!IsValid(*It) || Loader) return false;
++        Loader = *It;
++    }
++    if (!Loader) return false;
++    if (Loader->LoadedMapId != TEXT("mat_ssafy_v3")) return true;
++    FString Target;
++    if (Shelf->GetShelfId() == TEXT("SHELF_RED")) Target = TEXT("D04");
++    else if (Shelf->GetShelfId() == TEXT("SHELF_BLUE")) Target = TEXT("D03");
++    else return false;
++    int32 Matches = 0;
++    FVector NodePosition = FVector::ZeroVector;
++    for (const FWarehouseNode& Node : Loader->Nodes)
++    {
++        if (Node.Id == Target) { NodePosition = Node.Position; ++Matches; }
++    }
++    const FVector ShelfPosition = Shelf->GetActorLocation();
++    return Matches == 1 && !NodePosition.ContainsNaN() && !ShelfPosition.ContainsNaN()
++        && FVector::Dist2D(ShelfPosition, NodePosition) <= 10.0
++        && FVector::Dist2D(RobotPosition, NodePosition) <= 25.0;
+ }
+ 
+ bool AAGVRobot::ApplyExternalPlaceSuccess(
+@@ -680,6 +715,12 @@
+     }
+ 
+     // 상품 종류 확인
++    if (!V3ShelfLocationMatches(GetWorld(), TargetShelf, GetActorLocation()))
++    {
++        UE_LOG(LogTemp, Warning, TEXT("[%s] PLACE FAILED: Shelf or AGV is not at the mapped node"), *GetAGVId());
++        return false;
++    }
++
+     if (HeldActor->GetProductType() !=
+         TargetShelf->GetShelfProductType())
+     {
