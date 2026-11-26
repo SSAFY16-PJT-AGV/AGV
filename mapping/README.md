@@ -1,6 +1,33 @@
 # mapping/ — 맵 생성(팀 공통 형식 agv-map-v1)과 디버그 뷰어
 
-## 실제 매트 맵: `maps/mat_ssafy_v2.json` (도안으로 만듦, 지금 쓰는 맵)
+## 실제 매트 맵: `maps/mat_ssafy_v3.json` (2026-11-25 새 배치, 지금 쓰는 맵)
+
+트윈 맵(`maps/twin/warehouse_01.json`, 트윈 팀 `warehouse_map.json`)에 맞춘 새 배치다. 패치 8개(N01~N08), 안쪽 세로선 두 개(T자 갈라짐 J02·J06, 합류 J03·J07), 스퍼 끝 D01~D08. 예전 매트의 S자 선·렌즈·X자 교차·V자는 실물에서도 지웠다.
+
+| 노드 | 색 | 역할 |
+| --- | --- | --- |
+| N01 | 주황 | 정렬되지 않은 물체 공간 (4칸 선반) |
+| N02 | 파랑 | 우유 선반 |
+| N03 | 빨강 | 휴지 선반 |
+| N04 | 보라 | 계란 선반 |
+| N05 | 초록 | 주스 선반 |
+| N06 | 노랑 | 정렬된 물체 공간 (4칸 선반) |
+| N07 | 분홍 | agv01 충전 (패치 14.9cm 정사각형) |
+| N08 | 하늘 | agv02 충전 (패치 14.9cm 정사각형) |
+
+```
+python3 sim/mat/mats/gen_ssafy_v3.py                     # 도안 sim/mat/mats/ssafy_v3.json
+python3 mapping/design_map.py sim/mat/mats/ssafy_v3.json -o maps/mat_ssafy_v3.json --seeds 2 \
+    --twin-map maps/twin/warehouse_01.json
+python3 mapping/unify_map.py maps/mat_ssafy_v3.json      # 서버용 mm 필드
+```
+
+- 도안(`gen_ssafy_v3.py`): 패치 자리는 트윈 맵 좌표 그대로(mm, 트윈 y는 아래로 +라 도안에서는 뒤집음). **곡선 반지름은 트윈 그림이 아니라 예전 실물 매트와 같은 146.6mm**다(트윈 그림은 곡선을 4cm 정도로 작게 그렸지만 실물은 예전 그대로). 그래서 안쪽 세로선이 바깥 선에서 갈라지는/붙는 자리는 x 706.9·1275.1mm이고, 트윈 그림의 J 노드 자리와 몇 cm 다르다.
+- `--twin-map`(`mapping/twin_ids.py`): 탐색으로 만든 맵의 노드 이름을 트윈 ID로 바꾸고(P_<색>→N0k, D_P_<색>→D0k, 갈라짐·합류→가장 가까운 트윈 J), 좌표를 트윈 좌표(x 오른쪽, y 아래, mm→m)로 옮기며 역할(role)·라벨을 붙인다. 패치·스퍼 끝은 트윈 좌표와 같고, J는 로봇이 알아보는 자리라 트윈 그림과 몇 cm 다르다(`twin_drawn_offset_mm`).
+- 경고 2개(J03·J07 합류 검출 누락 보정)는 늘 난다. 합류점이 보라(N04)·빨강(N03) 패치 위에 겹쳐 합류 판정이 패치에 묻히기 때문이다. 로봇은 서버가 J03·J07을 해제 노드로 주면 그 패치 앞에서 서고 그 노드에 섰다고 보고한다(`agv/README.md`).
+- 시나리오 주행: `python3 sim/mat/v3_scenarios.py`(패치·안쪽 세로선·스퍼 8곳·반대 방향·유턴·시작 위치 모름·충전 패치). 테스트는 `agv/tests/test_map_v3.py`.
+
+## 예전 매트 맵: `maps/mat_ssafy_v2.json` (2026-11-06 도안)
 
 2m × 1m 매트(2026-11-06 도안 그대로)의 맵이다. 목표 패치로 가기(goto), 서버 경로 계획, 디지털 트윈에서 실물 매트를 보여 줄 때 이 파일을 쓴다. 로봇이 탐색해 맵을 만드는 일(아래 "탐색 로그로 맵 만들기")은 실물 시험이 오래 걸려 뒤로 미뤘다.
 
@@ -45,7 +72,7 @@ python3 mapping/build_map.py data/runs/<시각>/events.jsonl -o maps/field.json 
 
 - **좌표의 출처는 `pos_source`로 확인한다.** `"odometry"`면 주행 궤적으로 계산한 좌표·곡선이라 매트와 비슷한 모양이다(시뮬레이션 기준 패치 위치 오차 2~3cm). `"estimated"`면 `trace.jsonl`이 없어서 엣지 길이로 추정한 배치다. 연결 관계와 길이는 맞지만 모양은 실제 매트와 다를 수 있다.
 - **엣지는 양방향이다.** 테이프 선은 어느 쪽으로든 따라갈 수 있고 차체는 제자리에서 돌 수 있어서, 탐색은 한 방향으로 돌았어도 맵에는 `bidirectional: true`로 넣는다. 트윈 경로 찾기도 엣지를 양방향으로 보므로 그대로 맞는다. 한쪽으로만 다니게 하려면 `build_map.py --one-way`.
-- 트윈 레벨에서 시뮬레이션 출발·도착 노드를 예시 맵 ID(`J01` 등)로 정해 두었다면 새 맵의 노드 ID(`P_orange`, `S1` 등)로 바꿔야 한다.
+- 탐색으로 만든 맵의 노드 ID는 `P_orange`, `S1` 같은 이름이다. 트윈 ID(N01 등)로 맞추려면 `mapping/twin_ids.py`(또는 `design_map.py --twin-map`)를 쓴다. 지금 실물 맵 `mat_ssafy_v3.json`은 트윈 ID다.
 
 ### 통일 형식 필드 채우기 (서버 연동)
 
