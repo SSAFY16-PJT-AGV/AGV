@@ -24,6 +24,7 @@ PATCHES = (
     ('unreal_pickup_inventory.patch', ('--unidiff-zero',)),
     ('unreal_v3_scene_guard.patch', ()),
     ('unreal_v3_display_scale.patch', ()),
+    ('unreal_v3_camera.patch', ()),
 )
 
 

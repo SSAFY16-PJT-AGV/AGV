@@ -1,0 +1,94 @@
+diff --git a/Source/agvSimulation/Private/WarehouseCameraPawn.cpp b/Source/agvSimulation/Private/WarehouseCameraPawn.cpp
+index 6f3cc1d..75502dd 100644
+--- a/Source/agvSimulation/Private/WarehouseCameraPawn.cpp
++++ b/Source/agvSimulation/Private/WarehouseCameraPawn.cpp
+@@ -1,5 +1,9 @@
+ #include "WarehouseCameraPawn.h"
+ 
++#include "../WarehouseMapLoader.h"
++#include "EngineUtils.h"
++#include "Engine/World.h"
++
+ #include "Camera/CameraComponent.h"
+ #include "GameFramework/SpringArmComponent.h"
+ #include "Components/InputComponent.h"
+@@ -39,9 +43,62 @@ void AWarehouseCameraPawn::BeginPlay()
+     }
+ }
+ 
++// The v3 demo has a purpose-built camera. Wait for the actual selected map
++// and select it once only when one loader and one camera are present.
++// Controller possession and input bindings are deliberately unchanged.
++void AWarehouseCameraPawn::UpdateV3ViewTarget()
++{
++    if (!GetWorld()) return;
++    AWarehouseMapLoader* Loader = nullptr;
++    for (TActorIterator<AWarehouseMapLoader> It(GetWorld()); It; ++It)
++    {
++        if (!IsValid(*It) || Loader) return;
++        Loader = *It;
++    }
++    if (!Loader || Loader->LoadedMapId.IsEmpty()) return;
++    APlayerController* PC = GetWorld()->GetFirstPlayerController();
++    if (!IsValid(PC)) return;
++
++    if (Loader->LoadedMapId != TEXT("mat_ssafy_v3"))
++    {
++        if (bV3ViewActive)
++        {
++            if (PC->GetViewTarget() == this && PreviousV3ViewTarget.IsValid())
++                PC->SetViewTarget(PreviousV3ViewTarget.Get());
++            PreviousV3ViewTarget.Reset();
++            bV3ViewActive = false;
++        }
++        bV3ViewAttempted = false;
++        return;
++    }
++
++    int32 CameraCount = 0;
++    for (TActorIterator<AWarehouseCameraPawn> It(GetWorld()); It; ++It)
++    {
++        if (!IsValid(*It)) return;
++        ++CameraCount;
++    }
++    if (CameraCount != 1 || !IsValid(Camera) || bV3ViewAttempted) return;
++    bV3ViewAttempted = true;
++    AActor* Previous = PC->GetViewTarget();
++    if (Previous != this)
++    {
++        PreviousV3ViewTarget = Previous;
++        PC->SetViewTarget(this);
++    }
++    bV3ViewActive = PC->GetViewTarget() == this;
++    const FVector CameraPosition = Camera->GetComponentLocation();
++    const FRotator CameraRotation = Camera->GetComponentRotation();
++    UE_LOG(LogTemp, Display,
++        TEXT("[V3Camera] controller=%s target=%s verified=%d camera_position=%s camera_rotation=%s"),
++        *GetNameSafe(PC), *GetNameSafe(PC->GetViewTarget()), bV3ViewActive ? 1 : 0,
++        *CameraPosition.ToString(), *CameraRotation.ToString());
++}
++
+ void AWarehouseCameraPawn::Tick(float DeltaTime)
+ {
+     Super::Tick(DeltaTime);
++    UpdateV3ViewTarget();
+ }
+ 
+ void AWarehouseCameraPawn::SetupPlayerInputComponent(
+diff --git a/Source/agvSimulation/Public/WarehouseCameraPawn.h b/Source/agvSimulation/Public/WarehouseCameraPawn.h
+index eb3c510..3a8f408 100644
+--- a/Source/agvSimulation/Public/WarehouseCameraPawn.h
++++ b/Source/agvSimulation/Public/WarehouseCameraPawn.h
+@@ -42,6 +42,12 @@ protected:
+     float ZoomSpeed = 150.0f;
+ 
+ private:
++    // A temporary v3 demo view never changes controller possession.
++    bool bV3ViewActive = false;
++    bool bV3ViewAttempted = false;
++    TWeakObjectPtr<AActor> PreviousV3ViewTarget;
++    void UpdateV3ViewTarget();
++
+     void MoveForward(float Value);
+     void MoveRight(float Value);
+     void TurnCamera(float Value);
