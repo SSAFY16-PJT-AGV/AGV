@@ -110,13 +110,14 @@ class TestShelf(unittest.TestCase):
         cls.servo = cls.cfg["observe_pose"]["servo_angles"]
         cls.rays = cls.cam.pixel_rays()
 
-    def run_case(self, pose, contents, seed=0, ids=None):
+    def run_case(self, pose, contents, seed=0, ids=None, shelf=None, expect=None):
         rng = np.random.RandomState(seed)
         R_bc, t_bc = camera_to_body(self.cfg["robot_geom"], self.servo)
-        boxes, truth = scene.build_shelf_scene(self.cfg, self.layout, pose, contents, shelf_id_ids=ids)
+        boxes, truth = scene.build_shelf_scene(self.cfg, self.layout, pose, contents, shelf_id_ids=ids,
+                                               shelf_id=shelf)
         raw = scene.render(self.cam, R_bc, t_bc, boxes, wall_x=self.layout.front_x + 300, rays=self.rays)
         img = scene.finish(raw, rng, gain=0.9, noise=3.0, blur=0.7)
-        return perceive_shelf(img, self.cfg, self.cam, self.servo, self.layout), truth
+        return perceive_shelf(img, self.cfg, self.cam, self.servo, self.layout, expect_shelf=expect), truth
 
     def check(self, res, truth, pose, tol_mm=3.0):
         self.assertTrue(res["shelf"]["ok"])
@@ -130,13 +131,13 @@ class TestShelf(unittest.TestCase):
 
     def test_fixed_case(self):
         pose = (self.layout.front_x + 12, -15.0, 4.0)
-        contents = {1: {"marker_id": 10, "setback": 0, "dy": 5, "yaw": 6},
-                    2: {"marker_id": 21, "setback": 14, "dy": -8, "yaw": -7},
-                    4: {"marker_id": 12, "setback": 8, "dy": 0, "yaw": 0}}
+        contents = {1: {"marker_id": 30, "setback": 0, "dy": 5, "yaw": 6},
+                    2: {"marker_id": 31, "setback": 14, "dy": -8, "yaw": -7},
+                    4: {"marker_id": 32, "setback": 8, "dy": 0, "yaw": 0}}
         res, truth = self.run_case(pose, contents)
         self.check(res, truth, pose)
-        self.assertEqual([s["state"] for s in res["slots"]], ["box_a", "box_b", "empty", "box_a"])
-        self.assertEqual(res["slots"][0]["marker_id"], 10)
+        self.assertEqual([s["state"] for s in res["slots"]], ["milk", "tissue", "empty", "egg"])
+        self.assertEqual(res["slots"][0]["marker_id"], 30)
 
     def test_random_cases(self):
         rng = np.random.RandomState(7)
@@ -151,8 +152,8 @@ class TestShelf(unittest.TestCase):
         cv2.solvePnPGeneric = None
         try:
             pose = (self.layout.front_x - 10, 12.0, -3.0)
-            contents = {2: {"marker_id": 11, "setback": 5, "dy": 3, "yaw": -4},
-                        3: {"marker_id": 20, "setback": 10, "dy": -5, "yaw": 5}}
+            contents = {2: {"marker_id": 33, "setback": 5, "dy": 3, "yaw": -4},
+                        3: {"marker_id": 31, "setback": 10, "dy": -5, "yaw": 5}}
             res, truth = self.run_case(pose, contents)
             self.check(res, truth, pose)
         finally:
@@ -161,9 +162,24 @@ class TestShelf(unittest.TestCase):
     def test_hidden_slot_marker_is_unknown(self):
         """빈 칸인데 칸 앞면 마커가 안 보이면 empty가 아니라 unknown."""
         pose = (self.layout.front_x, 0.0, 0.0)
-        res, _ = self.run_case(pose, {1: {"marker_id": 10, "setback": 0}}, ids=[1, 2, 9, 4])
-        self.assertEqual([s["state"] for s in res["slots"]], ["box_a", "empty", "unknown", "empty"])
+        res, _ = self.run_case(pose, {1: {"marker_id": 30, "setback": 0}}, ids=[1, 2, 45, 4])   # 45: 안 쓰는 ID
+        self.assertEqual([s["state"] for s in res["slots"]], ["milk", "empty", "unknown", "empty"])
         self.assertEqual(res["shelf"]["slot_markers"], [1, 2, 4])
+
+    def test_six_shelves(self):
+        """선반 6개(N01~N06)는 칸 마커가 서로 달라, 서버가 정한 선반 앞인지 확인된다."""
+        self.assertEqual(sorted(self.layout.shelves), ["N0%d" % k for k in range(1, 7)])
+        self.assertEqual(self.layout.shelves["N03"], [9, 10, 11, 12])
+        pose = (self.layout.front_x + 5, 8.0, -2.0)
+        contents = {2: {"marker_id": 31, "setback": 3}, 4: {"marker_id": 31, "setback": 9}}
+        res, truth = self.run_case(pose, contents, shelf="N03", expect="N03")
+        self.check(res, truth, pose)
+        self.assertEqual(res["shelf"]["shelf_id"], "N03")
+        self.assertEqual([s["state"] for s in res["slots"]], ["empty", "tissue", "empty", "tissue"])
+        # 다른 선반 앞에 섰으면(서버는 N02라고 함) 칸을 판정하지 않음
+        res, _ = self.run_case(pose, contents, shelf="N03", expect="N02")
+        self.assertFalse(res["shelf"]["ok"])
+        self.assertEqual(set(s["state"] for s in res["slots"]), {"unknown"})
 
 
 if __name__ == "__main__":

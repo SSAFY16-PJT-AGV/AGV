@@ -77,7 +77,11 @@ class ShelfLayout(object):
         self.place_setback = float(sh.get("place_setback_mm", 5.0))
         shelves = sh.get("shelf_ids") or {"SHELF": sh["slot_marker_ids"]}
         self.slot_marker = {}            # marker id -> (shelf_id, slot 1..n)
+        self.shelves = {}                # shelf_id -> [칸 1..n 마커 id]
         for sid, ids in shelves.items():
+            if sid.startswith("_"):
+                continue
+            self.shelves[sid] = [int(v) for v in ids]
             for k, mid in enumerate(ids):
                 self.slot_marker[int(mid)] = (sid, k + 1)
         self.marker_size = float(cfg["markers"]["size_mm"])

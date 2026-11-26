@@ -139,17 +139,18 @@ def finish(img, rng, gain=1.0, noise=3.0, blur=0.7, gradient=0.0):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def build_shelf_scene(cfg, layout, shelf_pose, contents, shelf_id_ids=None, apron_mm=35.0):
+def build_shelf_scene(cfg, layout, shelf_pose, contents, shelf_id_ids=None, apron_mm=35.0, shelf_id=None):
     """선반 + 박스 장면.
 
     shelf_pose: (x, y, yaw_deg) 선반 원점(앞 모서리 가운데, 윗면 높이)의 몸체 좌표.
     contents: {slot: {"type", "marker_id", "setback", "dy", "yaw"}}  없는 칸은 빈 칸.
+    shelf_id: 어느 선반의 칸 마커를 붙일지(없으면 첫 선반). shelf_id_ids로 마커 id를 직접 줄 수도 있다.
     반환: (boxes, truth). truth: {"slots": {k: {...}}, "shelf": {...}}
     """
     sx, sy, syaw = shelf_pose
     Rs = rot_z(syaw)
     org = np.array([sx, sy, layout.height])
-    ids = shelf_id_ids or [mid for mid, (sid, k) in sorted(layout.slot_marker.items(), key=lambda t: t[1][1])]
+    ids = shelf_id_ids or layout.shelves[shelf_id or sorted(layout.shelves)[0]]
     width = layout.n * layout.slot_w + 40.0
     # 선반 윗판 + 앞판(두께 apron_mm). 앞면에 칸 마커
     marks = []
@@ -205,10 +206,11 @@ def random_case(rng, cfg, layout, stop_xy_mm=20.0, stop_yaw_deg=5.0, p_empty=0.3
     return shelf_pose, contents
 
 
-def render_case(cfg, cam, layout, shelf_pose, contents, servo_angles, rng, rays=None, light=None):
+def render_case(cfg, cam, layout, shelf_pose, contents, servo_angles, rng, rays=None, light=None, shelf_id=None):
     """한 장면을 그려 (영상 uint8, truth)를 돌려준다. light: finish()에 넘길 값."""
     R_bc, t_bc = camera_to_body(cfg["robot_geom"], servo_angles)
-    boxes, truth = build_shelf_scene(cfg, layout, shelf_pose, contents)
+    boxes, truth = build_shelf_scene(cfg, layout, shelf_pose, contents, shelf_id=shelf_id)
+    truth["shelf"]["id"] = shelf_id or sorted(layout.shelves)[0]
     raw = render(cam, R_bc, t_bc, boxes, wall_x=layout.front_x + layout.depth + 250.0, rays=rays)
     light = light or {}
     img = finish(raw, rng, **light)

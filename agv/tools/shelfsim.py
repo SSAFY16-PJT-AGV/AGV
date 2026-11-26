@@ -94,6 +94,8 @@ def main(argv=None):
     ap.add_argument("--pan-err", type=float, default=0.0, help="판정 쪽 1번(받침 좌우) 각도 오차(도, ±)")
     ap.add_argument("--cam-pos-err", type=float, default=0.0, help="판정 쪽 카메라 위치 오차(mm, ±, 앞·높이)")
     ap.add_argument("--focal-err", type=float, default=0.0, help="판정 쪽 초점거리 오차(%%, ±)")
+    ap.add_argument("--shelf", default=None,
+                    help="선반 노드(N01~N06). 없으면 장면마다 무작위. 판정에는 서버가 정한 선반으로 expect_shelf를 줌")
     ap.add_argument("--save", type=int, default=0, help="그림을 저장할 장면 수")
     ap.add_argument("--out", default=os.path.join(ROOT, "data", "shelfsim"))
     a = ap.parse_args(argv)
@@ -111,20 +113,25 @@ def main(argv=None):
     counts = {"ok": 0, "wrong": 0, "unknown": 0}
     wrong_cases = []
     pos_err, yaw_err, shelf_xy, shelf_yaw, times = [], [], [], [], []
-    shelf_miss = 0
+    shelf_miss = shelf_wrong = 0
+    shelves = sorted(layout.shelves)
     for i in range(a.n):
+        sid = a.shelf or shelves[rng.randint(len(shelves))]
         pose, contents = scene.random_case(rng, cfg, layout, a.stop_xy, a.stop_yaw, a.p_empty)
         light = {"gain": rng.uniform(a.gain[0], a.gain[1]), "noise": a.noise, "blur": a.blur,
                  "gradient": rng.uniform(-0.15, 0.15)}
-        img, truth = scene.render_case(cfg, cam, layout, pose, contents, servo, rng, rays=rays, light=light)
+        img, truth = scene.render_case(cfg, cam, layout, pose, contents, servo, rng, rays=rays, light=light,
+                                       shelf_id=sid)
         pcfg, pcam = perturbed(cfg, cam, rng, a)
         pservo = dict(servo)
         pservo["1"] = float(servo.get("1", 0.0)) + pcfg.pop("_pan_err", 0.0)
         t0 = time.time()
-        res = perceive_shelf(img, pcfg, pcam, pservo, ShelfLayout(pcfg))
+        res = perceive_shelf(img, pcfg, pcam, pservo, ShelfLayout(pcfg), expect_shelf=sid)
         times.append(time.time() - t0)
         sh = res["shelf"]
         if sh.get("ok"):
+            if sh["shelf_id"] != sid:
+                shelf_wrong += 1
             shelf_xy.append(math.hypot(sh["x_mm"] - pose[0], sh["y_mm"] - pose[1]))
             shelf_yaw.append(abs(sh["yaw_deg"] - pose[2]))
         else:
@@ -160,12 +167,12 @@ def main(argv=None):
             pe.mean(), np.percentile(pe, 95), pe.max(), len(pe)))
         print(u"박스 방향 오차(도)  평균 %.2f, 최대 %.2f" % (np.mean(yaw_err), np.max(yaw_err)))
     if shelf_xy:
-        print(u"선반 위치 오차      %.1fmm(평균) / %.1fmm(최대), 각도 %.2f도(최대)   선반 못 찾음 %d장" % (
-            np.mean(shelf_xy), np.max(shelf_xy), np.max(shelf_yaw), shelf_miss))
+        print(u"선반 위치 오차      %.1fmm(평균) / %.1fmm(최대), 각도 %.2f도(최대)   선반 못 찾음 %d장, 다른 선반 %d장" % (
+            np.mean(shelf_xy), np.max(shelf_xy), np.max(shelf_yaw), shelf_miss, shelf_wrong))
     print(u"판정 시간          평균 %.0fms (이 컴퓨터 기준)" % (1000 * np.mean(times)))
     if a.save:
         print(u"그림: %s/scene_*.png" % a.out)
-    return 0 if counts["wrong"] == 0 else 1
+    return 0 if counts["wrong"] == 0 and shelf_wrong == 0 else 1
 
 
 if __name__ == "__main__":
