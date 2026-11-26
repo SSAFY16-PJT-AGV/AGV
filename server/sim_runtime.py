@@ -133,6 +133,7 @@ class SimRuntime:
         self._started = False
         self._stopped = False
         self._prepared = {}
+        self._reroute_simulators = None
         self.store = self.gate = self.progress = self.inbox = self.receiver = self.workflow = self._client = None
         self.command_observations = self.command_observation_receiver = None
         self.investigation_notes = None
@@ -652,6 +653,33 @@ class SimRuntime:
         """Read classified simulator waits; never issue commands or release."""
         from server.sim_wait_graph import observe_wait_graph
         return observe_wait_graph(self)
+
+    def reroute_candidate(self, task_id):
+        """Calculate a non-executable candidate against verified virtual waits."""
+        from server.sim_reroute_candidate import propose_reroute
+        return propose_reroute(self, task_id)
+
+    def bind_reroute_simulators(self, robots):
+        """Bind local virtual executors once; never accept this from an API."""
+        from server.sim_order_authorization import SimOrderAuthorizer
+        from sim.mqtt_order_robot import SimMqttOrderRobot
+        from sim.order_executor import SimOrderExecutor
+        with self._lock:
+            if (not self._field_simulation or not self._started or self._stopped
+                    or self._reroute_simulators is not None or not isinstance(robots, dict)
+                    or set(robots) != set(self._sessions)):
+                raise ValueError('complete active field simulator mapping required')
+            for robot_id, robot in robots.items():
+                guard = getattr(robot, '_authorization_guard', None)
+                authorizer = getattr(guard, '__self__', None)
+                if (type(robot) is not SimMqttOrderRobot or robot.robot_id != robot_id
+                        or type(robot.executor) is not SimOrderExecutor
+                        or robot.port != self.port or type(authorizer) is not SimOrderAuthorizer
+                        or getattr(guard, '__func__', None) is not SimOrderAuthorizer.guard
+                        or authorizer.runtime is not self or authorizer.robot_id != robot_id
+                        or robot.executor._field_map != self.map_data):
+                    raise ValueError('simulator identity, authorizer or map differs')
+            self._reroute_simulators = dict(robots)
 
     def task_status(self, task_id):
         """Read a bounded, consistent allocation snapshot; never authorize movement."""

@@ -159,6 +159,11 @@ def wait_graph(runtime=Depends(_runtime)):
     return _invoke(runtime, "wait_graph")
 
 
+@router.get("/tasks/{task_id}/reroute-candidate")
+def reroute_candidate(task_id: str, runtime=Depends(_runtime)):
+    return _invoke(runtime, "reroute_candidate", task_id)
+
+
 @router.post("/tasks/{task_id}")
 def create_task(task_id: str, runtime=Depends(_runtime)):
     return _invoke(runtime, "create_task", task_id)

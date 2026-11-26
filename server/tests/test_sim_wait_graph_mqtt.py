@@ -30,12 +30,14 @@ from sim.order_inbox import SimOrderInbox
 
 def cycle_map():
     points = {'S1': [0, 0], 'W1': [100, 0], 'W2': [200, 0],
-              'D1': [300, 0], 'S2': [200, 100], 'D2': [100, -100]}
-    pairs = [('S1', 'W1'), ('W1', 'W2'), ('W2', 'D1'), ('S2', 'W2'), ('W1', 'D2')]
+              'D1': [300, 0], 'S2': [200, 100], 'D2': [100, -100],
+              'X': [100, 200], 'Y': [300, 200]}
+    pairs = [('S1', 'W1'), ('W1', 'W2'), ('W2', 'D1'), ('S2', 'W2'), ('W1', 'D2'),
+             ('W1', 'X'), ('X', 'Y'), ('Y', 'D1')]
     return {'map_id': 'wait-test', 'version': 1, 'unit': 'mm',
             'nodes': [{'id': name, 'pos': value} for name, value in points.items()],
-            'edges': [{'from': a, 'to': b, 'shape': [points[a], points[b]],
-                       'bidirectional': True, 'lanes': 1} for a, b in pairs],
+            'edges': [{'id': 'E' + str(i), 'from': a, 'to': b, 'shape': [points[a], points[b]],
+                       'bidirectional': True, 'lanes': 1} for i, (a, b) in enumerate(pairs)],
             'zones': [{'id': 'wait-' + name, 'type': 'waiting', 'node': name}
                       for name in ('W1', 'W2', 'D1', 'D2')]}
 
@@ -133,6 +135,12 @@ class SimWaitGraphMqttTest(unittest.TestCase):
                     self.assertEqual(graph['control_effect'], 'none')
                 self.assertEqual(read_tables(path), before)
 
+                proposal = runtime.reroute_candidate('T1')
+                self.assertEqual(proposal['status'], 'unknown')
+                self.assertEqual(proposal['reason'], 'direction_checkpoint_unavailable')
+                self.assertEqual(proposal['control_effect'], 'none')
+                self.assertEqual(read_tables(path), before)
+
                 # Corrupt evidence and an expired recovery proof must suppress
                 # the entire candidate, without modifying persistent state.
                 with closing(sqlite3.connect(path)) as db, db:
@@ -142,6 +150,7 @@ class SimWaitGraphMqttTest(unittest.TestCase):
                 graph = runtime.wait_graph()
                 self.assertEqual((graph['status'], graph['reason'], graph['cycle_candidates']),
                                  ('unknown', 'evidence_unavailable', []))
+                self.assertEqual(runtime.reroute_candidate('T1')['status'], 'unknown')
                 self.assertEqual(read_tables(path), corrupted)
                 with closing(sqlite3.connect(path)) as db, db:
                     db.execute("UPDATE sim_event_inbox SET digest=? WHERE event_id='event-T1'", (digest,))
@@ -164,6 +173,7 @@ class SimWaitGraphMqttTest(unittest.TestCase):
                 graph = runtime.wait_graph()
                 self.assertEqual(graph['status'], 'unknown')
                 self.assertEqual(graph['reason'], 'unclassified_pending')
+                self.assertEqual(runtime.reroute_candidate('T1')['status'], 'unknown')
                 self.assertEqual(graph['cycle_candidates'], [])
                 self.assertEqual(read_tables(path), before)
 
@@ -190,6 +200,7 @@ class SimWaitGraphMqttTest(unittest.TestCase):
                 graph = runtime.wait_graph()
                 self.assertEqual(graph['status'], 'unknown')
                 self.assertEqual(graph['reason'], 'receiver_unavailable')
+                self.assertEqual(runtime.reroute_candidate('T1')['status'], 'unknown')
                 self.assertEqual(graph['cycle_candidates'], [])
                 self.assertEqual(runtime.store.list_occupancy(), retained)
 

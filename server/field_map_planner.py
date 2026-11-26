@@ -123,14 +123,16 @@ def _v3_logical_overlap(data, edge, nodes):
     return True
 
 
-def plan_field_route(data, *, map_ref, incoming_edge, goal):
+def plan_field_route(data, *, map_ref, incoming_edge, goal, blocked_resources=None):
     """Compute a candidate path from the end of a known directed entry edge.
 
     Costs use team NavMap's edge-length precedence and 500 mm U-turn cost.
     An edge with ``~r`` means the inverse of a bidirectional main edge. The
     returned edge IDs exclude the already traversed incoming edge; repeated
     nodes are preserved. Neither input state freshness nor physical safety is
-    checked. No code here publishes a command or alters a reservation.
+    checked. Optional blocked_resources is a snapshot of exclusive node,
+    edge and shared-zone resources; avoiding it does not reserve the route.
+    No code here publishes a command or alters a reservation.
     """
     if not isinstance(data, dict):
         raise ValueError('map must be an object')
@@ -226,6 +228,69 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
                 raise ValueError('spur requires matching observable side and destination')
     main_goal = spurs[goal_spur][0] if goal_spur is not None else goal
 
+    # Do not remove edges from the map: doing so would change the meaning of
+    # crossing validation. Filter transitions only after validating the full
+    # map and its crossing rules. A blocked zone excludes all its nodes.
+    blocked = set()
+    blocked_nodes = set()
+    blocked_edges = set()
+    if blocked_resources is not None:
+        from server.segments import _edge_id
+        if not isinstance(blocked_resources, (set, frozenset)) or len(blocked_resources) > 16384:
+            raise ValueError('blocked resources must be a bounded set')
+        for item in blocked_resources:
+            if (not isinstance(item, tuple) or len(item) != 2
+                    or item[0] not in ('node', 'edge', 'zone')
+                    or not isinstance(item[1], str)):
+                raise ValueError('invalid blocked resource')
+        blocked = blocked_resources
+        zones = data.get('zones')
+        if not isinstance(zones, list):
+            raise ValueError('resource-aware routing requires explicit zones')
+        shared, zone_ids, waiting = {}, set(), set()
+        for zone in zones:
+            if not isinstance(zone, dict) or not isinstance(zone.get('id'), str) or not zone['id'] or zone['id'] in zone_ids:
+                raise ValueError('invalid zone')
+            zone_ids.add(zone['id'])
+            if zone.get('type') == 'waiting':
+                if zone.get('node') not in nodes:
+                    raise ValueError('invalid waiting zone')
+                waiting.add(zone['node'])
+            elif zone.get('type') == 'shared':
+                members = zone.get('nodes')
+                if (not isinstance(members, list) or not members or len(members) != len(set(members))
+                        or any(member not in nodes for member in members)):
+                    raise ValueError('invalid shared zone')
+                shared[zone['id']] = set(members)
+            else:
+                raise ValueError('invalid zone type')
+        if any(waiting & members for members in shared.values()):
+            raise ValueError('waiting zones cannot be shared')
+        valid_edges = {_edge_id(e['from'], e['to']) for e in raw_edges}
+        for kind, value in blocked:
+            if kind == 'node':
+                if value not in nodes: raise ValueError('unknown blocked node')
+                blocked_nodes.add(value)
+            elif kind == 'edge':
+                if value not in valid_edges: raise ValueError('unknown blocked edge')
+                blocked_edges.add(value)
+            else:
+                if value not in shared: raise ValueError('unknown blocked shared zone')
+                blocked_nodes.update(shared[value])
+
+    def resource_allows(source, target):
+        if blocked_resources is None:
+            return True
+        return target not in blocked_nodes and _edge_id(source, target) not in blocked_edges
+
+    start = spurs[start_spur][1] if start_spur is not None else arcs[incoming_edge][1]
+    if start in blocked_nodes:
+        raise ValueError('starting node overlaps a blocked resource')
+    if start_spur is not None and not resource_allows(start, spurs[start_spur][0]):
+        raise NoFieldRouteError('blocked spur exit')
+    if goal_spur is not None and not resource_allows(spurs[goal_spur][0], goal):
+        raise NoFieldRouteError('blocked spur goal')
+
     # Validate the complete forward crossing table, including its incident
     # edges. The reverse table follows mechanically via reverse arcs.
     crossing = {}
@@ -277,7 +342,8 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
         if main_goal == parent:
             seeds = []
         else:
-            seeds = [(eid, arcs[eid][3]) for eid in outs[parent]]
+            seeds = [(eid, arcs[eid][3]) for eid in outs[parent]
+                     if resource_allows(arcs[eid][0], arcs[eid][1])]
             if not seeds:
                 raise NoFieldRouteError('spur parent has no main-line arc')
     distance = {eid: cost for eid, cost in seeds}
@@ -305,6 +371,8 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal):
         if reverse is not None and can_uturn:
             candidates.append(reverse)
         for candidate in candidates:
+            if not resource_allows(arcs[candidate][0], arcs[candidate][1]):
+                continue
             extra = arcs[candidate][3] + (_UTURN_MM if candidate == reverse else 0.0)
             value = dist + extra
             if not math.isfinite(value):

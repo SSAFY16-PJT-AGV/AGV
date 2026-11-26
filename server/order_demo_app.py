@@ -906,6 +906,8 @@ async def lifespan(app):
                             logging.getLogger(__name__).exception('saved simulated stop could not be verified')
                 robot.start()
                 cleanup.callback(robot.stop)
+            if field_mapping is not None:
+                runtime.bind_reroute_simulators({robot_id: item.robot for robot_id, item in engines.items()})
             inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in products}, store=journal)
                          if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
             engine = FleetProductControlEngine(engines, sim_map, inventory=inventory) if fleet_enabled else engines['sim-r1']
