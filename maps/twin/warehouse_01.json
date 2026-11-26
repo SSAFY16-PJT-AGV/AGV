@@ -1,0 +1,399 @@
+{
+  "map_id": "warehouse_01",
+  "coordinate_unit": "meter",
+  "nodes": [
+    {
+      "id": "J01",
+      "x": 0.198,
+      "y": 0.148,
+      "type": "junction"
+    },
+    {
+      "id": "J02",
+      "x": 0.8135,
+      "y": 0.148,
+      "type": "junction"
+    },
+    {
+      "id": "J03",
+      "x": 1.1685,
+      "y": 0.148,
+      "type": "junction"
+    },
+    {
+      "id": "J04",
+      "x": 1.784,
+      "y": 0.148,
+      "type": "junction"
+    },
+    {
+      "id": "J05",
+      "x": 1.784,
+      "y": 0.868,
+      "type": "junction"
+    },
+    {
+      "id": "J06",
+      "x": 1.1685,
+      "y": 0.868,
+      "type": "junction"
+    },
+    {
+      "id": "J07",
+      "x": 0.8135,
+      "y": 0.868,
+      "type": "junction"
+    },
+    {
+      "id": "J08",
+      "x": 0.198,
+      "y": 0.868,
+      "type": "junction"
+    },
+    {
+      "id": "N01",
+      "x": 0.466,
+      "y": 0.148,
+      "type": "access",
+      "color": "orange",
+      "group": "G01"
+    },
+    {
+      "id": "N02",
+      "x": 0.343,
+      "y": 0.868,
+      "type": "access",
+      "color": "blue",
+      "group": "G02"
+    },
+    {
+      "id": "N03",
+      "x": 0.693,
+      "y": 0.868,
+      "type": "access",
+      "color": "red",
+      "group": "G02"
+    },
+    {
+      "id": "N04",
+      "x": 1.256,
+      "y": 0.148,
+      "type": "access",
+      "color": "purple",
+      "group": "G03"
+    },
+    {
+      "id": "N05",
+      "x": 1.606,
+      "y": 0.148,
+      "type": "access",
+      "color": "green",
+      "group": "G03"
+    },
+    {
+      "id": "N06",
+      "x": 1.493,
+      "y": 0.868,
+      "type": "access",
+      "color": "yellow",
+      "group": "G04"
+    },
+    {
+      "id": "N07",
+      "x": 0.148,
+      "y": 0.508,
+      "type": "access",
+      "color": "pink",
+      "group": "G05",
+      "size_m": 0.149
+    },
+    {
+      "id": "N08",
+      "type": "access",
+      "x": 1.834,
+      "y": 0.508,
+      "color": "skyblue",
+      "group": "G06",
+      "size_m": 0.149
+    },
+    {
+      "id": "D01",
+      "x": 0.466,
+      "y": 0.0,
+      "type": "destination"
+    },
+    {
+      "id": "D02",
+      "x": 0.343,
+      "y": 1.016,
+      "type": "destination"
+    },
+    {
+      "id": "D03",
+      "x": 0.693,
+      "y": 1.016,
+      "type": "destination"
+    },
+    {
+      "id": "D04",
+      "x": 1.256,
+      "y": 0.0,
+      "type": "destination"
+    },
+    {
+      "id": "D05",
+      "x": 1.606,
+      "y": 0.0,
+      "type": "destination"
+    },
+    {
+      "id": "D06",
+      "x": 1.493,
+      "y": 1.016,
+      "type": "destination"
+    },
+    {
+      "id": "D07",
+      "x": 0.0,
+      "y": 0.508,
+      "type": "destination",
+      "purpose": "charging"
+    },
+    {
+      "id": "D08",
+      "type": "destination",
+      "x": 1.982,
+      "y": 0.508,
+      "purpose": "charging"
+    }
+  ],
+  "edges": [
+    {
+      "from": "J01",
+      "to": "N01",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N01",
+      "to": "J02",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "J02",
+      "to": "J03",
+      "type": "connector",
+      "points": []
+    },
+    {
+      "from": "J03",
+      "to": "N04",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N04",
+      "to": "N05",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N05",
+      "to": "J04",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "J04",
+      "to": "N08",
+      "type": "main",
+      "points": [
+        {
+          "x": 1.819,
+          "y": 0.163
+        },
+        {
+          "x": 1.834,
+          "y": 0.198
+        }
+      ]
+    },
+    {
+      "from": "N08",
+      "to": "J05",
+      "type": "main",
+      "points": [
+        {
+          "x": 1.834,
+          "y": 0.818
+        },
+        {
+          "x": 1.819,
+          "y": 0.853
+        }
+      ]
+    },
+    {
+      "from": "J05",
+      "to": "N06",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N06",
+      "to": "J06",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "J06",
+      "to": "J07",
+      "type": "connector",
+      "points": []
+    },
+    {
+      "from": "J07",
+      "to": "N03",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N03",
+      "to": "N02",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "N02",
+      "to": "J08",
+      "type": "main",
+      "points": []
+    },
+    {
+      "from": "J08",
+      "to": "N07",
+      "type": "main",
+      "points": [
+        {
+          "x": 0.163,
+          "y": 0.853
+        },
+        {
+          "x": 0.148,
+          "y": 0.818
+        }
+      ]
+    },
+    {
+      "from": "N07",
+      "to": "J01",
+      "type": "main",
+      "points": [
+        {
+          "x": 0.148,
+          "y": 0.198
+        },
+        {
+          "x": 0.163,
+          "y": 0.163
+        }
+      ]
+    },
+    {
+      "from": "J02",
+      "to": "J07",
+      "type": "main",
+      "points": [
+        {
+          "x": 0.8435,
+          "y": 0.178
+        },
+        {
+          "x": 0.8535,
+          "y": 0.218
+        },
+        {
+          "x": 0.8535,
+          "y": 0.798
+        },
+        {
+          "x": 0.8435,
+          "y": 0.838
+        }
+      ]
+    },
+    {
+      "from": "J03",
+      "to": "J06",
+      "type": "main",
+      "points": [
+        {
+          "x": 1.1385,
+          "y": 0.178
+        },
+        {
+          "x": 1.1285,
+          "y": 0.218
+        },
+        {
+          "x": 1.1285,
+          "y": 0.798
+        },
+        {
+          "x": 1.1385,
+          "y": 0.838
+        }
+      ]
+    },
+    {
+      "from": "N01",
+      "to": "D01",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N02",
+      "to": "D02",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N03",
+      "to": "D03",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N04",
+      "to": "D04",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N05",
+      "to": "D05",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N06",
+      "to": "D06",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N07",
+      "to": "D07",
+      "type": "destination",
+      "points": []
+    },
+    {
+      "from": "N08",
+      "to": "D08",
+      "type": "destination",
+      "points": []
+    }
+  ],
+  "path_width_m": 0.02
+}

@@ -23,7 +23,12 @@
   },
   "patch": {
     "_length_note": "색 패치의 진행 방향 길이(mm, 자로 한 번 잼). 넣으면 패치를 지날 때마다 실제 속도를 다시 재서 이동거리를 보정한다(배터리·바닥 차이). null이면 끔.",
-    "length_mm": null
+    "length_mm": null,
+    "_length_by_color_note": "길이가 다른 패치만 색별로(mm). 새 매트(ssafy_v3)의 충전 패치 N07 분홍·N08 하늘은 14.9cm 정사각형.",
+    "length_mm_by_color": {
+      "pink": 149.0,
+      "skyblue": 149.0
+    }
   },
   "follow": {
     "base_speed": 0.3,

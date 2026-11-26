@@ -560,7 +560,7 @@ class TestSimSpur(unittest.TestCase):
         dx, dy = pose[0] - jx, pose[1] - jy
         return dx * ux + dy * uy, abs(-dx * uy + dy * ux), L
 
-    def _park_then(self, goal, nxt, seed, start="P_orange"):
+    def _park_then(self, goal, nxt, seed, start="P_orange", cfg=None):
         nav = Navigator(self.m, goal=goal, start=start, hold_at_end=True)
         st = {"t": None, "pose": None, "sent": False}
         orig = Mat.camera_view
@@ -579,15 +579,16 @@ class TestSimSpur(unittest.TestCase):
                 self.assertTrue(runner.resume())
         Mat.camera_view = cam
         try:
-            ev, gt = run_sim.run(MAT_V2, self.tmp, seed=seed, max_time_s=120, policy=nav, on_step=on_step)
+            ev, gt = run_sim.run(MAT_V2, self.tmp, seed=seed, max_time_s=120, policy=nav, on_step=on_step,
+                                 cfg_override=cfg)
         finally:
             Mat.camera_view = orig
         with io.open(ev, encoding="utf-8") as f:
             msgs = [json.loads(l).get("msg") for l in f]
         return st["pose"], gt, msgs
 
-    def _check(self, goal, nxt, seed, min_depth):
-        pose, gt, msgs = self._park_then(goal, nxt, seed)
+    def _check(self, goal, nxt, seed, min_depth, cfg=None):
+        pose, gt, msgs = self._park_then(goal, nxt, seed, cfg=cfg)
         self.assertIsNotNone(pose, msgs)
         depth, side, L = self._in_spur(pose, goal)
         self.assertGreater(depth, min_depth, (depth, L))
@@ -609,9 +610,16 @@ class TestSimSpur(unittest.TestCase):
         self._check("D_P_red", "P_blue", 1, 120.0)
 
     def test_missed_spur_retries_next_lap(self):
-        """렌즈 오른쪽 가지로 와서 흔들리는 채로 초록을 지나면 스퍼를 놓친다: 한 바퀴 돌아 다시 들어간다."""
-        msgs = self._check("D_P_green", "P_red", 3, 120.0)
+        """렌즈 오른쪽 가지로 와서 흔들리는 채로 초록을 지나면 스퍼를 놓친다: 한 바퀴 돌아 다시 들어간다.
+        지금 스퍼 검출(비스듬한 스퍼도 봄)은 이 경우를 잡으므로, 놓치게 예전 검출 설정으로 돌린다."""
+        old = {"tee": {"clear_need": 2, "join_gap_k": 0.0}}
+        msgs = self._check("D_P_green", "P_red", 3, 120.0, cfg=old)
         self.assertIn("nav_spur_retry", msgs)
+
+    def test_swaying_spur_now_seen(self):
+        """같은 경우를 지금 검출 설정으로: 한 번에 들어간다."""
+        msgs = self._check("D_P_green", "P_red", 3, 120.0)
+        self.assertNotIn("nav_spur_retry", msgs)
 
 
 if __name__ == "__main__":

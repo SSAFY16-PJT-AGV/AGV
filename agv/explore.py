@@ -22,18 +22,18 @@
     python3 -m agv.explore --mode drive --enable-motors --view
 
     # 4) 완성된 맵에서 목표 패치로 가기(주황 패치 조금 앞에 놓고 출발, 목표 패치 가운데에서 멈춤)
-    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to P_green --enable-motors
+    python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --start N01 --to N05 --enable-motors
     #    스퍼 끝에 주차했다가 3초 뒤 후진해 나와 파랑으로(--then은 쉼표로 여러 개)
-    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --to D_P_red --then P_blue --enable-motors
+    python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --start N01 --to D03 --then N02 --enable-motors
     #    반대 방향(탐색과 반대로 놓음)으로 출발. 목표가 뒤쪽이면 패치 가운데·스퍼 끝에서 유턴
-    python3 -m agv.explore --mode goto --map maps/field_v2.json --start P_orange --reverse --to P_blue --enable-motors
+    python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --start N01 --reverse --to N07 --enable-motors
     #    정해진 경로 따라가기(서버 주문의 nodes와 같은 뜻)
-    python3 -m agv.explore --mode goto --map maps/field_v2.json --route P_orange,S1,M1,P_purple --enable-motors
+    python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --route N01,J02,J07,N03 --enable-motors
     #    모터 없이 위치 추적만 확인(손으로 밀기·녹화 영상): passive에 --map
     python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4 --map maps/field_v2.json
 
     # 5) 서버 주문으로 움직이기(MQTT): 시작 노드 조금 앞에 놓고 첫 주문을 기다림. agv/link/
-    MQTT_HOST=192.168.0.10 python3 -m agv.explore --mode serve --map maps/mat_ssafy_v2.json --start P_orange --enable-motors
+    MQTT_HOST=192.168.0.10 python3 -m agv.explore --mode serve --map maps/mat_ssafy_v3.json --start N01 --enable-motors
     python3 -m agv.explore --camera video:data/runs/<run>/camera.mp4 --map maps/field_v2.json
 
 카메라로 찍을 때는 시작하면서 저장해 둔 카메라 자세(arm.servo_angles, camtool arm으로 정함)로 팔을 맞춘다.

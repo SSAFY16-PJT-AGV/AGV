@@ -572,7 +572,7 @@ class ExploreRunner(object):
         if self.state != "follow":
             self.cal.reset()
         else:
-            res = self.cal.update(an, self.u, self.last_cmd)
+            res = self.cal.update(an, self.u, self.last_cmd, self.patch.active)
             if res is not None:
                 self.speed_mm_s = self.cal.k
                 self.log.log("note", self._odo(), msg="speed_cal", color=self.patch.active, **res)

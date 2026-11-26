@@ -7,16 +7,16 @@
     python3 sim/link_demo.py --host 127.0.0.1 --port 1883
 
     # 작은 배차기까지: 경로를 구간으로 나눠 rear_clear를 받을 때마다 다음 해제를 보냄
-    python3 sim/link_demo.py --dispatch P_orange,S1,M1,P_purple,S2,V_E15,M2,P_green \\
-        --releases P_purple,V_E15,P_green --then P_green,M2,S2,P_purple,M1,S1,P_orange,D_P_orange
+    python3 sim/link_demo.py --dispatch N01,J02,J07,N03,D03 \\
+        --releases J07,D03 --then D03,N03,N02,N07,N01,D01
 
     # 실물 로봇에 배차기만(가상 로봇 없이). 젯슨에서 serve 모드를 먼저 띄워 둔다
     python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \
-        --dispatch P_orange,S1,M3,P_red --then P_red,P_blue,P_orange
+        --dispatch N01,J02,J07,N03 --then N03,N02,N07,N01
 
     # 주문 하나를 손으로(mosquitto_pub)
-    mosquitto_pub -t agv/sim-r1/order -q 1 -m '{"order_id":"T1","seq":1,"map_id":"mat_ssafy_v2@v0",
-        "nodes":["P_orange","S1","M3","P_red"],"released_until":"P_red","action_at_end":{"type":"none"}}'
+    mosquitto_pub -t agv/sim-r1/order -q 1 -m '{"order_id":"T1","seq":1,"map_id":"mat_ssafy_v3@v0",
+        "nodes":["N01","J02","J07","N03"],"released_until":"N03","action_at_end":{"type":"none"}}'
 
 토픽: agv/<id>/order(받음), agv/<id>/state(5Hz), agv/<id>/event(rear_clear), agv/<id>/conn(online/offline).
 로봇 ID 기본값 sim-r1은 서버 브랜치의 트윈 매핑(AGV_TWIN_ROBOT_MAP {"sim-r1":"AGV_01"})과 맞춘 것이다.
@@ -119,9 +119,9 @@ def main(argv=None):
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--robot-id", default="sim-r1")
-    ap.add_argument("--map", default=os.path.join(ROOT, "maps", "mat_ssafy_v2.json"))
-    ap.add_argument("--mat", default=os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v2.json"))
-    ap.add_argument("--start", default="P_orange", help="놓은 자리 바로 앞 노드(가상 매트 기본 출발점은 주황 앞)")
+    ap.add_argument("--map", default=os.path.join(ROOT, "maps", "mat_ssafy_v3.json"))
+    ap.add_argument("--mat", default=os.path.join(ROOT, "sim", "mat", "mats", "ssafy_v3.json"))
+    ap.add_argument("--start", default="N01", help="놓은 자리 바로 앞 노드(가상 매트 기본 출발점은 N01 주황 앞)")
     ap.add_argument("--start-pose", default=None,
                     help="가상 매트에 놓을 자세 x,y,각도(도) mm. --start 노드 바로 앞이어야 함(예: 파랑 앞 528,188.3,180)")
     ap.add_argument("--waiting", default="zones", choices=["zones", "all"],

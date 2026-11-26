@@ -56,6 +56,7 @@ SKIP_COST = {"via": 0.0, "merge": 1.0, "cross": 1.0, "tee": 1.0, "split": 2.0}
 SPURIOUS_COST = {"merge": 1.0, "cross": 1.0, "tee": 1.0}
 NODE_OF_EVENT = {"patch": "patch", "split": "split", "merge": "merge", "cross": "cross", "tee": "tee"}
 ABSORB_MM = 200.0          # 패치에서 이 거리 안의 스퍼·교차 이벤트는 패치의 일부
+MERGE_ON_PATCH_MM = 80.0   # 합류점 바로 뒤 패치까지 이보다 짧으면 합류점이 패치에 겹친 것(합류 판정이 패치에 묻힘)
 SLACK = 1.0                # 가장 싼 가설보다 이만큼 비싼 가설까지 남김
 CHOICE_SLACK = 0.5         # 갈림길 고를 때 쓰는 해석의 비용 폭
 MAX_HYPS = 40
@@ -90,6 +91,8 @@ class Navigator(object):
         self._route_pos = 0         # 경로에서 마지막으로 지난(또는 서 있는) 노드의 순번
         self._target_i = None       # 해제 노드의 경로 순번(같은 노드가 경로에 두 번 나올 수 있음)
         self.at_node = None         # 대기 중인 노드
+        self._patch_stop_pos = None   # 패치에 선 경우 그 패치를 본 이동거리
+        self._merge_hold = {}       # 패치 -> 그 패치에 겹친 합류점(해제 노드가 합류점이면 패치에서 섬)
         self._stop = None
         self._early = None          # 미리 정지를 요청한 목표 패치(on_patch_early)
         self._dead_now = None
@@ -150,9 +153,26 @@ class Navigator(object):
         self.route = list(nodes)
         self._route_pos = 0
         self.final = nodes[-1]
-        self.target = release
-        self._target_i = self._route_index(release)
+        self._target_i = self._hold_index(self._route_index(release))
+        self.target = self.route[self._target_i] if self._target_i is not None else release
         self._after_new_target()
+
+    def _hold_index(self, i):
+        """해제 노드가 패치에 겹친 합류점이면(합류점 -> 다음 패치 엣지가 MERGE_ON_PATCH_MM보다 짧음)
+        그 패치에서 선다. 합류 판정은 겹친 패치에 묻혀 안 나오고, 바로 패치가 보이면 해제 노드를 지난 것으로
+        보여 nav_off_route가 났다(새 매트 J03-N04, J07-N03). 서버에 보내는 stopped_at은 controller가
+        주문의 해제 노드로 보내므로 그대로다. 두 자리는 사실상 같은 곳이다."""
+        if i is None or i + 1 >= len(self.route):
+            return i
+        n, nxt = self.route[i], self.route[i + 1]
+        if self.m.kind(n) != "merge" or self.m.kind(nxt) != "patch":
+            return i
+        for e in self.m.edges_out_of(n):
+            if self.m.edges[e]["to"] == nxt and self.m.edges[e]["len"] < MERGE_ON_PATCH_MM:
+                self._note("nav_merge_on_patch", node=n, hold_at=nxt)
+                self._merge_hold[nxt] = n
+                return i + 1
+        return i
 
     def _route_index(self, node):
         """경로에서 node의 순번: 지금 위치 다음에 처음 나오는 곳(경로 첫 노드에 서 있으면 0)."""
@@ -184,11 +204,24 @@ class Navigator(object):
         if self.route is None or release not in self.route:
             raise ValueError(u"지금 경로에 없는 해제 노드: %s" % release)
         i = self._route_index(release)
-        if i is None or (self._target_i is not None and i < self._target_i):
+        if i is None or (self._target_i is not None and i < self._target_i - 1):
             raise ValueError(u"해제 노드를 줄일 수는 없어요")
-        self.target = release
+        i = max(self._hold_index(i), self._target_i or 0)
+        self.target = self.route[i]
         self._target_i = i
         self._after_new_target()
+
+    def _spur_next(self, node):
+        """경로에서 node(패치) 다음이 그 패치의 스퍼 끝인가."""
+        if self.route is None or self._target_i is None or self.route[self._target_i] != node:
+            return False
+        i = self._target_i + 1
+        return i < len(self.route) and self.m.kind(self.route[i]) == "spur_end" \
+            and self.m.spur_parent(self.route[i]) == node
+
+    def holds_for(self, release):
+        """release(주문의 해제 노드)에 서 있다고 봐도 되나: 그 노드에 섰거나, 그 합류점이 겹친 패치에 섰음."""
+        return self.at_node is not None and (self.at_node == release or self._merge_hold.get(self.at_node) == release)
 
     def check_node(self, n):
         """목표로 쓸 수 있는 노드인지 확인한다(아니면 ValueError)."""
@@ -219,6 +252,12 @@ class Navigator(object):
             # 이미 그 자리에 서 있음
             self._request_stop(None, self.target)
             return
+        if self.at_node is not None and self.spur is None and self._patch_stop_pos is not None \
+                and self._approach(self.target) == self.at_node and self.target != self.at_node:
+            # 스퍼 부모 패치 앞에 서 있다가 그 스퍼로: 다시 가면서 스퍼 갈림을 찾음
+            self._arm_spur(self.at_node, self._patch_stop_pos)
+            self._note("nav_target", target=self.target, final=self.final, route=self.route, start=self.where())
+            return
         if self.at_node is not None and self.m.kind(self.at_node) == "patch" and self.spur is None:
             # 패치 가운데에 서 있다가 새 목표: 되돌아가는 게 싸면 그 자리에서 유턴
             self._maybe_uturn(self.at_node, None)
@@ -244,6 +283,9 @@ class Navigator(object):
         if reason is None:
             reason = "nav_hold" if hold else "nav_arrived"
         off = self.stop_offset_mm if (pos is not None and self.m.kind(node) == "patch") else 0.0
+        if off and self._spur_next(node):
+            off = 0.0       # 경로가 이 패치의 스퍼로 이어짐: 스퍼 갈림 앞(패치 앞 가장자리)에서 서야 나중에 들어감
+        self._patch_stop_pos = pos if self.m.kind(node) == "patch" else None
         self._stop = {"pos": None if pos is None else pos + off, "reason": reason, "hold": hold,
                       "node": node}
         self.at_node = node
