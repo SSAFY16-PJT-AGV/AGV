@@ -1,0 +1,203 @@
+--- a/Source/agvSimulation/AGVRobot.h
++++ b/Source/agvSimulation/AGVRobot.h
+@@ -94,6 +94,10 @@
+ 
+     UFUNCTION(BlueprintCallable, Category = "AGV|External")
+     bool ApplyExternalGrabSuccess(EProductType ProductType);
++    // Opt-in v3 team-slot pilot, never used by legacy robot.action.
++    bool TeamSlotTargetMatches(int32 SlotId, double X, double Y) const;
++    bool ApplyTeamSlotPick(int32 SlotId);
++    bool ApplyTeamSlotPlace(int32 SlotId);
+     // Demo pickup inventory; false means the world cannot be proven valid.
+     static bool GetPickupAvailability(UWorld* World, EProductType ProductType,
+         int32& OutCount, FVector& OutCenter);
+--- a/Source/agvSimulation/AGVRobot.cpp
++++ b/Source/agvSimulation/AGVRobot.cpp
+@@ -808,6 +808,89 @@
+     return true;
+ }
+ 
++// The pilot binds milk to the existing Red demo asset. It is synthetic and
++// intentionally does not claim support for the other team product types yet.
++static bool TeamSlotStop(UWorld* World, int32 SlotId, FVector& Out)
++{
++    if (!IsValid(World) || !IsInGameThread() || SlotId < 1 || SlotId > 8) return false;
++    AWarehouseMapLoader* Loader = nullptr;
++    for (TActorIterator<AWarehouseMapLoader> It(World); It; ++It)
++    {
++        if (!IsValid(*It) || Loader) return false;
++        Loader = *It;
++    }
++    if (!Loader || Loader->LoadedMapId != TEXT("mat_ssafy_v3")) return false;
++    const FString NodeId = SlotId <= 4 ? TEXT("D01") : TEXT("D02");
++    int32 Matches = 0;
++    for (const FWarehouseNode& Node : Loader->Nodes)
++        if (Node.Id == NodeId) { Out = Node.Position; ++Matches; }
++    return Matches == 1 && !Out.ContainsNaN();
++}
++
++bool AAGVRobot::TeamSlotTargetMatches(int32 SlotId, double X, double Y) const
++{
++    FVector Node;
++    if (!FMath::IsFinite(X) || !FMath::IsFinite(Y) || !TeamSlotStop(GetWorld(), SlotId, Node)) return false;
++    const float Scale = GetExternalPositionScale();
++    return FMath::IsFinite(Scale) && Scale > 0 &&
++        FVector::Dist2D(Node, FVector(X * Scale, Y * Scale, Node.Z)) <= 0.1f &&
++        FVector::Dist2D(GetActorLocation(), Node) <= 25.0f;
++}
++
++bool AAGVRobot::ApplyTeamSlotPick(int32 SlotId)
++{
++    if (SlotId < 1 || SlotId > 4 || MovementMode != EAGVMovementMode::External ||
++        !IsValid(GrabPoint) || IsValid(HeldActor)) return false;
++    FVector Node;
++    if (!TeamSlotStop(GetWorld(), SlotId, Node) || FVector::Dist2D(GetActorLocation(), Node) > 25.0f) return false;
++    const FName Tag(*FString::Printf(TEXT("TEAM_V3_SLOT_%d"), SlotId));
++    AAGVGrabbableObject* Selected = nullptr;
++    for (TActorIterator<AAGVGrabbableObject> It(GetWorld()); It; ++It)
++    {
++        AAGVGrabbableObject* Candidate = *It;
++        if (!IsValid(Candidate)) return false;
++        if (!Candidate->ActorHasTag(Tag)) continue;
++        if (Selected) return false;
++        Selected = Candidate;
++    }
++    if (!IsValid(Selected) || Selected->bIsGrabbed || Selected->GetProductType() != EProductType::Red ||
++        FVector::Dist2D(Selected->GetActorLocation(), Node) > 12.0f) return false;
++    for (TActorIterator<AAGVDisplayShelf> It(GetWorld()); It; ++It)
++        if (!IsValid(*It) || It->FindProductSlot(Selected) != INDEX_NONE) return false;
++    Selected->Grab(GrabPoint);
++    if (!Selected->bIsGrabbed) return false;
++    HeldActor = Selected;
++    return true;
++}
++
++bool AAGVRobot::ApplyTeamSlotPlace(int32 SlotId)
++{
++    if (SlotId < 5 || SlotId > 8 || MovementMode != EAGVMovementMode::External ||
++        !IsValid(HeldActor) || HeldActor->GetProductType() != EProductType::Red) return false;
++    FVector Node;
++    if (!TeamSlotStop(GetWorld(), SlotId, Node) || FVector::Dist2D(GetActorLocation(), Node) > 25.0f) return false;
++    AAGVDisplayShelf* Shelf = nullptr;
++    for (TActorIterator<AAGVDisplayShelf> It(GetWorld()); It; ++It)
++    {
++        if (!IsValid(*It)) return false;
++        if (It->GetShelfId() != TEXT("SHELF_RED")) continue;
++        if (Shelf) return false;
++        Shelf = *It;
++    }
++    if (!IsValid(Shelf) || !Shelf->ActorHasTag(TEXT("TEAM_V3_SHELF")) || Shelf->GetSlotCount() != 4 ||
++        Shelf->GetShelfProductType() != EProductType::Red ||
++        FVector::Dist2D(Shelf->GetActorLocation(), Node) > 10.0f || Shelf->IsSlotOccupied(SlotId - 5)) return false;
++    if (!Shelf->PlaceProductAtSlot(HeldActor, SlotId - 5)) return false;
++    for (int32 Index = 1; Index <= 4; ++Index)
++        HeldActor->Tags.Remove(FName(*FString::Printf(TEXT("TEAM_V3_SLOT_%d"), Index)));
++    HeldActor->Tags.AddUnique(FName(*FString::Printf(TEXT("TEAM_V3_SLOT_%d"), SlotId)));
++    HeldActor = nullptr;
++    if (IsValid(PlacementPreview)) PlacementPreview->HidePreview();
++    AimedShelf = nullptr;
++    AimedSlotIndex = INDEX_NONE;
++    return true;
++}
++
+ bool AAGVRobot::CanGrabObject() const
+ {
+     return IsValid(TargetActor) && !IsValid(HeldActor);
+--- a/Source/agvSimulation/AGVDisplayShelf.cpp
++++ b/Source/agvSimulation/AGVDisplayShelf.cpp
+@@ -75,6 +75,19 @@
+ void AAGVDisplayShelf::BeginPlay()
+ {
+     Super::BeginPlay();
++
++    // Team-slot pilot is opt-in per isolated scene actor. Other shelves keep
++    // the original six slots and their existing Blueprint behaviour.
++    if (ActorHasTag(TEXT("TEAM_V3_SHELF")))
++    {
++        if (Slots.Num() < 4) return;
++        Slots.SetNum(4);
++        for (int32 Index = 0; Index < 4; ++Index)
++        {
++            if (!IsValid(Slots[Index])) return;
++            Slots[Index]->SetRelativeLocation(FVector(-5.0f, -105.0f + Index * 70.0f, 45.0f));
++        }
++    }
+ 
+     // 슬롯 수만큼 초기화
+     OccupiedSlots.Init(nullptr, Slots.Num());
+--- a/Source/agvSimulation/AGVWebSocketClient.h
++++ b/Source/agvSimulation/AGVWebSocketClient.h
+@@ -59,6 +59,7 @@
+     TSharedPtr<IWebSocket> Socket;
+     // Fresh for each actor/world lifetime; never changed by reconnecting.
+     FString RecoveryWorldId;
++    TSet<FString> SeenTeamSlotActions;
+     TWeakObjectPtr<UWorld> RecoveryWorld;
+ 
+     void HandleMessage(const FString& Message);
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -492,6 +492,63 @@
+     }
+ 
+     // 실제 AGV의 집기 / 놓기 결과 처리
++    // A distinct type prevents an old client from silently ignoring slot_id.
++    if (MessageType == TEXT("team.shelf.action.v1"))
++    {
++        const TSharedPtr<FJsonObject>* Data = nullptr;
++        FString WorldId, RequestId, ActionId, RobotId, Action, ShelfId, Product;
++        double Slot = 0, Index = -1, X = 0, Y = 0;
++        if (!RootObject->TryGetObjectField(TEXT("data"), Data) || !Data || !Data->IsValid() ||
++            (*Data)->Values.Num() != 11 ||
++            !(*Data)->TryGetStringField(TEXT("world_id"), WorldId) ||
++            !(*Data)->TryGetStringField(TEXT("request_id"), RequestId) ||
++            !(*Data)->TryGetStringField(TEXT("action_id"), ActionId) ||
++            !(*Data)->TryGetStringField(TEXT("agv_id"), RobotId) ||
++            !(*Data)->TryGetStringField(TEXT("action"), Action) ||
++            !(*Data)->TryGetStringField(TEXT("shelf_id"), ShelfId) ||
++            !(*Data)->TryGetStringField(TEXT("product_type"), Product) ||
++            !(*Data)->TryGetNumberField(TEXT("slot_id"), Slot) ||
++            !(*Data)->TryGetNumberField(TEXT("slot_index"), Index) ||
++            !(*Data)->TryGetNumberField(TEXT("expected_x"), X) ||
++            !(*Data)->TryGetNumberField(TEXT("expected_y"), Y) ||
++            RequestId.IsEmpty() || RequestId.Len() > 128 || ActionId.IsEmpty() || ActionId.Len() > 128 ||
++            (RobotId != TEXT("AGV_01") && RobotId != TEXT("AGV_02")) || Product != TEXT("milk") ||
++            !FMath::IsFinite(Slot) || FMath::FloorToDouble(Slot) != Slot || Slot < 1 || Slot > 8 ||
++            !FMath::IsFinite(Index) || FMath::FloorToDouble(Index) != Index || Index < 0 || Index > 3 ||
++            static_cast<int32>(Index) != (static_cast<int32>(Slot) - 1) % 4 ||
++            !FMath::IsFinite(X) || !FMath::IsFinite(Y) || FMath::Abs(X) > 1000 || FMath::Abs(Y) > 1000 ||
++            !((Action == TEXT("pick") && ShelfId == TEXT("N01") && Slot <= 4) ||
++              (Action == TEXT("place") && ShelfId == TEXT("N02") && Slot >= 5)) || !Socket.IsValid()) return;
++
++        TWeakObjectPtr<AAGVWebSocketClient> WeakSelf(this);
++        TWeakPtr<IWebSocket> RequestSocket(Socket);
++        TSharedPtr<FJsonObject> ActionData = *Data;
++        const int32 SlotId = static_cast<int32>(Slot);
++        AsyncTask(ENamedThreads::GameThread, [WeakSelf, RequestSocket, ActionData, WorldId, ActionId, RobotId, Action, SlotId, X, Y]()
++        {
++            AAGVWebSocketClient* Self = WeakSelf.Get();
++            TSharedPtr<IWebSocket> Connection = RequestSocket.Pin();
++            if (!IsValid(Self) || !Connection.IsValid() || Self->Socket != Connection || !Connection->IsConnected() ||
++                !Self->GetWorld() || Self->RecoveryWorld.Get() != Self->GetWorld() ||
++                Self->RecoveryWorldId.IsEmpty() || Self->RecoveryWorldId != WorldId ||
++                Self->SeenTeamSlotActions.Contains(ActionId) || Self->SeenTeamSlotActions.Num() >= 4096) return;
++            Self->SeenTeamSlotActions.Add(ActionId);
++            AAGVRobot* Robot = Self->FindRobotById(RobotId);
++            bool Applied = IsValid(Robot) && Robot->TeamSlotTargetMatches(SlotId, X, Y);
++            if (Applied) Applied = Action == TEXT("pick") ? Robot->ApplyTeamSlotPick(SlotId) : Robot->ApplyTeamSlotPlace(SlotId);
++            TSharedRef<FJsonObject> AckData = MakeShared<FJsonObject>();
++            AckData->Values = ActionData->Values;
++            AckData->SetBoolField(TEXT("applied"), Applied);
++            TSharedRef<FJsonObject> Ack = MakeShared<FJsonObject>();
++            Ack->SetStringField(TEXT("type"), TEXT("team.shelf.action.result.v1"));
++            Ack->SetObjectField(TEXT("data"), AckData);
++            FString Out;
++            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
++            if (FJsonSerializer::Serialize(Ack, Writer)) Connection->Send(Out);
++        });
++        return;
++    }
++
+     if (MessageType == TEXT("robot.action"))
+     {
+         const TSharedPtr<FJsonObject>* DataObject = nullptr;
