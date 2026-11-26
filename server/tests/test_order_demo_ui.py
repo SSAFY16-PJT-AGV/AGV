@@ -391,17 +391,12 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   rejectBeforeAcceptance = true;
   await element('product-form').handlers.submit({preventDefault(){}});
   assert.strictEqual(lastHeaders['Idempotency-Key'], '07'.repeat(16));
-  assert(element('product-feedback').textContent.includes('접수되지 않았습니다'));
-  assert.strictEqual(element('submit-product').disabled, false);
-  rejectBeforeAcceptance = false;
-  requestLost = true;
-  await element('product-form').handlers.submit({preventDefault(){}});
   assert(element('product-feedback').textContent.includes('결과를 확인할 수 없습니다'));
   assert(element('product-feedback').textContent.includes('재주문하지'));
   assert.strictEqual(element('submit-product').disabled, true);
-  const countAfterLoss = postCount;
+  const countAfter503 = postCount;
   await element('product-form').handlers.submit({preventDefault(){}});
-  assert.strictEqual(postCount, countAfterLoss);
+  assert.strictEqual(postCount, countAfter503);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''
         result = subprocess.run([shutil.which('node'), '-e', script], input=self.html,

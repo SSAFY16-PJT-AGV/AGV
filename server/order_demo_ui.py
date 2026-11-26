@@ -460,11 +460,6 @@ HTML_PAGE = r'''<!doctype html>
         method: 'POST', headers: {'Content-Type': 'application/json', 'Idempotency-Key': requestKey},
         body: JSON.stringify(body)
       });
-      if (response.status === 503) {
-        if (!forgetAttempt(stored)) return;
-        message(element, '현재 주문이 접수되지 않았습니다. 잠시 후 다시 시도해 주세요.');
-        return;
-      }
       if (response.status === 409) {
         const rejected = await response.json();
         if (rejected && rejected.detail === '선반에 빈 슬롯이 없습니다') {
