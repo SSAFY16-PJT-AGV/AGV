@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from server.order_persistence import PersistentOrderStore
 from server.tests.test_order_persistence import CATALOG, shelves
@@ -25,7 +26,7 @@ class OrderMetricsTest(unittest.TestCase):
         self.assertIsNotNone(importlib.util.find_spec('server.order_metrics'), 'metrics module required')
         return importlib.import_module('server.order_metrics').order_metrics(self.store)
 
-    def completed_order(self):
+    def completed_order(self, *, with_update=False):
         order = self.store.submit('red', request_key='one')
         self.store.claim_next()
         revision = self.store.sync_shelves(shelves())
@@ -33,6 +34,8 @@ class OrderMetricsTest(unittest.TestCase):
         result = {'assigned_robot': 'sim-r1', 'order_id': 'job-1', 'shelf_id': 'SHELF_RED',
                   'slot_index': slot['slot_index'], 'reservation_id': slot['reservation_id']}
         self.store.mark_active(order['request_id'], result)
+        if with_update:
+            self.store.update_active(order['request_id'], {'last_observation': {'status': 'moving'}})
         self.store.mark_completed(order['request_id'], result)
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("UPDATE orders SET created_at='2026-01-01 00:00:00' WHERE request_id=?",
@@ -73,6 +76,62 @@ class OrderMetricsTest(unittest.TestCase):
         self.assertEqual(data['orders_by_state']['completed'], 0)
         self.assertEqual(data['total_seconds'], {'samples': 0, 'average': None})
         self.assertEqual(data['inventory']['unknown'], 6)
+
+    def test_earliest_active_event_is_selected_by_sequence(self):
+        request_id = self.completed_order(with_update=True)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            active = db.execute("SELECT sequence FROM order_events WHERE request_id=? "
+                                "AND state='active' ORDER BY sequence", (request_id,)).fetchall()
+            db.execute("UPDATE order_events SET at='2026-01-01 00:00:10' WHERE sequence=?", active[0])
+            db.execute("UPDATE order_events SET at='2026-01-01 00:00:15' WHERE sequence=?", active[1])
+        data = self.metrics()
+        self.assertEqual(data['waiting_seconds'], {'samples': 1, 'average': 10.0})
+        self.assertEqual(data['processing_seconds'], {'samples': 1, 'average': 10.0})
+
+    def test_later_active_event_with_backwards_wall_clock_is_not_averaged(self):
+        request_id = self.completed_order(with_update=True)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            active = db.execute("SELECT sequence FROM order_events WHERE request_id=? "
+                                "AND state='active' ORDER BY sequence", (request_id,)).fetchall()
+            db.execute("UPDATE order_events SET at='2026-01-01 00:00:10' WHERE sequence=?", active[0])
+            db.execute("UPDATE order_events SET at='2026-01-01 00:00:05' WHERE sequence=?", active[1])
+        data = self.metrics()
+        self.assertEqual(data['invalid_timestamps'], 1)
+        for field in ('waiting_seconds', 'processing_seconds', 'total_seconds'):
+            self.assertEqual(data[field], {'samples': 0, 'average': None})
+
+    def test_completed_before_active_is_invalid_even_when_times_increase(self):
+        request_id = self.completed_order()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE order_events SET state=CASE state WHEN 'active' THEN 'completed' "
+                       "WHEN 'completed' THEN 'active' ELSE state END WHERE request_id=?", (request_id,))
+        data = self.metrics()
+        self.assertEqual(data['invalid_timestamps'], 1)
+        for field in ('waiting_seconds', 'processing_seconds', 'total_seconds'):
+            self.assertEqual(data[field], {'samples': 0, 'average': None})
+
+    def test_current_state_must_match_last_event(self):
+        request_id = self.completed_order()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE orders SET state='active' WHERE request_id=?", (request_id,))
+        data = self.metrics()
+        self.assertEqual(data['invalid_timestamps'], 1)
+        self.assertEqual(data['waiting_seconds'], {'samples': 0, 'average': None})
+
+    def test_events_must_follow_journal_transitions(self):
+        request_id = self.completed_order()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE order_events SET state='queued' WHERE request_id=? AND state='dispatching'",
+                       (request_id,))
+        data = self.metrics()
+        self.assertEqual(data['invalid_timestamps'], 1)
+        self.assertEqual(data['total_seconds'], {'samples': 0, 'average': None})
+
+    def test_truncated_history_is_never_presented_as_a_complete_average(self):
+        self.completed_order()
+        from server.order_metrics import order_metrics
+        with patch('server.order_metrics._MAX_EVENTS', 2), self.assertRaisesRegex(ValueError, 'event history'):
+            order_metrics(self.store)
 
     def test_local_dashboard_api_reports_metrics_without_mutating_orders(self):
         from server.order_demo_app import app
