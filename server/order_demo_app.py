@@ -1036,6 +1036,20 @@ def order_history(request: Request):
     return {'orders': [_public_order(row) for row in journal.list_orders()]}
 
 
+@app.get('/order-demo/api/metrics')
+def metrics(request: Request):
+    journal = getattr(_demo(request), 'journal', None)
+    if journal is None:
+        raise HTTPException(404, '영속 저장이 활성화되지 않았습니다',
+                            headers={'Cache-Control': 'no-store'})
+    try:
+        from server.order_metrics import order_metrics
+        return JSONResponse(order_metrics(journal), headers={'Cache-Control': 'no-store'})
+    except Exception:
+        raise HTTPException(503, '가상 시연 지표를 확인할 수 없습니다',
+                            headers={'Cache-Control': 'no-store'}) from None
+
+
 @app.get('/order-demo/api/orders/{request_id}')
 def order_status(request_id: str, request: Request):
     journal = getattr(_demo(request), 'journal', None)

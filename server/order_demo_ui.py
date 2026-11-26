@@ -152,6 +152,7 @@ HTML_PAGE = r'''<!doctype html>
     <p id="inventory-freshness" role="status">재고 확인 중</p>
     <p id="saved-inventory" class="help"></p>
     <ul id="saved-order-list" aria-live="polite"></ul>
+    <p id="simulation-metrics" class="help" role="status">가상 처리 지표 확인 중</p>
   </section>
 </main>
 <script>
@@ -184,6 +185,10 @@ HTML_PAGE = r'''<!doctype html>
   let savedGeneration = 0;
   let savedStarted = 0;
   let savedController = null;
+  let metricsPolling = false;
+  let metricsGeneration = 0;
+  let metricsStarted = 0;
+  let metricsController = null;
   let mapRobotLayer = null;
   let mapBounds = null;
   let lastMapStatus = null;
@@ -800,6 +805,40 @@ HTML_PAGE = r'''<!doctype html>
       if (generation === savedGeneration) { savedPolling=false; savedController=null; }
     }
   }
+  async function refreshMetrics() {
+    const target = document.getElementById('simulation-metrics');
+    if (metricsPolling) {
+      if (observationExpired(metricsStarted, 5000)) {
+        ++metricsGeneration;
+        if (metricsController) metricsController.abort();
+        metricsController = null; metricsPolling = false;
+        target.textContent = '가상 처리 지표를 확인할 수 없습니다.';
+      }
+      return;
+    }
+    metricsPolling = true; metricsStarted = observationClock();
+    const generation = ++metricsGeneration, controller = metricsController = makeController();
+    try {
+      const data = await readJson(await fetch('/order-demo/api/metrics', observationOptions(controller)));
+      if (generation !== metricsGeneration) return;
+      if (observationExpired(metricsStarted, 5000)) throw new Error('metrics expired');
+      const completed = data?.orders_by_state?.completed;
+      const wait = data?.waiting_seconds, processing = data?.processing_seconds;
+      function valid(stat) {
+        return stat && Number.isInteger(stat.samples) && stat.samples >= 0 &&
+          ((stat.samples === 0 && stat.average === null) ||
+           (stat.samples > 0 && Number.isFinite(stat.average) && stat.average >= 0));
+      }
+      if (data?.source !== 'simulation_journal' || !Number.isInteger(completed) || completed < 0 ||
+          !valid(wait) || !valid(processing)) throw new Error('invalid metrics');
+      const duration = stat => stat.samples ? `${stat.average}초 (${stat.samples}건)` : '기록 없음';
+      target.textContent = `가상 완료 ${completed}건 · 배정까지 평균 ${duration(wait)} · 배정 후 완료까지 평균 ${duration(processing)} (저장 기록, 초 단위)`;
+    } catch (_) {
+      if (generation === metricsGeneration) target.textContent = '가상 처리 지표를 확인할 수 없습니다.';
+    } finally {
+      if (generation === metricsGeneration) { metricsPolling = false; metricsController = null; }
+    }
+  }
   function statusUnavailable() {
     jobActive = true; updateButton();
     for (const item of activeTimelines) renderTimeline(item.element, item.robot, false);
@@ -968,9 +1007,10 @@ HTML_PAGE = r'''<!doctype html>
   loadProducts();
   refreshStatus();
   refreshSavedOrders();
+  refreshMetrics();
   refreshMap();
   refreshSubmissions();
-  setInterval(async () => { await Promise.all([refreshSavedOrders(), refreshMap()]); }, 3000);
+  setInterval(async () => { await Promise.all([refreshSavedOrders(), refreshMap(), refreshMetrics()]); }, 3000);
   setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmissions()]); }, 800);
 })();
 </script>

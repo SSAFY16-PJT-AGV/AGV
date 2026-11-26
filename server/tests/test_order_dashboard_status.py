@@ -16,7 +16,7 @@ function node(id='') {return {id,value:'',disabled:false,hidden:false,textConten
  classList:{toggle(){}},addEventListener(t,f){this.handlers[t]=f},setAttribute(){},
  replaceChildren(){this.children=[]},appendChild(x){this.children.push(x)}}}
 function el(id){if(!els.has(id))els.set(id,node(id));return els.get(id)}
-let now=0,timers=[],holdStatus=false,holdMap=false,holdOrders=false,releaseStatus,releaseMap,releaseOrders;
+let now=0,timers=[],holdStatus=false,holdMap=false,holdOrders=false,badMetrics=false,releaseStatus,releaseMap,releaseOrders;
 const status={mode:'fleet',action_source:'synthetic',accepting_orders:true,connected:true,unreal_connected:true,
  stale:false,robots:[{robot_id:'sim-r1',status:'moving',phase:'to_pickup',pose:{x:300,y:0},route:[]}]};
 const map={scope:'isolated_simulation',coordinate_unit:'mm',snapshot_consistency:'separate_from_status',map_id:'m@v1',
@@ -30,6 +30,7 @@ const context={localStorage:(()=>{const m=new Map();return {get length(){return 
  if(url.endsWith('/products'))return response({products:[{id:'red',label:'R',pickup_node:'A',destination_node:'B',shelf_id:'S'}]});
  if(url.endsWith('/status')){if(holdStatus)return await new Promise(resolve=>{releaseStatus=()=>resolve(response(status))});return response(status)}
  if(url.endsWith('/orders')){if(holdOrders)return await new Promise(resolve=>{releaseOrders=()=>resolve(response({orders:[]}))});return response({orders:[]})}
+ if(url.endsWith('/metrics'))return response(badMetrics ? {source:'unknown'} : {source:'simulation_journal',orders_by_state:{completed:2},waiting_seconds:{samples:1,average:5},processing_seconds:{samples:1,average:15}});
  if(url.endsWith('/inventory'))return response({shelves:{S:{slots:[true,false]}},fresh:true});throw Error(url);
  }};
 vm.runInNewContext(source,context);
@@ -38,6 +39,11 @@ const flush=()=>new Promise(r=>setImmediate(r));
  assert.strictEqual(el('submit-product').disabled,false);
  assert.strictEqual(el('dashboard-map').hidden,false);
  assert.strictEqual(el('dashboard-map').children[2].children.length,1);
+ assert(el('simulation-metrics').textContent.includes('완료 2건'));
+ assert(el('simulation-metrics').textContent.includes('15초'));
+ badMetrics=true;await timers[0]();
+ assert(el('simulation-metrics').textContent.includes('확인할 수 없습니다'));
+ badMetrics=false;await timers[0]();
  holdStatus=true;const oldStatus=timers[1]();await flush();
  now+=4000;await timers[1]();
  assert.strictEqual(el('submit-product').disabled,true);
