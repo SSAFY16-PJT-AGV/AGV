@@ -61,5 +61,9 @@ $env:TMP = $env:TEMP
 $env:PYTHONUTF8 = '1'
 $env:AMQTT_TEST_PATH = (Resolve-Path .venv\broker-deps).Path
 .\.venv\Scripts\python.exe -m unittest server.tests.test_v3_example `
-  server.tests.test_v3_web_unreal_integration -v
+  server.tests.test_v3_web_unreal_integration server.tests.test_v3_contention -v
 ```
+
+경합 시험은 두 가상 AGV가 공통 노드 J07을 요구하도록 한다. 첫 가상
+로봇이 점유하는 동안 두 번째 예약과 명령을 막고, 합성 후단 이탈 뒤
+두 번째가 진입하는지 확인한다. 이는 물리적 정지·후단 이탈의 증거가 아니다.
