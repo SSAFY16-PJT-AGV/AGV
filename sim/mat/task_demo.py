@@ -58,29 +58,15 @@ def make_order(oid, nodes, action, map_ref, seq=1, release=None):
             "released_until": release or nodes[-1], "action_at_end": action}
 
 
-def run(jobs=None, inventory=None, seed=2, out=None, video=False, link=None, max_time_s=400.0, notes=None,
-        pcfg_override=None, quiet=True, geom_err=None):
-    """jobs: [(경로, action_at_end)]. geom_err: 판정 쪽이 잘못 아는 robot_geom 값 차이(예: {"camera_z_mm": 8}),
-    카메라 보정 오차 흉내. 반환: dict(link, world, arm, gt, notes, ctl)."""
-    jobs = DEFAULT_JOBS if jobs is None else jobs
-    with io.open(MAP, encoding="utf-8") as f:
-        raw = json.load(f)
-    ref = "%s@v%s" % (raw["map_id"], raw["version"])
+def make_task_sim(st, inventory=None, seed=2, log=None, geom_err=None):
+    """가상 창고·가상 팔·실행기. st["pose"](실제 자세), st["t"](시뮬레이션 시각)를 on_step에서 채운다.
+    반환: (world, arm, executor)."""
     pcfg = load_config()
-    if pcfg_override:
-        pcfg.update(pcfg_override)
     layout = ShelfLayout(pcfg)
     cam = camera_from_config(pcfg)
-    st = {"t": 0.0, "runner": None, "sent": 0, "pose": None, "done": False}
     world = VirtualWarehouse(Mat(MAT).d, pcfg, layout, cam,
                              inventory=DEFAULT_INVENTORY if inventory is None else inventory, seed=seed)
     arm = FakeArm(world, lambda: st["pose"], lambda: st["t"], servo_angles=DRIVE_ANGLES)
-    notes = [] if notes is None else notes
-
-    def log(m, **k):
-        notes.append((round(st["t"], 2), m, k))
-        if not quiet:
-            print(u"[%6.1f] %s %s" % (st["t"], m, json.dumps(k, ensure_ascii=False)))
     ecfg = pcfg
     if geom_err:
         import copy
@@ -89,6 +75,25 @@ def run(jobs=None, inventory=None, seed=2, out=None, video=False, link=None, max
             ecfg["robot_geom"][k] = float(ecfg["robot_geom"].get(k, 0.0)) + d
     ex = TaskExecutor(ecfg, cam, layout, arm, pcfg["observe_pose"]["servo_angles"], DRIVE_ANGLES,
                       grab=lambda: world.render(st["pose"], arm.servo_angles()), log=log)
+    return world, arm, ex
+
+
+def run(jobs=None, inventory=None, seed=2, out=None, video=False, link=None, max_time_s=400.0, notes=None,
+        quiet=True, geom_err=None):
+    """jobs: [(경로, action_at_end)]. geom_err: 판정 쪽이 잘못 아는 robot_geom 값 차이(예: {"camera_z_mm": 8}),
+    카메라 보정 오차 흉내. 반환: dict(link, world, arm, gt, notes, ctl)."""
+    jobs = DEFAULT_JOBS if jobs is None else jobs
+    with io.open(MAP, encoding="utf-8") as f:
+        raw = json.load(f)
+    ref = "%s@v%s" % (raw["map_id"], raw["version"])
+    st = {"t": 0.0, "runner": None, "sent": 0, "pose": None, "done": False}
+    notes = [] if notes is None else notes
+
+    def log(m, **k):
+        notes.append((round(st["t"], 2), m, k))
+        if not quiet:
+            print(u"[%6.1f] %s %s" % (st["t"], m, json.dumps(k, ensure_ascii=False)))
+    world, arm, ex = make_task_sim(st, inventory, seed, log, geom_err)
     nav = Navigator(NavMap(raw), start=jobs[0][0][0], stop_offset_mm=80, hold_at_end=True)
     link = link or FakeLink("sim")
     ctl = LinkController(link, nav, raw, start_node=jobs[0][0][0], log=log, tasks=ex, clock=lambda: st["t"])

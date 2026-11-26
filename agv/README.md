@@ -25,6 +25,8 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
 | `perception/` | 선반 집기·적재 인식([설계](../docs/perception/shelf-perception.md)): ArUco 검출 직접 구현(`aruco.py`, cv2.aruco 없이), 렌즈·카메라 위치(`camera.py`), 칸 판정(`shelf.py`의 `perceive_shelf`), 가상 선반 장면(`scene.py`) |
 | `task/` | 선반 작업(집기·놓기·보기): 할 일 정하기(`decide.py`), 관측 자세 → 칸 보기 → 팔 → 다시 보기 → 주행 자세를 프레임마다 진행(`executor.py`), 팔 인터페이스(`arm_driver.py`). 서버 메시지 변환은 `link/task_msgs.py` 한 곳([형식](../docs/protocol/shelf-task.md)) |
+| `tools/markers.py` | 선반 띠(칸 마커 4개, 칸 간격 그대로)·물건 마커 인쇄 파일(PDF/PNG, 300dpi, 100mm 눈금) |
+| `tools/shelfcheck.py` | 선반 앞에 세워 두고 칸 인식만 확인(주행·서버 없이): 칸 상태, 선반 위치(줄자와 비교), 밝기, 판정 시간, 관측 자세 찾기(`--sweep --save-observe`). 현장 순서는 FIELD_TEST.md 10절 |
 | `tools/shelfsim.py` | 가상 선반 장면 여러 장으로 칸 판정 정확도 측정(정차 오차·카메라 보정 오차를 넣어 볼 수 있음) |
 | `config/explore.json` | 두 대 공통 값. `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
 | `config/perception.json` | 선반 인식 기본값(렌즈, 카메라 위치, 팔 범위, 마커, 박스, 선반). 항목마다 근거(`_src`), 추정값은 실측해서 고침 |
