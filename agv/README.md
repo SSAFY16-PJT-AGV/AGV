@@ -24,6 +24,7 @@ Jetson Nano 기본 이미지(Python 3.6, OpenCV, jetbot)에서 돌아가며, 추
 | `tools/autocolor.py` | 한 바퀴 영상에서 패치 색 범위·문턱 자동 보정 |
 | `tools/runlog.py` | 주행 결과(events.jsonl) 요약: 타임라인, 막다른 길·V자 값, 종료 이유 |
 | `perception/` | 선반 집기·적재 인식([설계](../docs/perception/shelf-perception.md)): ArUco 검출 직접 구현(`aruco.py`, cv2.aruco 없이), 렌즈·카메라 위치(`camera.py`), 칸 판정(`shelf.py`의 `perceive_shelf`), 가상 선반 장면(`scene.py`) |
+| `task/` | 선반 작업(집기·놓기·보기): 할 일 정하기(`decide.py`), 관측 자세 → 칸 보기 → 팔 → 다시 보기 → 주행 자세를 프레임마다 진행(`executor.py`), 팔 인터페이스(`arm_driver.py`). 서버 메시지 변환은 `link/task_msgs.py` 한 곳([형식](../docs/protocol/shelf-task.md)) |
 | `tools/shelfsim.py` | 가상 선반 장면 여러 장으로 칸 판정 정확도 측정(정차 오차·카메라 보정 오차를 넣어 볼 수 있음) |
 | `config/explore.json` | 두 대 공통 값. `linecam.DEFAULT_CONFIG`를 덮어쓴다 |
 | `config/perception.json` | 선반 인식 기본값(렌즈, 카메라 위치, 팔 범위, 마커, 박스, 선반). 항목마다 근거(`_src`), 추정값은 실측해서 고침 |
@@ -121,11 +122,14 @@ python3 -m agv.tools.runlog data/runs/<시각>      # "이동(goto)" 칸에 갈�
 
 ## 서버 주문으로 움직이기 (serve)
 
+**선반 작업(`--tasks`)**: 주문의 끝 동작(`action_at_end`)이 `load`(집기)·`unload`(놓기)·`observe`(보기만)이고 경로가 그 선반의 스퍼 끝에서 끝나면, 도착한 뒤 카메라로 칸을 보고 작업한 다음 결과(`agv/{id}/task`)와 선반 상태(`agv/{id}/shelf`, 작업 전·후)를 보낸다. 작업 중 상태는 `WORKING`, 들고 있는 물건은 상태의 `carrying`. 형식은 [docs/protocol/shelf-task.md](../docs/protocol/shelf-task.md)(로봇 쪽 제안, 서버와 맞추면 `link/task_msgs.py`만 고침). 실물에서는 칸 보기와 1·5번 자세까지 되고, 집기·놓기 팔 동작은 팔 담당이 `agv/task/grip.py`에 `grip(cmd) -> (ok, reason)`을 넣으면 쓰인다(`cmd`는 `task/arm_driver.py` 설명, 그 전에는 `arm_unavailable`로 실패). `--tasks`가 없으면 끝 동작은 지금처럼 무시한다. 시뮬레이션은 `python3 sim/mat/task_demo.py`(아래 테스트).
+
 서버(브랜치 `feature/server-communication`)가 MQTT로 보내는 주문을 받아 `goto`와 같은 코드로 움직이고, 상태·정지 이벤트를 보낸다. 토픽과 주문 형식은 설계 문서 3장, 정지 이벤트는 서버 브랜치의 제안(`server/docs/segment_recovery_proposal.md`)을 따른다.
 
 ```bash
 pip3 install --user "paho-mqtt<2"     # 젯슨(Python 3.6)은 2.x가 안 깔림. 노트북은 아무 버전
 MQTT_HOST=<브로커 PC IP> python3 -m agv.explore --mode serve --map maps/mat_ssafy_v3.json --start N01 --enable-motors --view
+# 선반 작업까지: --tasks
 ```
 
 - 로봇을 `--start` 노드 조금 앞(라인 위)에 놓으면 서서 첫 주문을 기다린다(상태 `IDLE`, `last_node`가 그 노드). 첫 주문의 첫 노드는 `--start`여야 하고, 다음 새 작업은 이전 작업의 마지막 노드에서 시작해야 한다. 스퍼 끝에서 시작하는 주문(`D_P_red, P_red, ...`)은 그 스퍼에 주차해 있을 때만 된다(처음부터 스퍼 끝에 놓고 시작하는 건 아직 안 됨).
@@ -255,5 +259,7 @@ python3 -m unittest discover -s agv/tests -v
 실제 모터·카메라는 쓰지 않는다. `test_sim_e2e.py`는 가상 매트(`sim/mat/`)에서 탐색부터 맵 생성까지 돌린다. `test_nav.py`는 맵 읽기·위치 추적·갈림길 선택 단위 테스트와, 가상 매트에서 탐색으로 만든 맵(`maps/sim_ssafy_v2.json`)으로 목표까지 가는 시험(짧은 가지, V자, 대기 후 재개, 시작 위치 모름 + 속도 15% 오차, 스퍼 끝 주차 후 빠져나오기 3곳, `explore.py --then` 실행 루프)이다.
 
 `test_map_v3.py`는 새 매트(`maps/mat_ssafy_v3.json`, 가상 매트 `ssafy_v3`)다: 맵 파일(트윈 ID·좌표, 위상), 안쪽 세로선 두 개, 충전 스퍼, 모서리 바로 뒤 스퍼, 시작 위치 모름 + 느린 로봇, 충전 패치 속도 보정, lap 모드 8색, 서버 주문(합류점이 해제 노드일 때 포함). 더 많은 시나리오는 `python3 sim/mat/v3_scenarios.py`.
+
+`test_task.py`는 선반 작업이다: 메시지 변환, 할 일 정하기(모든 실패 경우), 실행기, 그리고 가상 매트 + 가상 선반(`sim/mat/task_demo.py`, `sim/mat/warehouse.py`)에서 주문 → 이동 → 칸 보기 → 집기·놓기 → 결과·선반 상태 보고(N01에서 휴지 집기 → N03에 놓기 → N02 보기 → 빈 칸 집기 실패), 카메라 보정 오차가 크면 집기 실패로 보고, 선반 스퍼로 안 끝나는 주문 거절.
 
 `test_link.py`는 서버 연동이다: 주문 검사 규칙, 맵 위 자세, rear_clear 자원, 통일 맵(중간 노드), 중간 노드에서 서기, 가상 매트에서 실물 맵(`maps/mat_ssafy_v2.json`)으로 주문 받아 움직이기(구간 셋 + 중간 노드 + 유턴해 거꾸로 + 스퍼 주차, 틀린 주문 거절, 통신 끊김에 서기). 서버 브랜치를 받아 둔 폴더를 `AGV_SERVER_REPO=<폴더>`로 주면 서버 코드(`server/routing.py`, `server/segments.py`)로도 맵과 자원 계산을 맞춰 본다. 실제 브로커 왕복은 `sim/link_demo.py`.

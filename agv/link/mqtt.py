@@ -272,6 +272,19 @@ class MqttLink(object):
                               qos=1, retain=False)
         return info.rc == mqtt.MQTT_ERR_SUCCESS
 
+    def publish_task(self, msg):
+        """선반 작업 결과(agv/{id}/task). QoS 1, 끊긴 동안 낸 것은 paho가 큐에 두었다 보냄."""
+        return self._publish_q1("task", msg)
+
+    def publish_shelf(self, msg):
+        """선반 관측(agv/{id}/shelf). QoS 1."""
+        return self._publish_q1("shelf", msg)
+
+    def _publish_q1(self, kind, msg):
+        info = self.c.publish(self.topic(kind), json.dumps(msg, ensure_ascii=False, separators=(",", ":")),
+                              qos=1, retain=False)
+        return info.rc == mqtt.MQTT_ERR_SUCCESS
+
     def publish_event_once(self, event, timeout=3.0):
         """Use one temporary connection, require PUBACK, and never reconnect.
 
@@ -355,6 +368,8 @@ class FakeLink(object):
         self.inbox = []
         self.states = []
         self.events = []
+        self.tasks = []
+        self.shelves = []
 
     def send(self, order):
         self.inbox.append(json.dumps(order).encode("utf-8") if isinstance(order, dict) else order)
@@ -375,6 +390,14 @@ class FakeLink(object):
 
     def publish_event(self, event):
         self.events.append(event)
+        return True
+
+    def publish_task(self, msg):
+        self.tasks.append(msg)
+        return True
+
+    def publish_shelf(self, msg):
+        self.shelves.append(msg)
         return True
 
     def start(self):

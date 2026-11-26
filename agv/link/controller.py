@@ -7,13 +7,18 @@
      rejected에 이유를 싣는다(서버가 이벤트 토픽에 다른 종류를 받으면 오류로 봐서 이벤트로는 안 보냄).
   2. 해제 노드에 서면 rear_clear 이벤트를 한 번 보낸다(서버 브랜치 제안 형식). 마지막 노드면 작업 끝.
   3. 상태를 state_hz로(바뀌면 바로) 보낸다: 마지막 노드, 엣지, 진행률, 자세(mm, 도), 상태, 배터리.
+  3-1. 마지막 노드에 섰고 주문에 선반 작업(action_at_end: load 집기 | unload 놓기 | observe 보기)이 있으면
+     tasks(agv.task.TaskExecutor)로 그 작업을 한다. 하는 동안 상태는 WORKING이고, 끝나면 선반 관측
+     (작업 전·후)과 작업 결과를 보낸 뒤 작업을 끝낸다. 메시지 형식은 task_msgs.py 한 곳에 있다.
+     tasks가 없으면 끝 동작은 지금처럼 무시한다.
   4. 브로커 연결이 link_loss_s 넘게 끊기면 그 자리에 선다(설계 7.3절 5번). 다시 붙어도 저절로 가지
      않는다(resume_after_reconnect를 켜면 남은 해제 구간을 이어 감) - 재동기화 규약이 정해지면 바꾼다.
 
 처음에는 서 있다(state IDLE, last_node = 놓인 노드). 로봇은 시작 노드 조금 앞(라인 위)에 놓고,
 첫 주문의 첫 노드는 그 시작 노드여야 한다. 그다음 새 작업은 이전 작업의 마지막 노드에서 시작해야 한다.
 
-상태 값: IDLE(주문 없음·작업 끝) | MOVING | WAITING(해제 노드에서 다음 해제를 기다림) | ERROR(error에 이유).
+상태 값: IDLE(주문 없음·작업 끝) | MOVING | WAITING(해제 노드에서 다음 해제를 기다림) | WORKING(선반 작업 중)
+| ERROR(error에 이유).
 표준 라이브러리만 쓴다. Python 3.6 호환.
 """
 import copy
@@ -25,6 +30,7 @@ import uuid
 from .geometry import MapGeometry
 from .orders import OrderBook, OrderRejected
 from .segments import SegmentRules
+from .task_msgs import TaskRejected, decode_action, encode_result, encode_shelf, state_fields
 
 NAV_ERRORS = ("nav_off_route", "nav_spur_missed", "nav_gave_up")
 
@@ -35,7 +41,8 @@ def map_ref_of(navmap):
 
 class LinkController(object):
     def __init__(self, link, nav, raw_map, start_node=None, waiting="zones", state_hz=5.0,
-                 link_loss_s=1.0, resume_after_reconnect=False, battery=None, log=None, clock=time.time):
+                 link_loss_s=1.0, resume_after_reconnect=False, battery=None, log=None, clock=time.time,
+                 tasks=None):
         self.link = link
         self.nav = nav
         self.book = OrderBook(map_ref_of(nav.m))
@@ -58,6 +65,10 @@ class LinkController(object):
         self._last_status = None
         self.n_orders = 0
         self._anchor = None             # (노드, 경로 순번, odo): 마지막으로 선 해제 노드
+        self.tasks = tasks              # 선반 작업 실행기(agv.task.TaskExecutor). 없으면 끝 동작 무시
+        self._order_task = {}           # order_id -> Task(끝 동작)
+        self._task = None               # 진행 중인 선반 작업 {"order": 주문, "task": Task}
+        self._msg_n = 0
         get_generation = getattr(link, "disconnect_generation", None)
         self._seen_disconnect_generation = get_generation() if get_generation is not None else None
         self._strict_disconnect_latched = False
@@ -112,8 +123,10 @@ class LinkController(object):
         self._watch_stop()
 
     # ---------- 한 스텝 ----------
-    def step(self, now=None):
+    def step(self, now=None, frame=None):
+        """frame: 지금 카메라 프레임(선반 작업이 칸을 볼 때 씀)."""
         now = self.clock() if now is None else now
+        self._now = now
         for msg, kw in getattr(self.link, "pop_notes", lambda: [])():
             self._note(msg, **kw)
         self._consume_disconnect()
@@ -139,6 +152,7 @@ class LinkController(object):
             self._watch_stop_fenced()
         else:
             fence(self._watch_stop_fenced)
+        self._step_task(now, frame)
         st = self.state(now)
         if (self._last_pub is None or now - self._last_pub >= self.state_period - 1e-6
                 or st["status"] != self._last_status):
@@ -237,6 +251,19 @@ class LinkController(object):
         if self.error is not None:
             self._reject(o, "robot in error: %s" % self.error)
             return
+        if self._task is not None:
+            self._reject(o, "robot is busy with a shelf task")
+            return
+        task = None
+        if d.kind == "new":
+            try:
+                task = decode_action(o["action_at_end"], o["nodes"], self.nav.m)
+            except TaskRejected as e:
+                self._reject(o, e.args[0])
+                return
+            if task is not None and self.tasks is None:
+                self._note("link_action_ignored", order_id=o["order_id"], action=task.action)
+                task = None
         try:
             if d.kind == "new":
                 here = self.here()
@@ -303,6 +330,7 @@ class LinkController(object):
         if d.kind == "new":
             # 이전 작업에서 선 노드의 순번은 새 경로에서 의미가 없다. 새 경로의 첫 노드에 서 있다.
             self._anchor = (o["nodes"][0], 0, r.odo)
+            self._order_task = {o["order_id"]: task} if task is not None else {}
         self.n_orders += 1
         if self._reconcile is not None:
             self._reconcile_event = None
@@ -394,9 +422,43 @@ class LinkController(object):
             self._note("link_event_unconfirmed", order_id=o["order_id"], seq=o["seq"])
             return
         final = b.at_final_release
-        if final:
+        task = self._order_task.pop(o["order_id"], None) if final else None
+        if task is not None:
+            self._task = {"order": o, "task": task}
+            self.tasks.start(task, getattr(self, "_now", None) or self.clock())
+            self._note("link_task_start", order_id=o["order_id"], action=task.action, shelf=task.shelf,
+                       slot=task.slot)
+        elif final:
             b.mark_finished()
         self._note("link_stopped", order_id=o["order_id"], seq=o["seq"], node=release, final=final)
+
+    # ---------- 선반 작업 ----------
+    def _ctx(self, now, o):
+        self._msg_n += 1
+        return {"session": self.session, "event_id": "%s-t%d" % (self.session, self._msg_n),
+                "ts": round(now, 3), "order_id": o["order_id"], "map_id": o["map_id"]}
+
+    def _publish(self, kind, msg):
+        f = getattr(self.link, "publish_" + kind, None)
+        if f is None:
+            self._note("link_publish_missing", kind=kind)
+            return False
+        return f(msg)
+
+    def _step_task(self, now, frame):
+        if self._task is None:
+            return
+        out = self.tasks.step(now, frame)
+        if out is None:
+            return
+        o = self._task["order"]
+        for phase, view in (("before", out.before), ("after", out.after)):
+            if view is not None:
+                self._publish("shelf", encode_shelf(view, phase, self._ctx(now, o)))
+        self._publish("task", encode_result(out, self._ctx(now, o)))
+        self._note("link_task_done", order_id=o["order_id"], ok=out.ok, reason=out.reason, carrying=out.carrying)
+        self._task = None
+        self.book.mark_finished()
 
     def _watch_link(self, now):
         r, L = self.runner, self.link
@@ -441,6 +503,8 @@ class LinkController(object):
             return "IDLE"
         if r.finished or self.error is not None:
             return "ERROR"
+        if self._task is not None:
+            return "WORKING"
         if r.state == "hold":
             if r.hold_reason == "wait_order":
                 return "IDLE"
@@ -575,12 +639,12 @@ class LinkController(object):
                 "x": round(pose[0], 1), "y": round(pose[1], 1),
                 "th": None if pose[2] is None else round(pose[2], 1), "src": src},
             "status": self.status(),
-            "carrying": None,
             "battery": self.battery() if self.battery is not None else None,
             "order_id": None, "seq": None, "released_until": None,
             "error": self.error or (r.finish_reason if r is not None and r.finished else None),
             "rejected": self.rejected,
         }
+        out.update(state_fields(self.tasks))
         if self.book.current is not None:
             o = self.book.current
             out.update({"order_id": o["order_id"], "seq": o["seq"], "released_until": o["released_until"]})
