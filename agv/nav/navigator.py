@@ -88,6 +88,8 @@ class Navigator(object):
         self.final = None           # 경로의 마지막 노드
         self.allowed = None         # 정해진 경로의 엣지 집합(None이면 최단 경로 자유)
         self.route = None
+        self._strict_repeat = False  # repeat support, one held segment at a time
+        self._sequence_resume_split = False
         self._route_pos = 0         # 경로에서 마지막으로 지난(또는 서 있는) 노드의 순번
         self._target_i = None       # 해제 노드의 경로 순번(같은 노드가 경로에 두 번 나올 수 있음)
         self.at_node = None         # 대기 중인 노드
@@ -137,8 +139,54 @@ class Navigator(object):
         """최단 경로로 node까지 간다."""
         self._check_node(node)
         self.route, self.allowed = None, None
+        self._strict_repeat = False
+        self._sequence_resume_split = False
         self.target = self.final = node
         self._after_new_target()
+
+    def _sequence_transition(self, before, after):
+        if before not in self.m.edges or after not in self.m.edges:
+            raise ValueError("sequence direction is unavailable")
+        edge = self.m.edges[before]
+        if edge["to"] != self.m.edges[after]["from"]:
+            raise ValueError("sequence edges do not meet")
+        node = self.m.nodes[edge["to"]]
+        turning = after == edge["rev"] and self.m.uturn_ok(edge["to"])
+        if node["crossing"] and not turning:
+            if not node["through"]:
+                raise ValueError("crossing through rules are required")
+            pair = ((before, after) if edge["dir"] == FWD else
+                    (self.m.rev(after), self.m.rev(before)))
+            if pair not in node["through"]:
+                raise ValueError("sequence violates crossing through rules")
+        if after not in self.m.next_edges(before) and not turning:
+            raise ValueError("sequence violates direction or U-turn rules")
+
+    def _sequence_allowed(self, nodes):
+        """Fail closed unless each mainline arc and turn is unambiguous."""
+        edges = []
+        for a, b in zip(nodes[:-1], nodes[1:]):
+            matches = [e for e in self.m.out.get(a, []) if self.m.edges[e]["to"] == b]
+            if len(matches) != 1:
+                raise ValueError("sequence edge is missing or ambiguous")
+            edges.append(matches[0])
+        for before, after in zip(edges[:-1], edges[1:]):
+            self._sequence_transition(before, after)
+        return set(edges)
+
+    def _sequence_entry(self, node, next_node):
+        """Require one observed entry arc and a valid first outgoing arc."""
+        best = self._best()
+        entries = set()
+        for h in best:
+            entry = h.came if h.last == node else h.edge
+            if entry not in self.m.edges or self.m.edges[entry]["to"] != node:
+                raise ValueError("repeated route needs a known entry edge")
+            entries.add(entry)
+        outgoing = [e for e in self.m.out.get(node, []) if self.m.edges[e]["to"] == next_node]
+        if len(entries) != 1 or len(outgoing) != 1:
+            raise ValueError("repeated route needs an unambiguous direction")
+        self._sequence_transition(next(iter(entries)), outgoing[0])
 
     def set_route(self, nodes, release=None):
         """정해진 노드 목록을 따라간다(서버 주문의 nodes). release(released_until)까지만 가고 대기."""
@@ -149,11 +197,28 @@ class Navigator(object):
         release = release or nodes[-1]
         if release not in nodes:
             raise ValueError(u"해제 노드가 경로에 없어요: %s" % release)
-        self.allowed = self.m.route_edges(nodes)
+        # Validate the entire path's connectivity/U-turn rules first. Repeat
+        # support is limited to observable mainline nodes.
+        allowed = self.m.route_edges(nodes)
+        strict = len(set(nodes)) != len(nodes)
+        if strict:
+            if any(self.m.kind(n) in ("via", "spur_end") for n in nodes):
+                raise ValueError("repeated routes with via/spur are unsupported")
+            end = next((i for i in range(1, len(nodes)) if nodes[i] == release), None)
+            if end is None:
+                raise ValueError("released occurrence must move forward")
+            self._sequence_entry(nodes[0], nodes[1])
+            allowed = self._sequence_allowed(nodes[:end + 1])
+        self.allowed = allowed
         self.route = list(nodes)
+        self._strict_repeat = strict
+        self._sequence_resume_split = False
         self._route_pos = 0
         self.final = nodes[-1]
-        self._target_i = self._hold_index(self._route_index(release))
+        # 같은 노드를 두 번 지나는 경로(strict)는 아직 합류점-패치 겹침 처리를 하지 않는다(그 모드의 대기·재출발
+        # 가정과 맞춰 봐야 함). 거기서 합류점 해제는 예전처럼 nav_off_route로 선다.
+        i = self._route_index(release)
+        self._target_i = i if strict else self._hold_index(i)
         self.target = self.route[self._target_i] if self._target_i is not None else release
         self._after_new_target()
 
@@ -185,6 +250,18 @@ class Navigator(object):
         """경로 다음 몇 노드 안에서 node를 지났으면 진행 순번을 올린다."""
         if self.route is None:
             return
+        if self._strict_repeat:
+            if self.route[self._route_pos] == node:
+                return  # repeated/delayed observation of the current occurrence
+            next_pos = self._route_pos + 1
+            if next_pos <= self._target_i and self.route[next_pos] == node:
+                self._route_pos = next_pos
+                return
+            self._note("nav_sequence_ambiguous", event="unexpected_node", node=node)
+            self._request_stop(None, self.target, reason="nav_off_route")
+            self._stop["hold"] = True
+            self.at_node = None
+            return
         for i in range(self._route_pos + 1, min(len(self.route), self._route_pos + 5)):
             if self.route[i] == node:
                 self._route_pos = i
@@ -203,6 +280,42 @@ class Navigator(object):
         """해제 노드를 늘린다. 대기 중이었으면 runner.resume()을 불러야 다시 간다."""
         if self.route is None or release not in self.route:
             raise ValueError(u"지금 경로에 없는 해제 노드: %s" % release)
+        if self._strict_repeat:
+            if self.at_node is None or self.at_node != self.target or self._target_i is None:
+                raise ValueError("repeated route requires confirmed hold before extend")
+            old = self._target_i
+            i = next((j for j in range(old + 1, len(self.route)) if self.route[j] == release), None)
+            if i is None:
+                raise ValueError("released occurrence must move forward")
+            segment = self.route[old:i + 1]
+            allowed = self._sequence_allowed(segment)
+            self._sequence_entry(segment[0], segment[1])
+            outgoing = [e for e in self.m.out.get(segment[0], [])
+                        if self.m.edges[e]["to"] == segment[1]]
+            if len(outgoing) != 1:
+                raise ValueError("repeated route requires one outgoing edge")
+            # A stop at a merge/split may retain the incoming edge instead of
+            # a successor. Re-anchor only the already confirmed occurrence.
+            updated = []
+            resume_split = False
+            for h in self.hyps:
+                if (self.m.kind(segment[0]) != "patch"
+                        and self.m.edges[h.edge]["to"] == segment[0]):
+                    incoming = h.came if h.last == segment[0] else h.edge
+                    if incoming not in self.m.edges:
+                        raise ValueError("confirmed incoming edge is missing")
+                    resume_split = resume_split or self.m.kind_seen(
+                        segment[0], self.m.dir(incoming)) == "split"
+                    updated.append(Hyp(outgoing[0], h.s0, h.cost, segment[0], incoming))
+                else:
+                    updated.append(h)
+            self.hyps = updated
+            self._sequence_resume_split = resume_split
+            self.allowed = allowed
+            self._route_pos = old
+            self.target, self._target_i = release, i
+            self._after_new_target()
+            return
         i = self._route_index(release)
         if i is None or (self._target_i is not None and i < self._target_i - 1):
             raise ValueError(u"해제 노드를 줄일 수는 없어요")
@@ -248,7 +361,8 @@ class Navigator(object):
         if self.spur is not None and self.spur["state"] == "armed":
             self.spur = None
         self._spur_tries = 0
-        if self.at_node is not None and self.at_node == self.target:
+        if (self.at_node is not None and self.at_node == self.target
+                and (not self._strict_repeat or self._route_reached(self.at_node))):
             # 이미 그 자리에 서 있음
             self._request_stop(None, self.target)
             return
@@ -326,7 +440,19 @@ class Navigator(object):
         if len(cames) != 1 or None in cames:
             return False
         came = cames.pop()
-        nxt = self.m.best_next(came, self._approach(self.target), self.allowed)
+        if self._strict_repeat:
+            if self._route_pos >= self._target_i:
+                return False
+            expected = self.route[self._route_pos + 1]
+            matches = [e for e in self.m.out.get(node, []) if self.m.edges[e]["to"] == expected]
+            if len(matches) != 1:
+                self._request_stop(None, self.target, reason="nav_off_route")
+                self._stop["hold"] = True
+                self.at_node = None
+                return False
+            nxt = (matches[0], matches[0] == self.m.edges[came]["rev"])
+        else:
+            nxt = self.m.best_next(came, self._approach(self.target), self.allowed)
         if nxt is None or not nxt[1]:
             return False
         sp = self.m.spur_side_at(node, self.m.dir(came))
@@ -346,6 +472,14 @@ class Navigator(object):
         if e["len"] > NEAR_SPLIT_MM or self.m.kind_seen(n2, d) != "split":
             return None
         br = self.m.branches_seen(n2, d)
+        if self._strict_repeat:
+            i = self._route_pos + 1
+            if i >= self._target_i or self.route[i] != n2:
+                return None
+            expected = self.route[i + 1]
+            choices = [side for side, edge in br.items()
+                       if self.m.edges[edge]["to"] == expected and edge in self.allowed]
+            return choices[0] if len(choices) == 1 else None
         R = self._R()
         if R is None or len(br) < 2:
             return None
@@ -484,10 +618,17 @@ class Navigator(object):
             d = self.m.dir(e)
             k = self.m.kind_seen(node, d)
             if k in SKIP_COST:
+                # A physical observed node must never be assumed to have been
+                # visited just because a later observation fits. Limited
+                # repeat routes already reject non-observable via nodes.
+                if self._strict_repeat:
+                    continue
                 step = 0 if k == "via" else 1
                 if dep + step > MAX_SKIP:
                     continue
                 nexts = list(self.m.branches_seen(node, d).values()) if k == "split" else self.m.next_edges(e)
+                if self._strict_repeat:
+                    nexts = [f for f in nexts if f in self.allowed]
                 for f in nexts:
                     if f in self.m.edges and not self.m.edges[f]["spur"]:
                         stack.append((f, L2, c + SKIP_COST[k], dep + step))
@@ -530,9 +671,18 @@ class Navigator(object):
         want = NODE_OF_EVENT[kind]
         cands = []
         for h in self.hyps:
+            if self._strict_repeat and self._sequence_resume_split and kind == "split":
+                current = self.route[self._route_pos]
+                if h.last == current and h.came in self.m.edges:
+                    branches = self.m.branches_seen(current, self.m.dir(h.came))
+                    if branches.get(side) == h.edge:
+                        cands.append(h._replace(s0=odo))
+                continue
             if kind in SPURIOUS_COST:
-                c = 0.0 if self._absorbed(h, kind, odo) else SPURIOUS_COST[kind]
-                cands.append(h._replace(cost=h.cost + c))
+                absorbed = self._absorbed(h, kind, odo)
+                if absorbed or not self._strict_repeat:
+                    c = 0.0 if absorbed else SPURIOUS_COST[kind]
+                    cands.append(h._replace(cost=h.cost + c))
             d = None if h.s0 is None else odo - h.s0
             for e, node, L, sc in self._walk(h):
                 n = self.m.nodes[node]
@@ -543,13 +693,48 @@ class Navigator(object):
                     succ = [br[side]] if side in br else []
                 else:
                     succ = self.m.next_edges(e)
+                if self._strict_repeat:
+                    # The node and next arc must correspond to this visit, not
+                    # any occurrence of the same edge later in the route.
+                    current = self.route[self._route_pos]
+                    at_current = node == current and h.last is None
+                    i = self._route_pos if at_current else self._route_pos + 1
+                    if i > self._target_i or node != self.route[i]:
+                        continue
+                    if not at_current:
+                        before = self.route[i - 1]
+                        if self.m.edges[e]["from"] != before:
+                            continue
+                    if i < self._target_i:
+                        expected = self.route[i + 1]
+                        outgoing = [f for f in self.m.out.get(node, [])
+                                    if self.m.edges[f]["to"] == expected and f in self.allowed]
+                        if len(outgoing) != 1:
+                            continue
+                        if outgoing[0] == self.m.edges[e]["rev"]:
+                            # Preserve the observed incoming edge; _maybe_uturn
+                            # will ask the runner to perform the actual turn.
+                            succ = []
+                            cands.append(Hyp(e, odo, h.cost + sc, node, e))
+                        else:
+                            succ = [f for f in succ if f == outgoing[0]]
+                    else:
+                        succ = []
                 pen = self._dist_pen(d, L)
                 for f in succ:
                     cands.append(Hyp(f, odo, h.cost + sc + pen, node, e))
                 if not succ and node == self.target:
                     # 목표가 막다른 노드(나가는 길 없음)여도 도착은 인정
                     cands.append(Hyp(e, odo, h.cost + sc + pen, node, e))
+        if self._strict_repeat and self._sequence_resume_split and kind == "split":
+            self._sequence_resume_split = False
         if not cands:
+            if self._strict_repeat:
+                self._note("nav_sequence_ambiguous", event=kind)
+                self._request_stop(None, self.target, reason="nav_off_route")
+                self._stop["hold"] = True
+                self.at_node = None
+                return
             if kind == "patch" and color in self.m.by_color:
                 p = self.m.by_color[color]
                 self.hyps = [Hyp(f, odo, 0.0, p) for f in self.m.out[p]]    # 방향도 모름
@@ -576,6 +761,8 @@ class Navigator(object):
     def on_patch_early(self, color, pos):
         """runner가 교차 판정 때문에 패치 기록을 보류할 때 부른다. 목표 패치면 정지 위치만 먼저 정한다.
         패치 색은 맵에 하나씩이라 색만으로 목표인지 안다. 스퍼 끝 목표면 그 부모 패치에서 무장한다."""
+        if self._strict_repeat:
+            return  # a delayed early observation alone is not a visit proof
         par = self._approach(self.target)
         if par is not None and par != self.target and self.spur is None \
                 and self.m.kind(par) == "patch" and self.m.nodes[par]["color"] == color \
@@ -606,8 +793,16 @@ class Navigator(object):
         best = self._best()
         par = self._approach(self.target)
         just = best and all(h.s0 == odo for h in best) and len(set(h.last for h in best)) == 1
+        if self._strict_repeat and just and (len(set(h.came for h in best)) != 1 or best[0].came is None):
+            self._note("nav_sequence_ambiguous", event="arrival")
+            self._request_stop(None, self.target, reason="nav_off_route")
+            self._stop["hold"] = True
+            self.at_node = None
+            return
         if just:
             self._route_advance(best[0].last)
+            if self._strict_repeat and self._stop is not None:
+                return
         if self._via_stop():
             return
         if par != self.target:
@@ -662,12 +857,24 @@ class Navigator(object):
 
     def on_dead_end(self, side, odo):
         """고른 갈림길이 사실은 스퍼였다: 갈림길 직전 가설로 돌아간다(되돌아 나와 원래 선을 탄다)."""
+        if self._strict_repeat:
+            self._note("nav_sequence_ambiguous", event="dead_end")
+            self._request_stop(None, self.target, reason="nav_off_route")
+            self._stop["hold"] = True
+            self.at_node = None
+            return
         if self._pre_split is not None:
             self.hyps = self._pre_split
             self._pre_split = None
         self._note("nav_dead_end", side=side)
 
     def on_gap(self):
+        if self._strict_repeat:
+            self._note("nav_sequence_ambiguous", event="gap")
+            self._request_stop(None, self.target, reason="nav_off_route")
+            self._stop["hold"] = True
+            self.at_node = None
+            return
         self.hyps = self._unknown()
 
     def known_dead(self):
@@ -676,6 +883,25 @@ class Navigator(object):
 
     def choose_split(self, odo):
         """갈림길(또는 V자)을 앞에서 봤을 때 갈 쪽. 목표 갈림길 앞에서 대기해야 하면 None."""
+        if self._strict_repeat and self._sequence_resume_split:
+            choices = set()
+            for h in self._best():
+                current = self.route[self._route_pos]
+                if h.last != current or h.came not in self.m.edges:
+                    choices = set()
+                    break
+                branches = self.m.branches_seen(current, self.m.dir(h.came))
+                sides = [side for side, edge in branches.items() if edge == h.edge]
+                if len(sides) != 1:
+                    choices = set()
+                    break
+                choices.add(sides[0])
+            if len(choices) == 1:
+                return choices.pop()
+            self._request_stop(None, self.target, reason="nav_off_route")
+            self._stop["hold"] = True
+            self.at_node = None
+            return None
         sp = self.spur
         if sp is not None and sp["state"] == "armed" and odo - sp["pos"] < SPUR_WINDOW_MM:
             self._enter_spur("split", odo)          # 스퍼가 갈림길로 보임: 스퍼 쪽으로
@@ -701,9 +927,48 @@ class Navigator(object):
                     interps.append((h.cost + sc, "spur", self.m.spur_side_at(node, ed), None))
         if not interps:
             self._note("nav_split_unknown")
+            if self._strict_repeat:
+                self._request_stop(None, self.target, reason="nav_off_route")
+                self._stop["hold"] = True
+                self.at_node = None
+                return None
             return self.default_side
         m = min(i[0] for i in interps)
         best = [i for i in interps if i[0] <= m + CHOICE_SLACK]
+        if self._strict_repeat:
+            next_i = self._route_pos + 1
+            expected = self.route[next_i] if next_i <= self._target_i else None
+            matching = [i for i in best if i[1] == "split" and i[2] == expected
+                        and self.m.edges[i[3]]["from"] == self.route[self._route_pos]]
+            if not matching or len(matching) != len(best):
+                self._request_stop(None, self.target, reason="nav_off_route")
+                self._stop["hold"] = True
+                self.at_node = None
+                return None
+            if next_i == self._target_i:
+                self._route_advance(expected)
+                # The detector gives a future estimated junction position;
+                # never issue a stop receipt at the current approach position.
+                self._request_stop(odo, self.target)
+                return None
+            next_node = self.route[next_i + 1]
+            chosen = set()
+            for _, _, node, incoming in matching:
+                br = self.m.branches_seen(node, self.m.dir(incoming))
+                sides = [side for side, edge in br.items() if edge in self.allowed
+                         and self.m.edges[edge]["to"] == next_node]
+                if len(sides) != 1:
+                    self._request_stop(None, self.target, reason="nav_off_route")
+                    self._stop["hold"] = True
+                    self.at_node = None
+                    return None
+                chosen.add(sides[0])
+            if len(chosen) != 1:
+                self._request_stop(None, self.target, reason="nav_off_route")
+                self._stop["hold"] = True
+                self.at_node = None
+                return None
+            return chosen.pop()
         if self.target is not None and all(i[1] == "split" and i[2] == self.target for i in best):
             self._note("nav_hold_before_split", node=self.target)
             self._request_stop(None, self.target)
@@ -716,6 +981,13 @@ class Navigator(object):
                 v[a] = SPUR_PENALTY
             else:
                 br = self.m.branches_seen(a, self.m.dir(_e))
+                if self._strict_repeat and (R is None or not any(
+                        f in self.allowed and f in R for f in br.values())):
+                    self._note("nav_sequence_ambiguous", event="branch")
+                    self._request_stop(None, self.target, reason="nav_off_route")
+                    self._stop["hold"] = True
+                    self.at_node = None
+                    return None
                 v = {}
                 for s in ("left", "right"):
                     f = br.get(s)
