@@ -1,8 +1,13 @@
 """Evidence checks for the visible v3 Unreal integration runner."""
 import copy
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
-from server.tools.v3_rendered_test import verify_outcome
+from server.tools.v3_rendered_test import verify_outcome, server_command, parse_speed
 
 
 def example():
@@ -51,6 +56,40 @@ class RenderedEvidenceTest(unittest.TestCase):
         data[1]['pickup']['sources']['N01']['available'] = 3
         with self.assertRaisesRegex(AssertionError, 'pickup inventory'):
             verify_outcome(*data)
+
+
+class RenderedSpeedTest(unittest.TestCase):
+    def test_speed_requires_a_finite_value_in_the_simulation_range(self):
+        self.assertEqual(parse_speed('100'), 100.0)
+        for value in ('0', '-1', 'inf', 'nan', '1001', 'not-a-number'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_speed(value)
+
+    def test_default_uses_the_original_uvicorn_entrypoint(self):
+        self.assertEqual(server_command('python', None), ['python', '-m', 'uvicorn',
+            'server.order_demo_app:app', '--host', '127.0.0.1', '--port', '8000',
+            '--workers', '1', '--no-proxy-headers'])
+
+    def test_optional_speed_is_applied_only_inside_the_child(self):
+        from sim import order_executor
+        old = order_executor.SPEED_MM_PER_SECOND
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory(prefix='v3-speed-') as folder:
+            Path(folder, 'uvicorn.py').write_text(
+                'def run(*args, **kwargs):\n'
+                '    from sim.order_executor import SPEED_MM_PER_SECOND\n'
+                '    print(SPEED_MM_PER_SECOND, kwargs["port"], kwargs["proxy_headers"])\n', encoding='utf-8')
+            env = os.environ.copy()
+            env['PYTHONPATH'] = str(root)
+            completed = subprocess.run(server_command(sys.executable, 50.0), cwd=folder, env=env,
+                                       text=True, encoding='utf-8', capture_output=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), '50.0 8000 False')
+        self.assertEqual(order_executor.SPEED_MM_PER_SECOND, old)
+
+    def test_speed_is_passed_as_an_argument_not_code(self):
+        with self.assertRaises((TypeError, ValueError)):
+            server_command('python', '50; print("injected")')
 
 
 if __name__ == '__main__':

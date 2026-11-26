@@ -26,6 +26,37 @@ from server.tools.order_demo import clean_environment, make_server_environment, 
 from server.tools.twin_multi_test import BROKER_SCRIPT, HTTP, ROOT, stop_process, wait_for_ready_log
 
 
+# Fixed source: the selected value is passed as a separate argument, never
+# interpolated into Python code. This process only owns the synthetic fleet.
+SLOW_SERVER_SOURCE = '''\
+import math, sys
+from sim import order_executor
+import uvicorn
+speed = float(sys.argv[1])
+if not math.isfinite(speed) or not 1 <= speed <= 1000:
+    raise ValueError('simulation speed must be between 1 and 1000 mm/s')
+order_executor.SPEED_MM_PER_SECOND = speed
+uvicorn.run('server.order_demo_app:app', host='127.0.0.1', port=8000,
+            workers=1, proxy_headers=False)
+'''
+
+
+def parse_speed(value):
+    speed = float(value)
+    if not math.isfinite(speed) or not 1 <= speed <= 1000:
+        raise ValueError('simulation speed must be between 1 and 1000 mm/s')
+    return speed
+
+
+def server_command(python, speed):
+    if speed is None:
+        return [python, '-m', 'uvicorn', 'server.order_demo_app:app', '--host', '127.0.0.1',
+                '--port', '8000', '--workers', '1', '--no-proxy-headers']
+    if type(speed) not in (float, int):
+        raise ValueError('simulation speed must be numeric')
+    return [python, '-c', SLOW_SERVER_SOURCE, str(parse_speed(speed))]
+
+
 def read_unreal_messages(path):
     """Read messages received by the actual test-owned Unreal game."""
     marker = '[WebSocket] Received: '
@@ -141,6 +172,7 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=False)
     token = secrets.token_urlsafe(32)
     python = getattr(sys, '_base_executable', sys.executable)
+    server_cmd = server_command(python, args.sim_speed_mm_s)
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     broker_env = clean_environment(os.environ)
     broker_env.update(PYTHONPATH=str(deps), TEMP=str(run_dir), TMP=str(run_dir))
@@ -154,6 +186,8 @@ def run(args):
     children = {'broker': None, 'server': None, 'unreal': None}
     result = {'passed': False, 'rendered': True, 'visual_observation': 'not_automated',
               'field_map_id': field['map_id'], 'project': str(project), 'evidence_dir': str(run_dir)}
+    if args.sim_speed_mm_s is not None:
+        result['simulation_speed_mm_per_second'] = args.sim_speed_mm_s
     print('EVIDENCE', run_dir, flush=True)
     try:
         with (run_dir / 'broker.log').open('w', encoding='utf-8') as blog, \
@@ -163,9 +197,8 @@ def run(args):
                 cwd=ROOT, env=broker_env, stdout=blog, stderr=blog, creationflags=flags)
             wait_for_ready_log(broker, run_dir / 'broker.log',
                                '[AGV_ISOLATED_BROKER_READY]:' + str(broker.pid), 'broker')
-            server = children['server'] = subprocess.Popen([python, '-m', 'uvicorn',
-                'server.order_demo_app:app', '--host', '127.0.0.1', '--port', '8000', '--workers', '1',
-                '--no-proxy-headers'], cwd=ROOT, env=server_env, stdout=slog, stderr=slog, creationflags=flags)
+            server = children['server'] = subprocess.Popen(server_cmd, cwd=ROOT, env=server_env,
+                                                           stdout=slog, stderr=slog, creationflags=flags)
             wait_for_demo(server, run_dir / 'server.log')
             cmd = [str(editor), str(project), args.level, '-game', '-windowed', '-ResX=1200', '-ResY=720',
                    '-nosound', '-NoSplash', '-ABSLOG=' + str(run_dir / 'unreal.log')]
@@ -226,6 +259,8 @@ def main():
     parser.add_argument('--order-timeout', type=float, default=180)
     parser.add_argument('--observe-delay', type=float, default=5)
     parser.add_argument('--hold-seconds', type=float, default=15)
+    parser.add_argument('--sim-speed-mm-s', type=parse_speed,
+                        help='optional isolated simulation speed in mm/s, from 1 to 1000')
     args = parser.parse_args()
     if min(args.start_timeout, args.order_timeout) <= 0 or min(args.observe_delay, args.hold_seconds) < 0:
         parser.error('timeouts must be positive and delays must be nonnegative')
