@@ -11,7 +11,8 @@ async def request(method, path):
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "method": method, "scheme": "http", "path": path,
         "raw_path": path.encode(), "query_string": b"", "root_path": "",
-        "headers": [], "client": ("test", 1234), "server": ("test", 80),
+        "headers": [(b"host", b"127.0.0.1:8000")],
+        "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000),
     }
 
     async def receive():

@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from server.mqtt_client import start_mqtt, stop_mqtt
+from server.observation_access import require_local_observation_access
 from server.sim_api import router as sim_router
 from server.twin_websocket import router as twin_router
 
@@ -95,6 +96,7 @@ app.include_router(twin_router)
 @app.get("/robots")
 def robot_observations(request: Request):
     """Return historical MQTT observations, never an authorization to move."""
+    require_local_observation_access(request)
     try:
         service = request.app.state.mqtt_service
         data = service.snapshot()
@@ -117,6 +119,7 @@ def robot_observations(request: Request):
 @app.get("/robots/battery")
 def robot_battery_observations(request: Request):
     """Summarize reported battery data without treating it as live evidence."""
+    require_local_observation_access(request)
     try:
         data = request.app.state.mqtt_service.snapshot()
         if (not isinstance(data, dict)
@@ -161,6 +164,7 @@ def robot_battery_observations(request: Request):
 @app.get("/robots/diagnostics")
 def robot_observation_diagnostics(request: Request):
     """Report local receive timing, not physical status or permission."""
+    require_local_observation_access(request)
     try:
         result = request.app.state.mqtt_service.observation_diagnostics()
         return JSONResponse(content=result, headers={"Cache-Control": "no-store"})

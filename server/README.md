@@ -49,15 +49,21 @@ TLS만 쓴다면 사용자명과 비밀번호 설정을 모두 제거한다. 인
 이 지원은 격리 시뮬레이션 전용으로, 실제 로봇 운행을 의미하지 않는다.
 
 ```powershell
-.\.venv\Scripts\python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python -m uvicorn server.main:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
 기존 셸 환경변수는 `.env`보다 우선한다. 최초 브로커 소켓 연결이 실패하면
 서버 시작도 실패한다. FastAPI 시작 완료는 MQTT 구독 완료를 보장하지 않으며,
 구독 준비 여부는 내부 `app.state.mqtt_service.snapshot()`의 `ready`로 확인한다.
-읽기 전용 `GET /robots` 조회는 팀 협의 전 제안이며 인증이 없으므로 로컬에서만
-사용한다. 응답의 의미와 한계는 [HTTP API 제안](docs/http_api_proposal.md)을
-먼저 읽는다.
+읽기 전용 `GET /robots`, `/robots/battery`, `/robots/diagnostics`는 직접
+루프백 연결과 로컬 Host만 허용한다. `AGV_OBSERVATION_API_TOKEN`을 32~512자의
+출력 가능한 ASCII로 설정하면 로컬 요청에도 `Authorization: Bearer <token>`이
+필요하다. 설정하지 않으면 직접 로컬 접근에는 토큰이 필요 없다. 토큰을
+소스나 로그에 기록하지 않는다. 이 제한은 프록시 뒤의 원격 접속이나 같은
+PC의 다른 사용자·프로세스로부터의 격리를 보장하지 않는다. 프록시 헤더를
+처리하는 서버나 중계기를 앞에 두지 않고 위의 로컬 바인딩과
+`--no-proxy-headers`를 사용한다. 실물 장비별 MQTT 인증·TLS·ACL은 별도다.
+응답의 의미와 한계는 [HTTP API 제안](docs/http_api_proposal.md)을 먼저 읽는다.
 
 ## 구현 상태와 제한
 
