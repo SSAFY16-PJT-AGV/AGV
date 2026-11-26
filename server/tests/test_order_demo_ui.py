@@ -73,7 +73,7 @@ const status={mode:'fleet', accepting_orders:false, accepting_queued_orders:true
   connected:true, unreal_connected:true, robots:[
     {robot_id:'sim-r1', status:'moving', route:[]}, {robot_id:'sim-r2', status:'moving', route:[]}]};
 const answers={'id-1':{status:'pending',request_id:'id-1'}, 'id-2':{status:'pending',request_id:'id-2'}};
-const context={
+const context={localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),
   crypto:{randomUUID:()=> 'key-' + (++uuid)},
   document:{getElementById:element, createElement:()=>({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(f) {timer=f;},
@@ -163,7 +163,7 @@ function element(id) {
 let posts = 0;
 let timer;
 let outcome = {status:'pending', request_id:'id-1'};
-const context = {
+const context = {localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),
   crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
   document: {getElementById:element, createElement:() => ({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(f) {timer=f;},
@@ -229,7 +229,7 @@ let submissionState = {status:'pending', request_id:'test-request-1'};
 let lastHeaders;
 const catalog = [{id:'red', label:'빨강', pickup_node:'D01', destination_node:'D04',
                   shelf_id:'SHELF_RED', slot_index:0}];
-const context = {
+const context = {localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),
   crypto: {randomUUID: () => '00000000-0000-4000-8000-000000000001'},
   document: {getElementById:element, createElement:() => ({children:[], appendChild(x){this.children.push(x)}, replaceChildren(){this.children=[]}, setAttribute(){}})},
   setInterval(fn) {timer = fn;},

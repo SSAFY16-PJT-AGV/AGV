@@ -71,6 +71,10 @@ class PersistentAdmission:
                     'error_type': order.get('error') or 'RuntimeError'}
         return {'status': 'pending', 'request_id': request_id}
 
+    def get_by_key(self, request_key):
+        """Observe the existing journal record without starting the worker."""
+        return self.get(self.store.get_order_by_key(request_key)['request_id'])
+
     def _drain(self):
         while True:
             with self._lock:

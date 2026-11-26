@@ -189,6 +189,11 @@ HTML_PAGE = r'''<!doctype html>
   let lastMapStatus = null;
   let activeTimelines = [];
   const pendingSubmissions = new Map();
+  // Write the key before POST. A missing server record is not proof that a
+  // timed-out request was never accepted, so recovery never sends another POST.
+  const attemptPrefix = 'agv-demo-submission-v1:';
+  const storedAttempts = new Map();
+  let storageFault = false;
   let submissionUnknown = false;
   let activePost = null;
   let postDelayUnknown = false;
@@ -216,10 +221,11 @@ HTML_PAGE = r'''<!doctype html>
     return controller ? {cache: 'no-store', signal: controller.signal} : {cache: 'no-store'};
   }
   function hasUncertainSubmission() {
-    return Array.from(pendingSubmissions.values()).some(entry => entry.lookupUncertain === true);
+    return storageFault || Array.from(storedAttempts.values()).some(entry => entry.uncertain) ||
+      Array.from(pendingSubmissions.values()).some(entry => entry.lookupUncertain === true);
   }
   function updateButton() {
-    const awaiting = (!fleetMode && pendingSubmissions.size > 0) || hasUncertainSubmission() ||
+    const awaiting = (!fleetMode && (pendingSubmissions.size > 0 || storedAttempts.size > 0)) || hasUncertainSubmission() ||
                      submissionUnknown || postDelayUnknown;
     submit.disabled = !nodesReady || submitting || jobActive || awaiting;
     productSubmit.disabled = !productsReady || submitting || jobActive || awaiting;
@@ -230,8 +236,119 @@ HTML_PAGE = r'''<!doctype html>
     if (typeof crypto.getRandomValues !== 'function') throw new Error('secure randomness is unavailable');
     return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   }
+  function forgetAttempt(entry) {
+    if (!entry) return false;
+    try {
+      localStorage.removeItem(attemptPrefix + entry.key);
+      if (localStorage.getItem(attemptPrefix + entry.key) !== null) throw new Error('storage did not remove');
+      storedAttempts.delete(entry.key);
+      submissionUnknown = false;
+      return true;
+    } catch (_) {
+      storageFault = true;
+      message(entry.feedback, '브라우저의 요청 기록을 정리하지 못했습니다. 새 주문을 중단합니다.');
+      return false;
+    }
+  }
+  function storedEntry(key, record, uncertain) {
+    const target = record.kind === 'product' ? productFeedback : feedback;
+    const row = document.createElement('li');
+    row.textContent = `${record.label} · 기존 요청 확인 중`;
+    document.getElementById('submission-list').appendChild(row);
+    const entry = {key, label: record.label, kind: record.kind, feedback: target, row,
+                   uncertain, inFlight: false, polling: false, generation: 0};
+    storedAttempts.set(key, entry);
+    return entry;
+  }
+  function scanStoredAttempts() {
+    try {
+      if (typeof localStorage === 'undefined') throw new Error('storage unavailable');
+      for (let i = 0; i < localStorage.length; ++i) {
+        const name = localStorage.key(i);
+        if (typeof name !== 'string' || !name.startsWith(attemptPrefix)) continue;
+        const key = name.slice(attemptPrefix.length);
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(key)) throw new Error('invalid stored key');
+        const record = JSON.parse(localStorage.getItem(name));
+        if (!record || record.version !== 1 || record.key !== key ||
+            !['product', 'direct'].includes(record.kind) || typeof record.label !== 'string' ||
+            !record.label || record.label.length > 256) throw new Error('invalid stored attempt');
+        if (!storedAttempts.has(key)) storedEntry(key, record, true);
+      }
+    } catch (_) {
+      storageFault = true;
+      message(productFeedback, '브라우저의 주문 기록을 확인할 수 없어 새 주문을 중단합니다.');
+    }
+    updateButton();
+  }
+  function rememberAttempt(key, url, label) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(key) || typeof label !== 'string' || !label || label.length > 256)
+      throw new Error('invalid request identity');
+    const record = {version: 1, key, kind: url.endsWith('/product-orders') ? 'product' : 'direct', label};
+    const name = attemptPrefix + key;
+    if (localStorage.getItem(name) !== null) throw new Error('request key already recorded');
+    const encoded = JSON.stringify(record);
+    localStorage.setItem(name, encoded);
+    if (localStorage.getItem(name) !== encoded) throw new Error('request was not persisted');
+    const entry = storedEntry(key, record, false);
+    entry.inFlight = true;
+    return entry;
+  }
+  async function refreshStoredAttempt(entry) {
+    if (!storedAttempts.has(entry.key) || entry.inFlight ||
+        (entry.id && pendingSubmissions.has(entry.id))) return;
+    if (entry.polling) {
+      if (observationExpired(entry.started, 5000)) {
+        ++entry.generation;
+        if (entry.controller) entry.controller.abort();
+        entry.controller = null; entry.polling = false; entry.uncertain = true;
+      }
+      return;
+    }
+    entry.polling = true; entry.started = observationClock();
+    const generation = ++entry.generation, controller = entry.controller = makeController();
+    try {
+      const options = observationOptions(controller);
+      options.headers = {'Idempotency-Key': entry.key};
+      const result = await readJson(await fetch('/order-demo/api/submission-lookup', options));
+      if (generation !== entry.generation || !storedAttempts.has(entry.key)) return;
+      if (observationExpired(entry.started, 5000)) throw new Error('lookup expired');
+      if (!result || typeof result.request_id !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,128}$/.test(result.request_id)) throw new Error('invalid original request');
+      if (result.status === 'pending') {
+        entry.id = result.request_id; entry.uncertain = false;
+        entry.row.textContent = `${entry.label} · 접수 결과 확인 중 (${entry.id})`;
+      } else if (result.status === 'completed' && result.result &&
+                 !['unknown', 'failed', 'error'].includes(result.result.status)) {
+        if (forgetAttempt(entry)) {
+          entry.row.textContent = `${entry.label} · 기존 요청 확인됨 (${result.request_id})`;
+          message(entry.feedback, '기존 주문을 확인했습니다.', true);
+          await refreshStatus();
+        }
+      } else if (result.status === 'error' && typeof result.error_type === 'string' && result.error_type) {
+        if (forgetAttempt(entry)) {
+          entry.row.textContent = `${entry.label} · 기존 요청 처리 실패 (${result.request_id})`;
+          message(entry.feedback, '기존 요청이 접수되지 않았습니다.');
+          await refreshStatus();
+        }
+      } else {
+        entry.uncertain = true;
+        entry.row.textContent = `${entry.label} · 결과 확인 필요 (${result.request_id})`;
+        message(entry.feedback, '기존 주문의 결과가 불명입니다. 확인 전 재주문하지 마세요.');
+      }
+    } catch (_) {
+      if (generation === entry.generation && storedAttempts.has(entry.key)) {
+        entry.uncertain = true;
+        entry.row.textContent = `${entry.label} · 기존 요청 확인 불가`;
+        message(entry.feedback, '기존 주문을 확인하지 못했습니다. 확인 전 재주문하지 마세요.');
+      }
+    } finally {
+      if (generation === entry.generation) { entry.polling = false; entry.controller = null; }
+      updateButton();
+    }
+  }
   function submissionFailed(element, entry = null) {
-    submissionUnknown = true;
+    if (entry && entry.key && storedAttempts.has(entry.key)) storedAttempts.get(entry.key).uncertain = true;
+    else submissionUnknown = true;
     message(element, '요청 결과를 확인할 수 없습니다. 새로고침 후에도 서버 확인 전에는 재주문하지 마세요.');
     if (entry) entry.row.textContent = `${entry.label} · 요청 결과를 확인할 수 없습니다.`;
     updateButton();
@@ -277,12 +394,14 @@ HTML_PAGE = r'''<!doctype html>
       } else if (result.status === 'completed' && result.result &&
                  !['unknown', 'failed', 'error'].includes(result.result.status)) {
         pendingSubmissions.delete(entry.id);
+        if (!forgetAttempt(storedAttempts.get(entry.key))) return;
         const slot = Number.isInteger(result.result.slot_index) ? ` · ${result.result.slot_index}번 슬롯` : '';
         entry.row.textContent = `${entry.label} · 접수 완료${slot} (${entry.id})`;
         message(entry.feedback, entry.success, true);
         await refreshStatus();
       } else if (result.status === 'error' && typeof result.error_type === 'string' && result.error_type) {
         pendingSubmissions.delete(entry.id);
+        if (!forgetAttempt(storedAttempts.get(entry.key))) return;
         const reason = result.error_type === 'ShelfFull' ? '선반에 빈 슬롯이 없습니다'
           : (result.error_type === 'PickupUnavailable' ? '픽업 재고가 없거나 확인되지 않았습니다' : '주문이 접수되지 않았습니다');
         entry.row.textContent = `${entry.label} · ${reason} (${entry.id})`;
@@ -306,18 +425,30 @@ HTML_PAGE = r'''<!doctype html>
     }
   }
   async function refreshSubmissions() {
+    scanStoredAttempts();
     if (activePost && !activePost.warned && observationExpired(activePost.started, 5000)) {
       activePost.warned = true;
       postDelayUnknown = true;
       message(activePost.element, '요청 결과를 확인할 수 없습니다. 새로고침 후에도 서버 확인 전에는 재주문하지 마세요.');
       updateButton();
     }
-    await Promise.all(Array.from(pendingSubmissions.values(), entry => refreshSubmission(entry)));
+    await Promise.all([
+      ...Array.from(pendingSubmissions.values(), entry => refreshSubmission(entry)),
+      ...Array.from(storedAttempts.values(), entry => refreshStoredAttempt(entry))
+    ]);
   }
   async function submitRequest(url, body, element, success, label) {
     let requestKey;
     try { requestKey = makeRequestKey(); }
     catch (_) { message(element, '주문 요청 식별자를 만들 수 없어 접수하지 않았습니다.'); return; }
+    let stored;
+    try { stored = rememberAttempt(requestKey, url, label); }
+    catch (_) {
+      storageFault = true;
+      message(element, '주문 기록을 저장할 수 없어 접수하지 않았습니다.');
+      updateButton();
+      return;
+    }
     const attempt = activePost = {started: observationClock(), element, warned: false};
     try {
       const response = await fetch(url, {
@@ -325,48 +456,51 @@ HTML_PAGE = r'''<!doctype html>
         body: JSON.stringify(body)
       });
       if (response.status === 503) {
+        if (!forgetAttempt(stored)) return;
         message(element, '현재 주문이 접수되지 않았습니다. 잠시 후 다시 시도해 주세요.');
         return;
       }
       if (response.status === 409) {
         const rejected = await response.json();
         if (rejected && rejected.detail === '선반에 빈 슬롯이 없습니다') {
-          const row = document.createElement('li');
+          if (!forgetAttempt(stored)) return;
+          const row = stored.row;
           row.textContent = `${label} · 선반에 빈 슬롯이 없습니다`;
-          document.getElementById('submission-list').appendChild(row);
           message(element, '선반에 빈 슬롯이 없습니다.');
           await refreshStatus();
           return;
         }
-        submissionFailed(element);
+        submissionFailed(element, stored);
         return;
       }
       const result = await readJson(response);
       if (result && result.status === 'pending' && typeof result.request_id === 'string' &&
           /^[A-Za-z0-9_-]{1,128}$/.test(result.request_id)) {
         if (pendingSubmissions.has(result.request_id)) {
-          submissionFailed(element);
+          submissionFailed(element, stored);
           return;
         }
-        const row = document.createElement('li');
-        const entry = {id: result.request_id, feedback: element, success, row, label, polling: false};
+        const row = stored.row;
+        const entry = {id: result.request_id, key: stored.key, feedback: element, success, row, label, polling: false};
+        stored.id = result.request_id;
         row.textContent = `${label} · 접수 결과 확인 중 (${entry.id})`;
-        document.getElementById('submission-list').appendChild(row);
         pendingSubmissions.set(entry.id, entry);
         message(element, '가상 주문 처리 결과를 확인 중입니다.');
         updateButton();
         if (fleetMode) void refreshSubmission(entry);
         else await refreshSubmission(entry);
       } else if (!result || ['pending', 'unknown', 'failed', 'error'].includes(result.status)) {
-        submissionFailed(element);
+        submissionFailed(element, stored);
       } else {
+        if (!forgetAttempt(stored)) return;
         if (!fleetMode) jobActive = true;
         message(element, success, true);
         await refreshStatus();
       }
     } catch (_) {
-      submissionFailed(element);
+      submissionFailed(element, stored);
     } finally {
+      stored.inFlight = false;
       if (activePost === attempt) { activePost = null; postDelayUnknown = false; }
       updateButton();
     }
@@ -795,7 +929,8 @@ HTML_PAGE = r'''<!doctype html>
   }
   document.getElementById('product-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!productsReady || submitting || jobActive || (!fleetMode && pendingSubmissions.size) ||
+    scanStoredAttempts();
+    if (!productsReady || submitting || jobActive || (!fleetMode && (pendingSubmissions.size || storedAttempts.size)) ||
         hasUncertainSubmission() || submissionUnknown || postDelayUnknown) return;
     if (!products.has(product.value)) {
       message(productFeedback, '상품을 선택해 주세요.');
@@ -810,7 +945,8 @@ HTML_PAGE = r'''<!doctype html>
   });
   document.getElementById('order-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!nodesReady || submitting || jobActive || pendingSubmissions.size || hasUncertainSubmission() ||
+    scanStoredAttempts();
+    if (!nodesReady || submitting || jobActive || pendingSubmissions.size || storedAttempts.size || hasUncertainSubmission() ||
         submissionUnknown || postDelayUnknown) return;
     if (!pickup.value || !destination.value) {
       message(feedback, '출발지와 도착지를 선택해 주세요.');
@@ -827,11 +963,13 @@ HTML_PAGE = r'''<!doctype html>
                               feedback, '가상 운반 요청을 접수했습니다.', `${pickup.value} → ${destination.value}`); }
     finally { submitting = false; updateButton(); }
   });
+  scanStoredAttempts();
   loadNodes();
   loadProducts();
   refreshStatus();
   refreshSavedOrders();
   refreshMap();
+  refreshSubmissions();
   setInterval(async () => { await Promise.all([refreshSavedOrders(), refreshMap()]); }, 3000);
   setInterval(async () => { await Promise.all([refreshStatus(), refreshSubmissions()]); }, 800);
 })();

@@ -152,6 +152,15 @@ class OrderAdmission:
                 result['error_type'] = type(job['error']).__name__
             return result
 
+    def get_by_key(self, request_key):
+        """Observe a prior request without submitting or starting work."""
+        self._identifier(request_key, 'request_key', 128)
+        with self._lock:
+            request_id = self._keys.get(request_key)
+        if request_id is None:
+            raise KeyError(request_key)
+        return self.get(request_id)
+
     def shutdown(self):
         with self._lock:
             self._stopped = True

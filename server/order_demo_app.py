@@ -1070,6 +1070,20 @@ def submission(request_id: str, request: Request):
         raise HTTPException(404, '요청을 찾을 수 없습니다') from None
 
 
+@app.get('/order-demo/api/submission-lookup')
+def submission_lookup(request: Request):
+    """Read the original attempt only; a missing key does not permit retry."""
+    demo = _demo(request)
+    values = request.headers.getlist('idempotency-key')
+    if len(values) != 1:
+        raise HTTPException(422, '요청 키가 필요합니다', headers={'Cache-Control': 'no-store'})
+    try:
+        result = demo.admission.get_by_key(values[0])
+    except (KeyError, ValueError):
+        raise HTTPException(404, '요청을 확인할 수 없습니다', headers={'Cache-Control': 'no-store'}) from None
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
 def _request_key(request):
     values = request.headers.getlist('idempotency-key')
     if len(values) > 1:

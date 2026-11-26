@@ -281,6 +281,13 @@ class PersistentOrderStore:
             return self._order(db.execute('SELECT request_id,product_id,state,result_json,error '
                                           'FROM orders WHERE request_id=?', (request_id,)).fetchone())
 
+    def get_order_by_key(self, request_key):
+        """Read an existing durable submission; absence does not authorize retry."""
+        _text(request_key, 'idempotency key', 128)
+        with self._read() as db:
+            return self._order(db.execute('SELECT request_id,product_id,state,result_json,error '
+                                          'FROM orders WHERE request_key=?', (request_key,)).fetchone())
+
     def list_orders(self):
         with self._read() as db:
             return [self._order(row) for row in db.execute('SELECT request_id,product_id,state,result_json,error '

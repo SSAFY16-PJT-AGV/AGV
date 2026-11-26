@@ -22,7 +22,7 @@ const status={mode:'fleet',action_source:'synthetic',accepting_orders:true,conne
 const map={scope:'isolated_simulation',coordinate_unit:'mm',snapshot_consistency:'separate_from_status',map_id:'m@v1',
  nodes:[{id:'A',pos:[0,0]},{id:'B',pos:[1000,0]}],edges:[{from:'A',to:'B',shape:[[0,0],[1000,0]]}],occupancy:[]};
 const response=value=>({ok:true,status:200,json:async()=>value});
-const context={Date:class extends Date { static now(){return now;} },
+const context={localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),Date:class extends Date { static now(){return now;} },
  document:{getElementById:el,createElement:()=>node(),createElementNS:()=>node(),querySelector:()=>el('intro')},
  crypto:{randomUUID:()=> 'x'},setInterval(fn){timers.push(fn)},fetch:async url=>{
  if(url.endsWith('/map')){if(holdMap)return await new Promise(resolve=>{releaseMap=()=>resolve(response(map))});return response(map)}
@@ -101,7 +101,7 @@ const map={scope:'isolated_simulation',coordinate_unit:'mm',snapshot_consistency
              {kind:'zone',resource_id:'shared',robot_id:'sim-r1'}]};
 const status={mode:'fleet',accepting_orders:true,stale:false,connected:true,unreal_connected:true,
   robots:[{robot_id:'sim-r1',status:'moving',phase:'waiting_grab',pose:{x:300,y:0,th:0},route:[]}]};
-const context={document:{getElementById:el,createElement:()=>node(),createElementNS:()=>node(),querySelector:()=>el('intro')},
+const context={localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),document:{getElementById:el,createElement:()=>node(),createElementNS:()=>node(),querySelector:()=>el('intro')},
  crypto:{randomUUID:()=> 'x'},setInterval(fn){timers.push(fn)},fetch:async url=>{
  if(url.endsWith('/map')){if(fail)throw Error('offline');return {ok:true,json:async()=>map}}
  if(url.endsWith('/nodes'))return {ok:true,json:async()=>({nodes:[{id:'A'}]})};
@@ -169,7 +169,7 @@ function el(id) {
 let timers=[], lost=false, inventoryLost=false, ordersMissing=false;
 let status={mode:'fleet', action_source:'synthetic', accepting_orders:true, connected:true,
   unreal_connected:true, stale:false, robots:[{robot_id:'sim-r1', status:'idle',route:[]}]};
-const context={crypto:{randomUUID:()=> 'request-key'},document:{getElementById:el,createElement:()=>({children:[],appendChild(x){this.children.push(x)},replaceChildren(){this.children=[]},setAttribute(){}}),
+const context={localStorage:(()=>{const m=new Map();return {get length(){return m.size},key(i){return [...m.keys()][i]??null},getItem(k){return m.has(k)?m.get(k):null},setItem(k,v){m.set(k,String(v))},removeItem(k){m.delete(k)}}})(),crypto:{randomUUID:()=> 'request-key'},document:{getElementById:el,createElement:()=>({children:[],appendChild(x){this.children.push(x)},replaceChildren(){this.children=[]},setAttribute(){}}),
   querySelector:()=>el('intro')},setInterval(f){timers.push(f)},fetch:async url=>{
     if (url.endsWith('/nodes')) return {ok:true,json:async()=>({nodes:[{id:'A'}]})};
     if (url.endsWith('/products')) return {ok:true,json:async()=>({products:[{id:'red',label:'빨강',
