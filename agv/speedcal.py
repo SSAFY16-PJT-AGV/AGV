@@ -25,7 +25,10 @@ class SpeedCal(object):
     def __init__(self, cfg, k0):
         self.c = cfg["speedcal"]
         self.L = cfg["patch"].get("length_mm")
+        # 색마다 길이가 다른 패치(새 매트의 충전 패치 14.9cm 등). 없는 색은 length_mm
+        self.L_by_color = dict(cfg["patch"].get("length_mm_by_color") or {})
         self.enabled = bool(self.L)
+        self._color = None
         self.k = float(k0)          # 기본 속도(follow.base_speed)로 달릴 때 실제 mm/s
         self.k0 = float(k0)
         self.n = 0                  # 받아들인 측정 수
@@ -39,12 +42,16 @@ class SpeedCal(object):
         self._ep = None
         self._pre = []
         self._quiet = 0
+        self._color = None
 
-    def update(self, an, u, cmd):
+    def update(self, an, u, cmd, color=None):
         """프레임 하나. u: 지금까지 적분한 명령(기본 속도 초), cmd: 직전 (좌, 우) 명령.
+        color: 지금 지나는 패치 색(PatchTracker.active). 색마다 길이가 다를 때 쓴다.
         측정이 끝나면 결과 dict를 돌려준다(받아들였든 버렸든). 아니면 None."""
         if not self.enabled or not an.sat_rows:
             return None
+        if color is not None and self._ep is not None:
+            self._color = color
         f = np.array(an.sat_rows, float)
         rec = (u, f, cmd)
         c = self.c
@@ -54,6 +61,7 @@ class SpeedCal(object):
             if f.max() >= c["on"]:
                 self._ep = list(self._pre)
                 self._quiet = 0
+                self._color = color
             return None
         self._ep.append(rec)
         if len(self._ep) > c["max_frames"]:
@@ -63,13 +71,15 @@ class SpeedCal(object):
             self._quiet += 1
             if self._quiet >= c["end_frames"]:
                 ep, self._ep, self._pre = self._ep, None, [rec]
-                return self._finish(ep)
+                color, self._color = self._color, None
+                return self._finish(ep, color)
         else:
             self._quiet = 0
         return None
 
-    def _finish(self, ep):
+    def _finish(self, ep, color=None):
         c = self.c
+        L = float(self.L_by_color.get(color, self.L)) if color else self.L
         U = np.array([r[0] for r in ep])
         F = np.array([r[1] for r in ep])
         ks = []
@@ -87,8 +97,8 @@ class SpeedCal(object):
             u_out = U[i1] + (f[i1] - th) / (f[i1] - f[i1 + 1]) * (U[i1 + 1] - U[i1])
             du = u_out - u_in
             if du > 1e-3:
-                ks.append(self.L / du)
-        res = {"rows": len(ks)}
+                ks.append(L / du)
+        res = {"rows": len(ks), "length_mm": L}
         if len(ks) < c["min_rows"]:
             return None           # 패치를 제대로 못 봄(가장자리를 스침 등): 조용히 넘어감
         ks = np.array(ks)

@@ -72,6 +72,10 @@ DEFAULT_CONFIG = {
         "confirm_frames": 2,
         "rearm_frames": 4,
         "clear_rows": 3,        # 조향 줄에서 이만큼 위·아래 줄은 보통 폭 선 하나여야 함(스퍼 띠는 얇다)
+        # 느슨 기준(확인 프레임 이어 세기에만): 이 배수(라인폭)보다 좁은 틈으로 끊긴 조각은 잇고, 위·아래 확인 줄은
+        # loose_clear_need개만 보통 폭이면 됨. 0이면 끔. 자세한 건 TeeDetector.update
+        "join_gap_k": 0.6,
+        "loose_clear_need": 1,
     },
     "geom": {
         # 차체 회전 중심에서 각 판정 지점까지 바닥 거리(mm). 이벤트 위치(odo_mm)를 실제 지점으로 맞춘다.
@@ -96,17 +100,22 @@ DEFAULT_CONFIG = {
     "patch": {
         "region_top": 0.55,     # 패치 판정 영역(화면 아래쪽)
         "length_mm": None,      # 패치의 진행 방향 길이(전부 같은 크기). 넣으면 지날 때마다 속도를 보정(speedcal)
+        "length_mm_by_color": {},  # 길이가 다른 패치만 색별로(예: {"pink": 149, "skyblue": 149}). 없는 색은 length_mm
         "s_min": 90, "v_min": 50,
         "on_frac": 0.20, "off_frac": 0.06,
         "on_frames": 3, "off_frames": 5,
-        # OpenCV HSV의 H 범위(0~180). 실제 조명에서 tools/hsv_stats.py로 재서 고칠 것
+        # OpenCV HSV의 H 범위(0~180). 실제 조명에서 tools/autocolor.py로 잡을 것.
+        # 새 매트(ssafy_v3)에 충전 패치 색 둘(분홍, 하늘)이 늘어 파랑·보라 범위를 나눴다.
+        # 하늘-파랑, 분홍-보라·빨강은 H가 가까워 실물에서 꼭 autocolor로 다시 잡는다.
         "colors": {
             "red": [[0, 6], [170, 180]],
             "orange": [[7, 18]],
             "yellow": [[19, 38]],
             "green": [[40, 90]],
-            "blue": [[95, 124]],
-            "purple": [[125, 169]],
+            "skyblue": [[91, 102]],
+            "blue": [[103, 124]],
+            "purple": [[125, 154]],
+            "pink": [[155, 169]],
         },
     },
     "follow": {
@@ -495,51 +504,88 @@ class TeeTracker(object):
         self.c = cfg["tee"]
         self.armed = True
         self._n = 0
-        self._side = None
+        self._side_seen = None
+        self._full = False
         self._off = 0
         self.last = None
 
-    def _clear(self, an, x, lw):
+    def _clear(self, an, x, lw, need=2):
         """조향 줄 위·아래(clear_rows 떨어진 줄)에는 내 선만 보통 폭으로 있어야 스퍼 띠로 본다.
         합류하며 넓어진 선이나 교차는 여러 줄에 걸쳐 넓거나 두 갈래라 여기서 걸러진다."""
         k = self.c["clear_rows"]
+        clean, seen = 0, 0
         for i in (an.ctrl_idx - k, an.ctrl_idx + k):
             if i < 0 or i >= len(an.raw):
                 continue
+            seen += 1
             runs = an.raw[i]
             if len(runs) != 1:
-                return False
+                continue
             a, b = runs[0]
             if (b - a + 1) > 2.0 * lw or not (a - lw <= x <= b + lw):
-                return False
-        return True
+                continue
+            clean += 1
+        return clean >= min(need, seen)
+
+    @staticmethod
+    def _join(runs, gap):
+        """틈이 gap 이하인 이웃 조각을 하나로."""
+        out = []
+        for a, b in sorted(runs):
+            if out and a - out[-1][1] - 1 <= gap:
+                out[-1] = (out[-1][0], max(out[-1][1], b))
+            else:
+                out.append((a, b))
+        return out
+
+    def _side(self, runs, an, tracked_x, lw, need):
+        """조향 줄 조각들로 스퍼 쪽(left/right)을 본다. 아니면 None."""
+        if not runs:
+            return None, None
+        a, b = min(runs, key=lambda r: 0 if r[0] <= tracked_x <= r[1] else min(abs(r[0] - tracked_x), abs(r[1] - tracked_x)))
+        width = b - a + 1
+        ext_l = (tracked_x - a) - lw / 2.0
+        ext_r = (b - tracked_x) - lw / 2.0
+        if width > self.c["width_k"] * lw and self._clear(an, tracked_x, lw, need):
+            big, small = max(ext_l, ext_r), min(ext_l, ext_r)
+            if big > self.c["ext_k"] * lw and small < self.c["other_k"] * lw:
+                return ("left" if ext_l > ext_r else "right"), {"width_k": round(width / lw, 1), "ext_k": round(big / lw, 1)}
+        return None, None
 
     def update(self, an, tracked_x, lw):
-        """반환: None 또는 {"type": "tee", "side": left|right}"""
+        """반환: None 또는 {"type": "tee", "side": left|right}
+
+        한 프레임을 두 기준으로 본다. 엄격(full): 조각 그대로, 위·아래 확인 줄 둘 다 보통 폭.
+        느슨(loose): 좁은 틈(join_gap_k)으로 끊긴 조각을 잇고, 확인 줄은 하나만 보통 폭이어도 됨.
+        같은 쪽으로 confirm_frames 프레임 연속(엄격이나 느슨)이고 그중 하나라도 엄격이면 스퍼.
+        모서리를 막 돌아 비스듬히 만난 스퍼는 띠가 위·아래 줄에 걸치거나 이음 자리가 살짝 끊겨 엄격 기준이
+        한 프레임씩만 맞아 확인이 안 됐다(새 매트 N01, 모서리 끝에서 17cm). 느슨 기준만으로 세면 갈림길
+        시작이 스퍼로 잡힌다(예전 매트에서 확인)."""
         if lw is None or tracked_x is None:
             return None
-        runs = an.raw[an.ctrl_idx]
-        hit = None
-        if runs:
-            a, b = min(runs, key=lambda r: 0 if r[0] <= tracked_x <= r[1] else min(abs(r[0] - tracked_x), abs(r[1] - tracked_x)))
-            width = b - a + 1
-            ext_l = (tracked_x - a) - lw / 2.0
-            ext_r = (b - tracked_x) - lw / 2.0
-            if width > self.c["width_k"] * lw and self._clear(an, tracked_x, lw):
-                big, small = max(ext_l, ext_r), min(ext_l, ext_r)
-                if big > self.c["ext_k"] * lw and small < self.c["other_k"] * lw:
-                    hit = "left" if ext_l > ext_r else "right"
-                    self.last = {"width_k": round(width / lw, 1), "ext_k": round(big / lw, 1)}
+        raw = an.raw[an.ctrl_idx]
+        hit, meas = self._side(raw, an, tracked_x, lw, 2)
+        full = hit is not None
+        if not full and self.c.get("join_gap_k", 0.0) > 0:
+            hit, meas = self._side(self._join(raw, self.c["join_gap_k"] * lw), an, tracked_x, lw,
+                                   self.c.get("loose_clear_need", 1))
         if hit:
+            self.last = meas
             self._off = 0
             if self.armed:
-                self._n = self._n + 1 if hit == self._side else 1
-                self._side = hit
-                if self._n >= self.c["confirm_frames"]:
+                if hit == self._side_seen:
+                    self._n += 1
+                    self._full = self._full or full
+                else:
+                    self._n, self._full = 1, full
+                self._side_seen = hit
+                if self._n >= self.c["confirm_frames"] and self._full:
                     self.armed = False
                     return {"type": "tee", "side": hit}
         else:
             self._n = 0
+            self._full = False
+            self._side_seen = None
             self._off += 1
             if self._off >= self.c["rearm_frames"]:
                 self.armed = True
@@ -660,7 +706,7 @@ def draw_debug(bgr, an, follower=None, junction=None, patch=None, text=None, tee
         lines.append("ctrl:%s%s%s" % (junction.state, " FORK" if junction.fork_ahead else "",
                                        " in_split" if junction.in_split else ""))
     if tee is not None and not tee.armed:
-        lines.append("tee:" + str(tee._side))
+        lines.append("tee:" + str(tee._side_seen))
     if text:
         lines.append(text)
     for i, t in enumerate(lines):
