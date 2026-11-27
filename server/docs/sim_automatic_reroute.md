@@ -56,5 +56,9 @@ Unreal 화면과 팀 v3 맵은 별도 시연 검증이 필요하다. 상태 API�
   (별도 격리 aMQTT 경로 `AMQTT_TEST_PATH` 필요).
 - 동일한 v3 가상 사본에서 N01/D02에서 출발하는 두 AGV의 경합 중 한 대가
   `N07→N01→J02→J07→N03` 다중 구간을 우회하고 두 대가 목적지에 도착하는
-  MQTT 시험도 수행했다. 시작점·대기점은 가상이고 action은 `none`이며,
-  이 시험은 v3 웹 상품이나 Unreal 화면·실물 동작을 검증하지 않는다.
+  MQTT 시험도 수행했다. 시작점·대기점은 가상이고 action은 `none`이다.
+- 팀 v3 가상 맵에서 가상 시작점 N05/J02와 시험용 동시 배정 순서를 사용해
+  웹 주문 두 건의 다중 구간 우회·합성 집기/적재와 후속 빨강 주문 완료를
+  검증했다. 실제 Unreal 화면, 기본 시작점과 실물 로봇 시험은 아니다. 재현은
+  `python -m unittest server.tests.test_sim_reroute_multi_auto_web`이며 격리
+  aMQTT 경로 `AMQTT_TEST_PATH`가 필요하다.
