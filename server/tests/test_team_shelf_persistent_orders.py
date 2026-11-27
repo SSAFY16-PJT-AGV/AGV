@@ -2,11 +2,13 @@
 import tempfile
 import unittest
 import json
+import sqlite3
 from pathlib import Path
 
 from server.team_shelf_order_slots import TeamShelfOrderSlots
 from server.team_shelf_persistent_orders import (TeamShelfPersistentOrders,
     check_recovered_team_orders, check_recovered_team_snapshot, check_completed_action_bindings)
+from server.team_shelf_persistent_orders import check_completed_reroute_handoffs
 from server.tests.test_team_shelf_order_slots import snapshot
 
 CATALOG = [{'id': 'milk', 'product_type': 'milk', 'shelf_id': 'N02',
@@ -42,6 +44,77 @@ class TeamShelfPersistentOrdersTest(unittest.TestCase):
             grab_ack = dict(pick, action='grab', applied=True)
             self.assertTrue(check_completed_action_bindings(journal, slots, lambda _: grab_ack))
             self.assertTrue(check_recovered_team_orders(journal, slots))
+            second = journal.submit('milk', 'key2')['request_id']
+            journal.claim(second)
+            slots.reserve(session, second, 'milk')
+            journal.mark_active(second, {'assigned_robot': 'sim-r1', 'order_id': 'web-2-pickup',
+                'shelf_id': 'N02', 'slot_index': 1, 'reservation_id': second})
+            pick2 = {'order_id': 'web-2-pickup', 'action_id': 'grab2', 'agv_id': 'AGV_01'}
+            place2 = {'order_id': 'web-2-delivery', 'action_id': 'place2', 'agv_id': 'AGV_01'}
+            slots.mark_dispatched(session, second, 'pick', 's3', binding=pick2)
+            slots.complete_action(session, second, 's3', True)
+            slots.mark_dispatched(session, second, 'place', 's4', binding=place2)
+            slots.complete_action(session, second, 's4', True)
+            checkpoint2 = {'pickup_task': 'web-2-pickup', 'delivery_task': 'web-2-delivery',
+                'robot_id': 'sim-r1', 'session': 'demo-session', 'twin_id': 'AGV_01', 'product': 'milk',
+                'shelf': 'N02', 'slot': 1, 'destination': 'D02',
+                'action_ack': dict(place2, action='place', applied=True)}
+            journal.mark_completed(second, {'checkpoint': checkpoint2})
+            # Reroute authorization requires the same completed web order,
+            # team-slot action, and the source/target transfer in the sim DB.
+            with sqlite3.connect(':memory:') as db:
+                db.execute('CREATE TABLE sim_reroute_generations(task_id TEXT)')
+                db.execute('CREATE TABLE sim_reroute_finishes(task_id TEXT)')
+                db.execute('CREATE TABLE tasks(task_id TEXT,status TEXT)')
+                db.execute('CREATE TABLE sim_handoff_transfers(source_task_id TEXT,target_task_id TEXT,robot_id TEXT,robot_session TEXT,ack_json TEXT)')
+                checkpoint['session'] = 'demo-session'
+                with journal._write() as orders_db:
+                    saved = json.loads(orders_db.execute('SELECT result_json FROM orders WHERE request_id=?', (request,)).fetchone()[0])
+                    saved['checkpoint'] = checkpoint
+                    orders_db.execute('UPDATE orders SET result_json=? WHERE request_id=?', (json.dumps(saved), request))
+                db.execute("INSERT INTO tasks VALUES('web-pickup','DONE')")
+                db.execute("INSERT INTO sim_reroute_generations VALUES('web-pickup')")
+                db.execute("INSERT INTO sim_reroute_finishes VALUES('web-pickup')")
+                db.execute('INSERT INTO sim_handoff_transfers VALUES(?,?,?,?,?)',
+                           ('web-pickup','web-delivery','sim-r1','demo-session',json.dumps(grab_ack)))
+                db.execute('INSERT INTO sim_handoff_transfers VALUES(?,?,?,?,?)',
+                           ('web-2-pickup','web-2-delivery','sim-r1','demo-session',
+                            json.dumps(dict(pick2, action='grab', applied=True))))
+                self.assertTrue(check_completed_reroute_handoffs(journal, slots, db))
+                db.execute("UPDATE sim_handoff_transfers SET ack_json='{}' WHERE source_task_id='web-pickup'")
+                with self.assertRaises(ValueError):
+                    check_completed_reroute_handoffs(journal, slots, db)
+                db.execute('UPDATE sim_handoff_transfers SET ack_json=? WHERE source_task_id=?',
+                           (json.dumps(grab_ack), 'web-pickup'))
+                # Latest completed delivery is still ASSIGNED until another
+                # job takes over its terminal node; it must be cross-checked.
+                db.execute("INSERT INTO tasks VALUES('web-delivery','ASSIGNED')")
+                db.execute("INSERT INTO sim_reroute_generations VALUES('web-delivery')")
+                db.execute("INSERT INTO sim_reroute_finishes VALUES('web-delivery')")
+                self.assertTrue(check_completed_reroute_handoffs(journal, slots, db))
+                db.execute("INSERT INTO tasks VALUES('other-delivery','ASSIGNED')")
+                db.execute("INSERT INTO sim_reroute_generations VALUES('other-delivery')")
+                db.execute("INSERT INTO sim_reroute_finishes VALUES('other-delivery')")
+                with self.assertRaises(ValueError):
+                    check_completed_reroute_handoffs(journal, slots, db)
+                db.execute("DELETE FROM sim_reroute_finishes WHERE task_id='other-delivery'")
+                # A prior rerouted delivery hands its held node to the next
+                # pickup. Its place ACK must match that order's slot binding.
+                db.execute("UPDATE tasks SET status='DONE' WHERE task_id='web-delivery'")
+                db.execute('INSERT INTO sim_handoff_transfers VALUES(?,?,?,?,?)',
+                           ('web-delivery','web-2-pickup','sim-r1','demo-session',
+                            json.dumps(dict(place, action='place', applied=True))))
+                self.assertTrue(check_completed_reroute_handoffs(journal, slots, db))
+                db.execute("UPDATE sim_handoff_transfers SET ack_json='{}' WHERE source_task_id='web-delivery'")
+                with self.assertRaises(ValueError):
+                    check_completed_reroute_handoffs(journal, slots, db)
+                db.execute('UPDATE sim_handoff_transfers SET ack_json=? WHERE source_task_id=?',
+                           (json.dumps(dict(place, action='place', applied=True)), 'web-delivery'))
+                db.execute("INSERT INTO tasks VALUES('unbound','DONE')")
+                db.execute("INSERT INTO sim_reroute_generations VALUES('unbound')")
+                db.execute("INSERT INTO sim_reroute_finishes VALUES('unbound')")
+                with self.assertRaises(ValueError):
+                    check_completed_reroute_handoffs(journal, slots, db)
             with self.assertRaises(ValueError):
                 check_completed_action_bindings(journal, slots,
                     lambda _: dict(grab_ack, action_id='another-grab'))

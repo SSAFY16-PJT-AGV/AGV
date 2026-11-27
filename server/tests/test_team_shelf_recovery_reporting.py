@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from server.order_demo_admission import AdmissionStopped
 from server.order_demo_app import DemoRuntime, app
-from server.tests.test_order_demo_app import request
+from server.tests.test_order_demo_app import FakeDemo, request
 from server.tests.test_submission_key_recovery import get_by_key
 
 
@@ -28,6 +28,15 @@ class _Admission:
         return self.get_by_key('existing')
     def submit_product(self, *_args):
         raise AssertionError('blocked recovery must not submit a new order')
+
+
+class RecoveryCapabilityTest(unittest.TestCase):
+    def test_team_shelf_reroute_reports_completed_recovery_scope(self):
+        demo = DemoRuntime(FakeDemo(), 1883, [])
+        demo.journal = object()
+        demo.team_shelves = True
+        demo.auto_reroute_sim = True
+        self.assertEqual(demo.snapshot()['restart_recovery_scope'], 'completed_only')
 
 
 class RecoveryReportingTest(unittest.IsolatedAsyncioTestCase):

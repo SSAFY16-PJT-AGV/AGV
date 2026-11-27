@@ -488,8 +488,6 @@ class DemoRuntime:
             result['action_source'] = 'synthetic'
         if getattr(self, 'auto_reroute_sim', False):
             result['automatic_reroute'] = 'isolated_simulation'
-            if result.get('restart_recovery'):
-                result['restart_recovery_scope'] = 'completed_except_rerouted_handoffs'
         if self.journal is not None:
             result['recovery_required'] = self._restart_blocked or not self._world_ready.is_set()
         if stale or not result['connected'] or not result['unreal_connected']:
@@ -970,9 +968,14 @@ async def lifespan(app):
                 for index in range(2, 17):
                     task_ids.extend(('{}-{}-pickup'.format(prefix, index), '{}-{}-delivery'.format(prefix, index)))
                 sessions[robot_id] = {task: session_names[robot_id] for task in task_ids}
+            team_shelf_recovery = None
+            if team_shelves and journal is not None and store.reopened and not recovery_blocked:
+                from server.team_shelf_persistent_orders import TeamShelfRerouteRecovery
+                team_shelf_recovery = TeamShelfRerouteRecovery(journal, slot_store)
             runtime = SimRuntime(db_path, sim_map, sessions, port=port,
                                  client_id='web-order-workflow', simulation_store=store,
                                  reroute_transitions=auto_reroute,
+                                 team_shelf_recovery=team_shelf_recovery,
                                  **({'field_simulation': True, 'field_initial_positions': starts}
                                     if field_mapping is not None else {}))
             runtime.start()

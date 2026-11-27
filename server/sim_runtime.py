@@ -70,7 +70,7 @@ class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
                  field_simulation=False, field_initial_positions=None, command_observations=False,
-                 investigation_notes=False, reroute_transitions=False):
+                 investigation_notes=False, reroute_transitions=False, team_shelf_recovery=None):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
         if type(command_observations) is not bool or (command_observations and not field_simulation):
@@ -80,6 +80,11 @@ class SimRuntime:
         if type(reroute_transitions) is not bool or (reroute_transitions and not field_simulation):
             raise ValueError('reroute transitions require explicit field simulation')
         self._reroute_transitions = reroute_transitions
+        if team_shelf_recovery is not None:
+            from server.team_shelf_persistent_orders import TeamShelfRerouteRecovery
+            if type(team_shelf_recovery) is not TeamShelfRerouteRecovery or not field_simulation:
+                raise ValueError('team shelf recovery requires the bound field simulation')
+        self._team_shelf_recovery = team_shelf_recovery
         if field_initial_positions is not None and not field_simulation:
             raise ValueError('field initial positions require field simulation')
         self._field_initial_positions = copy.deepcopy(field_initial_positions)
@@ -225,17 +230,32 @@ class SimRuntime:
                 self.store = self._simulation_store or (AllocationStore(self.path, field_required=True)
                                                         if self._field_simulation else AllocationStore(self.path))
                 if self._field_simulation:
-                    # Completed reroute handoffs retain locally verified Unreal
-                    # ACKs, but this DB alone cannot authenticate them on a new
-                    # process boot. Preserve the DB and require reconciliation.
+                    # The simulation DB alone cannot establish a completed
+                    # handoff. Only a bound team-shelf journal may cross-check
+                    # all historical actions. The app still gates all work on
+                    # a fresh same-world Unreal snapshot after startup.
                     with closing(self.store._connect()) as db:
                         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                         if 'sim_reroute_generations' in tables:
                             if 'tasks' not in tables:
                                 raise RuntimeError('reroute handoff history is incomplete')
-                            if db.execute("SELECT 1 FROM sim_reroute_generations g JOIN tasks t "
-                                          "ON t.task_id=g.task_id WHERE t.status='DONE' LIMIT 1").fetchone():
-                                raise RuntimeError('completed reroute handoff requires manual reconciliation before restart')
+                            completed = db.execute("SELECT 1 FROM sim_reroute_generations g JOIN tasks t "
+                                                   "ON t.task_id=g.task_id WHERE t.status='DONE' LIMIT 1").fetchone()
+                            finished = ('sim_reroute_finishes' in tables and
+                                        db.execute('SELECT 1 FROM sim_reroute_finishes LIMIT 1').fetchone())
+                            if completed or (finished and self._team_shelf_recovery is not None):
+                                if self._team_shelf_recovery is None:
+                                    raise RuntimeError('completed reroute handoff requires manual reconciliation before restart')
+                                db.execute('BEGIN')
+                                self._team_shelf_recovery.validate(self.store, db)
+                                from server.sim_reroute_restore import verify_saved_reroute_robot
+                                for task, robot, session in db.execute(
+                                        'SELECT g.task_id,g.robot_id,g.robot_session FROM sim_reroute_generations g '
+                                        'JOIN sim_reroute_finishes f ON f.task_id=g.task_id'):
+                                    if robot not in ('sim-r1', 'sim-r2') or self._tasks.get(task) != (robot, session):
+                                        raise ValueError('saved reroute task identity differs')
+                                    verify_saved_reroute_robot(db, self.map_data,
+                                        Path(self.path).parent / (robot + '.sqlite3'), task, robot, session)
                 if self._simulation_store is not None:
                     # Repeat after the process-wide lock: a validated file may
                     # have been replaced or modified while ownership was pending.
@@ -538,6 +558,17 @@ class SimRuntime:
                 robot_id, route, stopped = self.progress._job(db, task_id, robot)
                 seq, payload, state, order = self.progress._latest(db, task_id, robot_id, route, stopped)
                 parsed, canonical, digest = _decode(payload.encode('utf-8'), robot, self.progress._map_id)
+                from server.sim_reroute_transition import is_prepared
+                if self._field_simulation and is_prepared(db, task_id):
+                    if (parsed != order or state != 'acked' or order['action_at_end'].get('type') != 'unload'
+                            or self.progress._occupancy(db, task_id) != {('node', route[-1])}
+                            or db.execute('SELECT task_id FROM sim_active_robots WHERE robot_id=?', (robot,)).fetchone() != (task_id,)
+                            or db.execute('SELECT 1 FROM sim_handoff_transfers WHERE source_task_id=? OR action_id=?',
+                                          (task_id, action_ack['action_id'])).fetchone()):
+                        raise ValueError('rerouted terminal allocation differs')
+                    from server.sim_reroute_restore import restore_rerouted_terminal
+                    return copy.deepcopy(restore_rerouted_terminal(
+                        self, executor, db, task_id, session, event_id, robot, route, stopped, order))
                 if (parsed != order or state != 'acked' or stopped != route[-1]
                         or order['released_until'] != stopped
                         or order['action_at_end'].get('type') != 'unload'

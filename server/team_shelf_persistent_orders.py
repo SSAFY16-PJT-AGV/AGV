@@ -160,3 +160,88 @@ def check_completed_action_bindings(journal, slots, read_grab_ack):
         if read_grab_ack(checkpoint) != expected_grab or checkpoint.get('action_ack') != expected_place:
             raise ValueError('team actions differ from durable fleet acknowledgements')
     return True
+
+
+def check_completed_reroute_handoffs(journal, slots, db):
+    """Cross-check every completed reroute handoff against both web journals.
+
+    This is database consistency evidence for isolated simulation, not a
+    signature or a live-world proof. The caller must also verify the same
+    Unreal world, all slots, pose and carried state before permitting orders.
+    """
+    import json
+    if not check_recovered_team_orders(journal, slots):
+        raise ValueError('uncertain team order blocks reroute recovery')
+    orders = [row for row in journal.list_orders() if row['state'] == 'completed']
+    by_task = {}
+    for row in orders:
+        checkpoint = (row.get('result') or {}).get('checkpoint')
+        if not isinstance(checkpoint, dict):
+            raise ValueError('completed checkpoint is missing')
+        for phase, key in (('pick', 'pickup_task'), ('place', 'delivery_task')):
+            task = checkpoint.get(key)
+            if not isinstance(task, str) or not task or task in by_task:
+                raise ValueError('completed task binding is ambiguous')
+            by_task[task] = (row, checkpoint, phase)
+
+    def grab_ack(checkpoint):
+        row = db.execute('SELECT target_task_id,robot_id,robot_session,ack_json '
+                         'FROM sim_handoff_transfers WHERE source_task_id=?',
+                         (checkpoint['pickup_task'],)).fetchone()
+        if row is None or row[:3] != (checkpoint['delivery_task'], checkpoint['robot_id'], checkpoint['session']):
+            raise ValueError('saved simulated pickup handoff differs')
+        return json.loads(row[3])
+
+    check_completed_action_bindings(journal, slots, grab_ack)
+    rerouted = db.execute("SELECT g.task_id,t.status FROM sim_reroute_generations g "
+                          "JOIN sim_reroute_finishes f ON f.task_id=g.task_id "
+                          "JOIN tasks t ON t.task_id=g.task_id").fetchall()
+    for task, status in rerouted:
+        entry = by_task.get(task)
+        if entry is None:
+            raise ValueError('rerouted handoff has no completed team order')
+        order, checkpoint, phase = entry
+        binding = {row['phase']: row for row in slots.action_bindings(order['request_id'])}[phase]
+        expected = {'order_id': task, 'action_id': binding['action_id'], 'agv_id': binding['agv_id'],
+                    'action': 'grab' if phase == 'pick' else 'place', 'applied': True}
+        if status == 'ASSIGNED':
+            if phase != 'place' or checkpoint['action_ack'] != expected:
+                raise ValueError('terminal rerouted delivery action differs')
+            continue
+        if status != 'DONE':
+            raise ValueError('rerouted task is not a completed handoff')
+        transfer = db.execute('SELECT target_task_id,robot_id,robot_session,ack_json '
+                              'FROM sim_handoff_transfers WHERE source_task_id=?', (task,)).fetchone()
+        if transfer is None or transfer[1:3] != (checkpoint['robot_id'], checkpoint['session']):
+            raise ValueError('rerouted handoff robot or session differs')
+        ack = json.loads(transfer[3])
+        if ack != expected:
+            raise ValueError('rerouted handoff action differs from team slot binding')
+        if phase == 'pick':
+            if transfer[0] != checkpoint['delivery_task']:
+                raise ValueError('rerouted pickup target differs')
+        else:
+            target = by_task.get(transfer[0])
+            if (ack != checkpoint['action_ack'] or target is None or target[2] != 'pick'
+                    or target[1]['robot_id'] != checkpoint['robot_id']
+                    or target[1]['session'] != checkpoint['session']):
+                raise ValueError('rerouted delivery target differs')
+    return True
+
+
+class TeamShelfRerouteRecovery:
+    """Bound startup validator; live Unreal verification remains mandatory."""
+    def __init__(self, journal, slots):
+        if type(journal) is not TeamShelfPersistentOrders or journal.slots is not slots:
+            raise ValueError('bound durable team journals required')
+        self.journal, self.slots = journal, slots
+
+    def validate(self, store, db):
+        from server.sim_handoff_store import SimHandoffStore
+        if (type(store) is not SimHandoffStore or not store.reopened
+                or self.journal.simulation_id != store.creation_id
+                or not isinstance(self.journal.world_id, str)
+                or not isinstance(self.slots.world_id, str)
+                or self.journal.world_id.lower() != self.slots.world_id.lower()):
+            raise ValueError('persistent simulation, world and team slots must match')
+        return check_completed_reroute_handoffs(self.journal, self.slots, db)

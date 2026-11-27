@@ -383,7 +383,8 @@ class SimOrderExecutor:
                 result['reroute_transition_id'] = self._reroute_transition
             return result
 
-    def _restore_completed(self, order, digest, evidence, *, field_entry=None, field_history=None):
+    def _restore_completed(self, order, digest, evidence, *, field_entry=None, field_history=None,
+                           reroute_transition=None, reroute_edges=None):
         """Install already validated historical stop; never execute an order."""
         with self._lock:
             if self._status != 'idle' or self._order is not None or self._receipt is not None:
@@ -393,11 +394,24 @@ class SimOrderExecutor:
             if self._field_map is not None:
                 from server.route_occurrence import visit_indices_from_orders, plan_occurrence_segment
                 try:
-                    indices = visit_indices_from_orders(field_history)
+                    if reroute_transition is not None:
+                        if not isinstance(reroute_transition, str) or not reroute_transition or not isinstance(reroute_edges, (list, tuple)):
+                            raise ValueError('reroute identity and edges required')
+                        # The preceding parent is verified independently. Rebase
+                        # only for occurrence validation; retain actual wire seq.
+                        rebased = [dict(item, seq=index) for index, item in enumerate(field_history, 1)]
+                        indices = visit_indices_from_orders(rebased)
+                    else:
+                        if reroute_edges is not None:
+                            raise ValueError('unexpected reroute edges')
+                        indices = visit_indices_from_orders(field_history)
                     if field_history[-1] != order or indices[-1] != len(order['nodes']) - 1:
                         raise ValueError('field completed order history does not reach the final occurrence')
-                    field_route = plan_field_route(self._field_map, map_ref=self._inbox.map_id,
-                                                   incoming_edge=field_entry, goal=order['nodes'][-1])
+                    field_route = (validate_field_route(self._field_map, map_ref=self._inbox.map_id,
+                                    incoming_edge=field_entry, nodes=order['nodes'], edge_ids=reroute_edges)
+                                   if reroute_transition is not None else
+                                   plan_field_route(self._field_map, map_ref=self._inbox.map_id,
+                                                    incoming_edge=field_entry, goal=order['nodes'][-1]))
                     if field_route.nodes != tuple(order['nodes']) or not field_route.edge_ids:
                         raise ValueError('field completed path differs from verified route')
                     start = 0
@@ -408,7 +422,7 @@ class SimOrderExecutor:
                     field_segment_start = 0 if len(indices) == 1 else indices[-2]
                 except (ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
                     raise OrderRejected('field completed route proof is invalid') from exc
-            elif field_entry is not None or field_history is not None:
+            elif field_entry is not None or field_history is not None or reroute_transition is not None or reroute_edges is not None:
                 raise OrderRejected('field proof cannot restore a generic simulation')
             node = order['released_until']
             if node != order['nodes'][-1]:
@@ -458,6 +472,7 @@ class SimOrderExecutor:
                 self._field_order_entry = field_entry
                 self._field_route_edges = field_route.edge_ids
                 self._field_incoming_edge = self._field_guard_incoming = field_route.edge_ids[-1]
+                self._reroute_transition = reroute_transition
             self._recovery_evidence = copy.deepcopy(evidence)
             self._status = 'stopped'
             self._verify_field_execution()
