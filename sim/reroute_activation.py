@@ -113,7 +113,7 @@ class SimRerouteActivation:
                         or receipt['seq'] != data['parent_seq'] or receipt['digest'] != data['parent_digest']
                         or stopped != data['stopped_at'] or incoming != data['incoming_edge']
                         or data['nodes'][0] != stopped or data['nodes'][-1] != old['nodes'][-1]
-                        or data['action_at_end'] != old['action_at_end']):
+                        or _canonical(data['action_at_end']) != _canonical(old['action_at_end'])):
                     raise ValueError('activation does not match the current stopped parent')
                 route = plan_field_route(self.executor._field_map, map_ref=self.inbox.map_id,
                     incoming_edge=incoming, goal=old['nodes'][-1], blocked_resources=blocked)

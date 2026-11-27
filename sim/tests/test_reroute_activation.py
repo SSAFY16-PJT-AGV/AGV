@@ -4,10 +4,14 @@ import hashlib
 import json
 from contextlib import closing
 import sqlite3
+import tempfile
 import unittest
 
 import sim.tests.test_reroute_acceptance as fixture
 from sim.order_inbox import OrderRejected
+from sim.order_inbox import SimOrderInbox
+from sim.order_executor import SimOrderExecutor
+from sim.reroute_acceptance import SimRerouteAcceptance
 from sim.reroute_activation import SimRerouteActivation
 
 
@@ -102,6 +106,37 @@ class RerouteActivationTest(fixture.RerouteAcceptanceTest):
         with closing(sqlite3.connect(self.inbox.path)) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM sim_reroute_activations').fetchone(), (0,))
         self.assertEqual(self.executor.snapshot()['status'], 'stopped')
+
+    def test_boolean_and_numeric_action_are_not_interchangeable(self):
+        with tempfile.TemporaryDirectory(prefix='reroute-json-types-') as folder:
+            from pathlib import Path
+            inbox = SimOrderInbox(Path(folder) / 'robot.sqlite3', 'sim-r1', 'wait-test@v1')
+            inbox.initialize()
+            executor = SimOrderExecutor(inbox, self.data, 'S1', experimental_field_map=True,
+                                        field_incoming_edge='IN1')
+            old = copy.deepcopy(self.original)
+            old['action_at_end'] = {'type': 'none', 'flag': True}
+            executor.accept(json.dumps(old).encode('utf-8'))
+            state = executor.tick(10)
+            acceptance = SimRerouteAcceptance(executor, robot_session='boot-1')
+            acceptance.initialize()
+            proposal = copy.deepcopy(self.message)
+            proposal['data']['parent_digest'] = state['receipt']['digest']
+            proposal['data']['action_at_end'] = {'type': 'none', 'flag': True}
+            forged = copy.deepcopy(proposal)
+            forged['data']['action_at_end']['flag'] = 1
+            with self.assertRaises(OrderRejected):
+                acceptance.accept(canonical(forged))
+            self.assertTrue(acceptance.accept(canonical(proposal))['new'])
+            activation = SimRerouteActivation(acceptance)
+            activation.initialize()
+            commit = {'type': 'sim.reroute.activate.v1', 'data': dict(proposal['data'],
+                      proposal_digest=hashlib.sha256(canonical(proposal)).hexdigest())}
+            # Python compares True == 1, but their JSON representations differ.
+            executor._order['action_at_end']['flag'] = 1
+            with self.assertRaises(OrderRejected):
+                activation.record(canonical(commit))
+            self.assertEqual(executor.snapshot()['status'], 'stopped')
 
 
 if __name__ == '__main__':
