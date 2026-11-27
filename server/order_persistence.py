@@ -320,6 +320,15 @@ class PersistentOrderStore:
             db.execute("INSERT INTO order_events(request_id,state) VALUES (?,'dispatching')", (request_id,))
             return self._order((row[0], row[1], 'dispatching', row[3], row[4]))
 
+    def _validate_assignment(self, db, request_id, product_id, result):
+        reservation = db.execute('SELECT request_id,shelf_id,slot_index,state FROM slot_reservations '
+                                 'WHERE reservation_id=?', (result['reservation_id'],)).fetchone()
+        product = self.products[product_id]
+        if (reservation != (request_id, result['shelf_id'], result['slot_index'], 'reserved')
+                or result['shelf_id'] != product['shelf_id']
+                or result['slot_index'] >= product['slot_count']):
+            raise ValueError('assigned order does not match its slot reservation')
+
     def _transition(self, request_id, state, allowed, result=None, error=None):
         _text(request_id, 'request ID')
         encoded = None if result is None else _json(result)
@@ -332,13 +341,7 @@ class PersistentOrderStore:
             if old[0] not in allowed:
                 raise RuntimeError('unsafe simulated order state transition')
             if state == 'active' and old[0] == 'dispatching':
-                reservation = db.execute('SELECT request_id,shelf_id,slot_index,state FROM slot_reservations '
-                                         'WHERE reservation_id=?', (result['reservation_id'],)).fetchone()
-                product = self.products[old[2]]
-                if (reservation != (request_id, result['shelf_id'], result['slot_index'], 'reserved')
-                        or result['shelf_id'] != product['shelf_id']
-                        or result['slot_index'] >= product['slot_count']):
-                    raise ValueError('assigned order does not match its slot reservation')
+                self._validate_assignment(db, request_id, old[2], result)
             if encoded is not None and old[1] is not None:
                 previous = json.loads(old[1])
                 incoming = json.loads(encoded)
