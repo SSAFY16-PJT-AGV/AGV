@@ -66,6 +66,7 @@ class SimMqttOrderRobot:
         self._event_uncertain = False
         self._pending_mid = None
         self._event_segments = set()
+        self._reroute_driver = None
         self._client = self._new_client()
 
     def _new_client(self):
@@ -288,57 +289,124 @@ class SimMqttOrderRobot:
                 raise _ConnectionLost('simulated MQTT connection lost')
             return self.executor.tick(dt_seconds)
 
+    def start_reroute(self, execution, payload, *, guard):
+        """Install one guarded virtual generation and its per-tick driver."""
+        from sim.reroute_execution import SimRerouteExecution
+        if (type(execution) is not SimRerouteExecution or execution.executor is not self.executor
+                or not isinstance(payload, bytes)
+                or getattr(getattr(guard, 'robot_receiver', None), 'robot', None) is not self):
+            raise ValueError('bound simulated robot, execution and guard required')
+        try:
+            result = execution.start(payload, guard=guard, bind_robot=self)
+            if result.get('new') is False and result.get('state') in ('moving', 'stopped'):
+                return result
+            if result.get('new') is not True or result.get('state') != 'moving':
+                raise RuntimeError('an existing generation cannot be resumed automatically')
+            return result
+        except Exception:
+            with self._lock:
+                self._fail()
+            raise
+
     def tick(self, dt_seconds):
         with self._lock:
             if not self.ready:
                 raise RuntimeError('simulated MQTT robot is unavailable')
-            processing_order = False
+            driver = self._reroute_driver
+            if driver is None:
+                return self._tick_regular_locked(dt_seconds)
             try:
-                while True:
-                    try:
-                        payload, mid, qos = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    processing_order = True
-                    if not self.ready:
-                        raise _ConnectionLost('simulated MQTT connection lost')
+                state = self.executor.snapshot()
+                if self._queue.empty() and state.get('status') == 'stopped':
+                    return state
+                if not self._queue.empty():
+                    from sim.order_inbox import _decode
+                    payload, mid, qos = self._queue.get_nowait()
+                    order, _canonical, _digest = _decode(payload, self.robot_id, self.executor._inbox.map_id)
+                    current = state.get('order') or {}
+                    if (order['seq'] != 1 or order['order_id'] == current.get('order_id')
+                            or state['status'] != 'stopped' or state['current_node'] != current['nodes'][-1]):
+                        raise ValueError('generation continuation requires a separate guarded driver')
                     guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
                     with guard:
                         if not self.ready:
                             raise _ConnectionLost('simulated MQTT connection lost')
                         if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
-                            raise ValueError('order does not match a reserved simulated segment')
+                            raise ValueError('new order does not match a reserved segment')
                         self.executor.accept(payload)
-                    if not self.ready or self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
+                    if self.executor._reroute_transition is not None or not self.ready:
+                        raise ValueError('previous generation did not close')
+                    if self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
                         raise RuntimeError('simulated order acknowledgement failed')
-                    processing_order = False
+                    self._reroute_driver = None
+                    return self._tick_regular_locked(dt_seconds)
+            except Exception as exc:
+                self._fail()
+                raise RuntimeError('simulated generation processing stopped') from exc
+        # Never hold robot._lock while acquiring the generation guard's outer
+        # lifecycle/connection locks. The guard reacquires robot._lock and
+        # checks the identical driver immediately before each virtual tick.
+        execution, payload, generation_guard = driver
+        try:
+            return execution.tick(payload, dt_seconds, guard=generation_guard, expected_driver=driver)
+        except Exception as exc:
+            with self._lock:
+                self._fail()
+            raise RuntimeError('simulated generation processing stopped') from exc
+
+    def _tick_regular_locked(self, dt_seconds):
+        """Run the unchanged ordinary-order path while robot._lock is held."""
+        if not self.ready:
+            raise RuntimeError('simulated MQTT robot is unavailable')
+        if self._reroute_driver is not None:
+            raise RuntimeError('generation driver must use its own guard')
+        processing_order = False
+        try:
+            while True:
+                try:
+                    payload, mid, qos = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                processing_order = True
                 if not self.ready:
                     raise _ConnectionLost('simulated MQTT connection lost')
-                state = self.executor.snapshot()
-                if (state.get('status') == 'moving' and type(dt_seconds) in (int, float)
-                        and dt_seconds > 0 and (self._authorization_guard or self._order_authorizer)):
-                    payload = json.dumps(state['order'], ensure_ascii=False, allow_nan=False,
-                                         separators=(',', ':')).encode('utf-8')
-                    guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
-                    with guard:
-                        if not self.ready:
-                            raise _ConnectionLost('simulated MQTT connection lost')
-                        if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
-                            raise ValueError('reserved simulated segment is no longer current')
-                        return self._tick_executor(dt_seconds)
-                return self._tick_executor(dt_seconds)
-            except Exception as exc:
-                if (isinstance(exc, _ConnectionLost) and not processing_order and not self._event_uncertain
-                        and (self._recoverable_disconnect or not self._failed.is_set())):
-                    # No command was removed from the queue and no event is
-                    # uncertain. Preserve this disconnect for reconciliation,
-                    # even if Paho's disconnect callback has not run yet.
-                    self._failed.set()
-                    self._ready.clear()
-                    self._recoverable_disconnect = True
-                else:
-                    self._fail()
-                raise RuntimeError('simulated order processing stopped') from exc
+                guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
+                with guard:
+                    if not self.ready:
+                        raise _ConnectionLost('simulated MQTT connection lost')
+                    if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
+                        raise ValueError('order does not match a reserved simulated segment')
+                    self.executor.accept(payload)
+                if not self.ready or self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
+                    raise RuntimeError('simulated order acknowledgement failed')
+                processing_order = False
+            if not self.ready:
+                raise _ConnectionLost('simulated MQTT connection lost')
+            state = self.executor.snapshot()
+            if (state.get('status') == 'moving' and type(dt_seconds) in (int, float)
+                    and dt_seconds > 0 and (self._authorization_guard or self._order_authorizer)):
+                payload = json.dumps(state['order'], ensure_ascii=False, allow_nan=False,
+                                     separators=(',', ':')).encode('utf-8')
+                guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
+                with guard:
+                    if not self.ready:
+                        raise _ConnectionLost('simulated MQTT connection lost')
+                    if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
+                        raise ValueError('reserved simulated segment is no longer current')
+                    return self._tick_executor(dt_seconds)
+            return self._tick_executor(dt_seconds)
+        except Exception as exc:
+            if (isinstance(exc, _ConnectionLost) and not processing_order and not self._event_uncertain
+                    and (self._recoverable_disconnect or not self._failed.is_set())):
+                # No command was removed from the queue and no event is
+                # uncertain. Preserve this disconnect for reconciliation,
+                # even if Paho's disconnect callback has not run yet.
+                self._failed.set()
+                self._ready.clear()
+                self._recoverable_disconnect = True
+            else:
+                self._fail()
+            raise RuntimeError('simulated order processing stopped') from exc
 
     def publish_event(self, event):
         """Publish one matching virtual stop event; PUBACK is not execution proof."""

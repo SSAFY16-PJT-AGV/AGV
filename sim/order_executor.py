@@ -9,7 +9,7 @@ import math
 import threading
 
 from server.routing import MapGraph, UnsupportedRobotRoutingError
-from server.field_map_planner import plan_field_route
+from server.field_map_planner import plan_field_route, validate_field_route
 from sim.order_inbox import OrderRejected, SimOrderInbox, Receipt, _decode
 
 
@@ -90,6 +90,8 @@ class SimOrderExecutor:
         self._field_guard_incoming = field_incoming_edge
         self._field_order_entry = None
         self._field_route_edges = None
+        self._reroute_transition = None
+        self._reroute_guard_thread = None
         self._recovery_evidence = None
         self._waypoints = ()
         self._waypoint_visits = ()
@@ -123,8 +125,15 @@ class SimOrderExecutor:
                     raise ValueError('field initial pose differs from start node')
                 return
             nodes = self._order['nodes']
-            route = plan_field_route(self._field_map, map_ref=self._inbox.map_id,
-                                     incoming_edge=self._field_order_entry, goal=nodes[-1])
+            if self._reroute_transition is None:
+                route = plan_field_route(self._field_map, map_ref=self._inbox.map_id,
+                                         incoming_edge=self._field_order_entry, goal=nodes[-1])
+            else:
+                if self._receipt is None:
+                    raise ValueError('reroute receipt is missing')
+                self._inbox._verify_reroute_motion(self._order, self._receipt, self._reroute_transition)
+                route = validate_field_route(self._field_map, map_ref=self._inbox.map_id,
+                    incoming_edge=self._field_order_entry, nodes=nodes, edge_ids=self._field_route_edges)
             if tuple(nodes) != route.nodes or self._field_route_edges != route.edge_ids:
                 raise ValueError('field route changed')
             start, end = self._segment_start_index, self._release_index
@@ -179,6 +188,9 @@ class SimOrderExecutor:
         order, _canonical, digest = _decode(payload, self._inbox.robot_id, self._inbox.map_id)
         with self._lock:
             self._verify_field_execution()
+            if (self._reroute_transition is not None and order['seq'] != 1
+                    and self._reroute_guard_thread != threading.get_ident()):
+                raise OrderRejected('a generation-aware server guard is required')
             if self._status == 'error':
                 raise OrderRejected('executor requires explicit reconciliation')
             if (self._receipt is not None and order['order_id'] == self._receipt.order_id
@@ -243,11 +255,62 @@ class SimOrderExecutor:
             if order['seq'] == 1:
                 self._field_route_edges = field_edges
                 self._field_order_entry = self._field_incoming_edge
+                self._reroute_transition = None
             self._recovery_evidence = None
             self._waypoints = tuple(waypoints)
             self._waypoint_visits = tuple(waypoint_visits)
             self._next_waypoint = 0
             self._status = 'moving'
+            return receipt
+
+    def _begin_reroute(self, payload, *, transition_id, incoming_edge, edge_ids):
+        """Start one virtual generation while caller holds the server guard."""
+        order, _canonical, _digest = _decode(payload, self._inbox.robot_id, self._inbox.map_id)
+        with self._lock:
+            self._verify_field_execution()
+            if self._reroute_guard_thread != threading.get_ident():
+                raise OrderRejected('a generation-aware server guard is required')
+            if (self._field_map is None or self._reroute_transition is not None
+                    or self._status != 'stopped' or self._receipt is None or self._order is None
+                    or self._receipt.state != 'completed' or self._current_node != self._order['released_until']
+                    or order['order_id'] != self._receipt.order_id or order['seq'] != self._receipt.seq + 1
+                    or not order['nodes'] or order['nodes'][0] != self._current_node
+                    or order['nodes'][-1] != self._order['nodes'][-1]
+                    or json.dumps(order['action_at_end'], sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+                       != json.dumps(self._order['action_at_end'], sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+                    or incoming_edge != self._field_incoming_edge):
+                raise OrderRejected('reroute does not follow the stopped parent')
+            route = validate_field_route(self._field_map, map_ref=self._inbox.map_id,
+                incoming_edge=incoming_edge, nodes=order['nodes'], edge_ids=edge_ids)
+            end = next((index for index in range(1, len(order['nodes']))
+                        if order['nodes'][index] == order['released_until']), None)
+            if end is None:
+                raise OrderRejected('reroute release must advance from the stopped node')
+            waypoints, visits = [], []
+            for visit, (source, target) in enumerate(zip(order['nodes'][:end], order['nodes'][1:end + 1]), 1):
+                points = self._shapes[(source, target)]
+                for index, (x, y) in enumerate(points[1:], 1):
+                    final = index == len(points) - 1
+                    waypoints.append((x, y, target if final else None))
+                    visits.append(visit if final else None)
+            if not waypoints:
+                raise OrderRejected('reroute segment contains no geometry')
+            receipt = self._inbox._accept_reroute(payload, transition_id)
+            if not receipt.new:
+                return receipt
+            self._order, self._receipt = copy.deepcopy(order), receipt
+            self._release_index, self._visit_index, self._segment_start_index = end, 0, 0
+            self._field_order_entry, self._field_route_edges = incoming_edge, route.edge_ids
+            self._field_incoming_edge = self._field_guard_incoming = incoming_edge
+            self._reroute_transition = transition_id
+            self._recovery_evidence = None
+            self._waypoints, self._waypoint_visits, self._next_waypoint = tuple(waypoints), tuple(visits), 0
+            self._status = 'moving'
+            try:
+                self._verify_field_execution()
+            except BaseException:
+                self._status = 'error'
+                raise
             return receipt
 
     def tick(self, dt_seconds):
@@ -263,6 +326,9 @@ class SimOrderExecutor:
             raise ValueError('elapsed time is too large')
         with self._lock:
             self._verify_field_execution()
+            if (self._reroute_transition is not None and self._status == 'moving'
+                    and self._reroute_guard_thread != threading.get_ident()):
+                raise OrderRejected('a generation-aware server guard is required')
             while self._status == 'moving' and remaining > 0:
                 x, y, node = self._waypoints[self._next_waypoint]
                 dx, dy = x - self._x, y - self._y
@@ -313,6 +379,8 @@ class SimOrderExecutor:
                 result['released_index'] = self._release_index
             if self._recovery_evidence is not None:
                 result['recovered'] = True
+            if self._reroute_transition is not None:
+                result['reroute_transition_id'] = self._reroute_transition
             return result
 
     def _restore_completed(self, order, digest, evidence, *, field_entry=None, field_history=None):

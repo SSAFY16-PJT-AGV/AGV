@@ -43,7 +43,8 @@ class SimRerouteActivation:
         except sqlite3.Error as exc:
             raise OrderRejected('simulated activation journal is unavailable') from exc
 
-    def _verify_activations(self, db):
+    @staticmethod
+    def _verify_activations(db):
         rows = db.execute('SELECT transition_id,order_id,parent_seq,proposal_digest,digest,payload,state '
                           'FROM sim_reroute_activations LIMIT 1025').fetchall()
         if len(rows) > 1024:
