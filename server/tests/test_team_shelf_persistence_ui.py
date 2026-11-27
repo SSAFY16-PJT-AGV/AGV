@@ -34,6 +34,9 @@ async function run(extra){
   restart_recovery_scope:'completed_only',synthetic_replenishment_available:false});
  assert(!x.note.hidden);assert(x.note.textContent.includes('완료'));
  assert(x.note.textContent.includes('불명'));assert(x.synthetic.hidden);
+ x=await run({state_persistence:'durable',restart_recovery:true,
+  restart_recovery_scope:'completed_only',synthetic_replenishment_available:true});
+ assert(!x.note.hidden);assert(x.note.textContent.includes('완료'));assert(!x.synthetic.hidden);
  x=await run({state_persistence:'process_only',restart_recovery:false,
   restart_recovery_scope:'none',synthetic_replenishment_available:true});
  assert(!x.note.hidden);assert(x.note.textContent.includes('이번 시연'));

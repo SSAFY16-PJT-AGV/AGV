@@ -8,6 +8,7 @@ from server.team_shelf_persistent_orders import TeamShelfPersistentOrders
 from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
 from server.tests.test_team_shelf_synthetic_replenishment import SyntheticReplenishmentTest
 from server.order_demo_admission import AdmissionConflict, AdmissionStopped
+from server.order_persistent_admission import PersistentAdmission
 
 PRODUCTS = [{'id': 'milk', 'product_type': 'milk', 'pickup_node': 'D01',
              'destination_node': 'D02', 'shelf_id': 'N02', 'slot_count': 4}]
@@ -97,6 +98,23 @@ class DurableSyntheticServiceTest(unittest.TestCase):
             restarted.validate_durable(order)
         self.assertEqual(self.demo.journal.get_order_by_key('key')['request_id'], first['request_id'])
 
+    def test_queued_approval_after_restart_fails_before_any_publish(self):
+        self.service.capture(threshold=1)
+        first = self.service.submit('milk', threshold=1, approved=True, request_key='key')
+        restarted = SyntheticReplenishment(self.demo, clock=lambda: self.now, max_age_seconds=5)
+        published = []
+        def dispatch(order):
+            restarted.validate_durable(order)
+            published.append(order['request_id'])
+        admission = PersistentAdmission(self.demo.journal, dispatch, self.demo.stop_event, wait_seconds=.01)
+        self.demo.admission = admission
+        admission.resume()
+        self.assertTrue(admission.join(5))
+        self.assertEqual(published, [])
+        self.assertEqual(self.store.inspect()['claims'], [])
+        self.assertEqual(self.demo.journal.get_order(first['request_id'])['state'], 'failed')
+        self.assertEqual(self.demo.journal.get_order_by_key('key')['request_id'], first['request_id'])
+
     def test_recovery_blocked_preserves_existing_key_and_rejects_new(self):
         self.service.capture(threshold=1)
         first = self.service.submit('milk', threshold=1, approved=True, request_key='key')
@@ -105,6 +123,14 @@ class DurableSyntheticServiceTest(unittest.TestCase):
                          {'status': 'unknown', 'request_id': first['request_id']})
         with self.assertRaises(AdmissionStopped):
             self.service.submit('milk', threshold=1, approved=True, request_key='new')
+
+    def test_occupied_pickup_rejects_before_a_durable_order_is_created(self):
+        self.service.capture(threshold=1)
+        self.mock_pickup.return_value = False
+        with self.assertRaises(ValueError):
+            self.service.submit('milk', threshold=1, approved=True, request_key='blocked')
+        self.assertEqual(self.demo.journal.list_orders(), [])
+        self.assertEqual(self.store.inspect()['claims'], [])
 
 
 if __name__ == '__main__':

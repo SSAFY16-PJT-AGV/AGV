@@ -32,13 +32,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class TeamShelfSyntheticMqttTest(unittest.TestCase):
+    def test_persistent_approved_shortage_uses_existing_mqtt_workflow(self):
+        self._exercise(('milk',), persistent=True)
+
     def test_approved_shortage_runs_existing_mqtt_workflow_to_slot_actions(self):
         self._exercise(('milk',))
 
     def test_expired_unreal_snapshot_is_refreshed_before_approval(self):
         self._exercise(('milk',), delay_capture=True)
 
-    def _exercise(self, product_ids, *, repeat=False, delay_capture=False):
+    def _exercise(self, product_ids, *, repeat=False, delay_capture=False, persistent=False):
         broker_port, server_port = free_port(), free_port()
         while broker_port == server_port or 8000 in (broker_port, server_port):
             broker_port, server_port = free_port(), free_port()
@@ -89,6 +92,8 @@ class TeamShelfSyntheticMqttTest(unittest.TestCase):
                 'MQTT_HOST': '127.0.0.1', 'MQTT_PORT': str(broker_port), 'AGV_TWIN_WEBSOCKET': '1',
                 'AGV_TWIN_UNREAL_TOKEN': token,
                 'AGV_TWIN_ROBOT_MAP': json.dumps({'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'})})
+            if persistent:
+                env['AGV_ORDER_PERSIST_DIR'] = str(folder / 'state')
             log = cleanup.enter_context((folder / 'server.log').open('w', encoding='utf-8'))
             server = subprocess.Popen([python, '-m', 'uvicorn', 'server.order_demo_app:app', '--host',
                 '127.0.0.1', '--port', str(server_port), '--workers', '1', '--no-proxy-headers'],

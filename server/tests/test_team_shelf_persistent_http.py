@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.request import Request
 from contextlib import ExitStack
 import json
 import subprocess
@@ -16,6 +17,42 @@ from server.tests import test_team_shelf_world_restart_http as previous
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class TeamShelfPersistentHttpTest(unittest.TestCase):
+    def test_interrupted_synthetic_approval_remains_unknown_after_server_restart(self):
+        with tempfile.TemporaryDirectory(prefix='team-persistent-synthetic-') as temp:
+            state = Path(temp) / 'state'
+            original_env = previous.isolated_environment
+            original_api = previous.api
+            first = True
+            def persistent_environment(source):
+                env = original_env(source)
+                env['AGV_ORDER_PERSIST_DIR'] = str(state)
+                return env
+            def synthetic_api(port, method, path, key=None):
+                nonlocal first
+                if method != 'POST' or path != '/order-demo/api/product-orders':
+                    return original_api(port, method, path, key)
+                def post(path, data, request_key=None):
+                    headers = {'Host': '127.0.0.1:8000', 'Origin': 'http://127.0.0.1:8000',
+                               'Content-Type': 'application/json'}
+                    if request_key:
+                        headers['Idempotency-Key'] = request_key
+                    req = Request('http://127.0.0.1:{}{}'.format(port, path),
+                                  data=json.dumps(data).encode(), headers=headers)
+                    with previous.HTTP.open(req, timeout=5) as response:
+                        return response.status, json.load(response)
+                if first:
+                    first = False
+                    code, report = post('/order-demo/api/synthetic-shortages', {'threshold': 1})
+                    self.assertEqual(code, 200)
+                    self.assertEqual(report['products']['milk']['status'], 'shortage')
+                return post('/order-demo/api/synthetic-replenishment',
+                            {'product_id': 'milk', 'threshold': 1, 'approved': True}, key)
+            case = previous.TeamShelfWorldRestartHttpTest(
+                'test_same_world_and_request_key_after_server_restart_do_not_publish')
+            with patch.object(previous, 'isolated_environment', side_effect=persistent_environment), \
+                    patch.object(previous, 'api', side_effect=synthetic_api):
+                case.test_same_world_and_request_key_after_server_restart_do_not_publish(expect_retry=False)
+
     def test_two_servers_cannot_own_same_state(self):
         with tempfile.TemporaryDirectory(prefix='team-persistent-owner-') as temp, ExitStack() as cleanup:
             folder = Path(temp)

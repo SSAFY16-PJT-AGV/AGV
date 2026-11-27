@@ -58,6 +58,9 @@ class TeamShelfSourceFreshnessTest(unittest.TestCase):
 
     def test_stale_source_gets_a_fresh_snapshot_before_reporting(self):
         self.now += 60
+        # Keep the asynchronous success case tolerant of a loaded CI host;
+        # the separate no-reply test still exercises the short timeout.
+        self.service.refresh_timeout = 2.0
         with ThreadPoolExecutor(max_workers=1) as pool:
             result = pool.submit(self.service.capture, threshold=1)
             deadline = time.monotonic() + 2

@@ -304,6 +304,11 @@ class DemoRuntime:
                 state = self.engine.snapshot()
                 self._record_orders(state)
                 if self._ready() and self.actions.available_fast():
+                    if getattr(self, 'team_shelves', False) and self.journal.get_approval(order['request_id']) is not None:
+                        service = getattr(self, 'synthetic_replenishment', None)
+                        if service is None:
+                            raise ValueError('synthetic approval evidence is unavailable')
+                        service.validate_durable(order)
                     inventory = self.engine.inventory
                     if not inventory.can_reserve(product['shelf_id'], product['product_type']):
                         raise ShelfFull('no confirmed empty simulated shelf slot')
@@ -478,7 +483,7 @@ class DemoRuntime:
             result['state_persistence'] = 'durable' if self.journal is not None else 'process_only'
             result['restart_recovery'] = self.journal is not None
             result['restart_recovery_scope'] = 'completed_only' if self.journal is not None else 'none'
-            result['synthetic_replenishment_available'] = self.journal is None
+            result['synthetic_replenishment_available'] = True
         if self._action_source == 'synthetic':
             result['action_source'] = 'synthetic'
         if self.journal is not None:
@@ -1104,9 +1109,8 @@ async def lifespan(app):
                 can_send_state=demo._may_send_state if journal else None,
                 on_snapshot=accept_team_world if journal else None,
                 on_invalidate=demo._invalidate_world if journal else None)
-            if journal is None:
-                from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
-                demo.synthetic_replenishment = SyntheticReplenishment(demo)
+            from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
+            demo.synthetic_replenishment = SyntheticReplenishment(demo)
         app.state.mqtt_service = service
         try:
             demo.start()
