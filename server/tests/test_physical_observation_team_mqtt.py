@@ -1,5 +1,6 @@
 """Actual team MQTT/controller and server exchange on a test-owned broker only."""
 import os
+import asyncio
 from contextlib import ExitStack
 import json
 import socket
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +17,7 @@ from server.allocation_store import AllocationStore
 from server.physical_reconcile import PhysicalReconciler
 from server.physical_reconcile_mqtt import PhysicalReconcileMqtt, isolated_gate_reconciliation
 from server.physical_evidence_observer import PhysicalEvidenceInbox, PhysicalEvidenceWatcher
+from server.physical_recovery_diagnostics import PhysicalRecoveryDiagnostics
 from server.recovery import RecoveryGate
 from sim.event_inbox import SimEventInbox
 
@@ -108,6 +111,31 @@ class TeamReconcileMqttTests(unittest.TestCase):
                     self.assertFalse(result['current_hold_proven'])
                     self.assertTrue(links[robot].disconnect_pending())
                     self.assertEqual((runners[robot].state, runners[robot].resume_count), ('hold', 1))
+                # Inspect the same existing gate, live watcher and signed
+                # ledger. The diagnostic must not replay or authorize either
+                # robot even though both signed confirmations were recorded.
+                diagnostic = PhysicalRecoveryDiagnostics(gate, watcher, isolated=True).snapshot()
+                self.assertEqual(diagnostic['scope'], 'isolated_physical_observation')
+                self.assertEqual({row['robot_id'] for row in diagnostic['tasks']}, set(links))
+                for row in diagnostic['tasks']:
+                    self.assertEqual((row['gate'], row['signed_record'], row['event_state']),
+                                     ('blocked', 'recorded', 'not_observed'))
+                    self.assertFalse(row['motion_authorized'])
+                    self.assertFalse(row['physical_stop_proven'])
+                from server.main import app
+                from server.tests.test_physical_recovery_diagnostics import call
+                previous = app.state._state.copy()
+                try:
+                    app.state.physical_recovery_diagnostics = PhysicalRecoveryDiagnostics(gate, watcher, isolated=True)
+                    with patch.dict(os.environ, {}, clear=True):
+                        status, headers, response = asyncio.run(call('/robots/physical-recovery'))
+                    self.assertEqual(status, 200)
+                    self.assertEqual(headers[b'cache-control'], b'no-store')
+                    self.assertEqual(response, diagnostic)
+                    self.assertNotIn(controllers['physical-1'].session, json.dumps(response))
+                finally:
+                    app.state._state.clear()
+                    app.state._state.update(previous)
             self.assertEqual(store.list_occupancy(), before)
             self.assertEqual(gate._blocked, {'T1', 'T2'})
             self.assertEqual(inbox.list_pending(), [])

@@ -93,6 +93,21 @@ app.include_router(sim_router)
 app.include_router(twin_router)
 
 
+@app.get("/robots/physical-recovery")
+def physical_recovery_observations(request: Request):
+    """Read explicitly bound isolated claims without enabling physical motion."""
+    require_local_observation_access(request)
+    try:
+        from server.physical_recovery_diagnostics import PhysicalRecoveryDiagnostics
+        diagnostics = getattr(request.app.state, 'physical_recovery_diagnostics', None)
+        if type(diagnostics) is not PhysicalRecoveryDiagnostics:
+            raise ValueError('explicit isolated diagnostics unavailable')
+        return JSONResponse(content=diagnostics.snapshot(), headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(status_code=503, detail="Physical recovery observations unavailable",
+                            headers={"Cache-Control": "no-store"}) from None
+
+
 @app.get("/robots")
 def robot_observations(request: Request):
     """Return historical MQTT observations, never an authorization to move."""
