@@ -77,6 +77,7 @@ class SimRerouteMqttReceiver:
         self._worker = None
         self._started = False
         self._lifecycle_lock = threading.RLock()
+        self._connection_fence = threading.RLock()
         self._network_cleanup_failed = False
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
             client_id=robot.robot_id + '-reroute-' + secrets.token_hex(8), protocol=mqtt.MQTTv311,
@@ -119,9 +120,10 @@ class SimRerouteMqttReceiver:
             self._failed.set()
 
     def _disconnect(self, _client, _userdata, _flags, _reason, _properties):
-        self._ready.clear()
-        if not self._stopping.is_set():
-            self._failed.set()
+        with self._connection_fence:
+            self._ready.clear()
+            if not self._stopping.is_set():
+                self._failed.set()
 
     def _run(self):
         while not self._stopping.is_set() and not self._failed.is_set():
@@ -130,34 +132,40 @@ class SimRerouteMqttReceiver:
             except queue.Empty:
                 continue
             try:
-                with self.guard.guard(payload):
-                    if (self.guard.runtime._reroute_simulators is None
-                            or self.guard.runtime._reroute_simulators.get(self.robot.robot_id) is not self.robot
-                            or self.robot._client is not self._robot_client or not self.robot.ready):
-                        raise ValueError('simulated robot instance or connection changed')
-                    result = self.acceptance.accept(payload)
-                    if self.robot._client is not self._robot_client or not self.robot.ready:
-                        raise ValueError('simulated robot disconnected during acceptance')
-                if (self._stopping.is_set() or not self._client.is_connected() or self._failed.is_set()
-                        or self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS):
-                    raise RuntimeError('simulated proposal receipt acknowledgement failed')
-                data = {k: result[k] for k in ('task_id', 'transition_id', 'generation', 'parent_seq', 'digest', 'state')}
-                data.update(robot_id=self.robot.robot_id, robot_session=self.acceptance.robot_session)
-                signed = {'type': 'sim.reroute.receipt.v1', 'data': data}
-                message = dict(signed, mac=hmac.new(self._key, _canonical(signed), hashlib.sha256).hexdigest())
-                if self._stopping.is_set() or not self._client.is_connected():
-                    raise RuntimeError('simulated receipt connection changed')
-                info = self._client.publish('agv/{}/reroute/receipt'.format(self.robot.robot_id),
-                                            _canonical(message), qos=1, retain=False)
-                if info.rc != mqtt.MQTT_ERR_SUCCESS:
-                    raise RuntimeError('simulated receipt enqueue failed')
-                info.wait_for_publish(timeout=5)
-                if not info.is_published() or not self._client.is_connected():
-                    raise RuntimeError('simulated receipt delivery is uncertain')
+                with self._connection_fence:
+                    self._process(payload, mid, qos)
             except Exception:
                 self._failed.set()
                 self._ready.clear()
                 return
+
+    def _process(self, payload, mid, qos):
+        if self._stopping.is_set() or self._failed.is_set() or not self._ready.is_set():
+            raise RuntimeError('simulated proposal receiver is unavailable')
+        with self.guard.guard(payload):
+            if (self.guard.runtime._reroute_simulators is None
+                    or self.guard.runtime._reroute_simulators.get(self.robot.robot_id) is not self.robot
+                    or self.robot._client is not self._robot_client or not self.robot.ready):
+                raise ValueError('simulated robot instance or connection changed')
+            result = self.acceptance.accept(payload)
+            if self.robot._client is not self._robot_client or not self.robot.ready:
+                raise ValueError('simulated robot disconnected during acceptance')
+        if (self._stopping.is_set() or not self._client.is_connected() or self._failed.is_set()
+                or self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS):
+            raise RuntimeError('simulated proposal receipt acknowledgement failed')
+        data = {k: result[k] for k in ('task_id', 'transition_id', 'generation', 'parent_seq', 'digest', 'state')}
+        data.update(robot_id=self.robot.robot_id, robot_session=self.acceptance.robot_session)
+        signed = {'type': 'sim.reroute.receipt.v1', 'data': data}
+        message = dict(signed, mac=hmac.new(self._key, _canonical(signed), hashlib.sha256).hexdigest())
+        if self._stopping.is_set() or not self._client.is_connected():
+            raise RuntimeError('simulated receipt connection changed')
+        info = self._client.publish('agv/{}/reroute/receipt'.format(self.robot.robot_id),
+                                    _canonical(message), qos=1, retain=False)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError('simulated receipt enqueue failed')
+        info.wait_for_publish(timeout=5)
+        if not info.is_published() or not self._client.is_connected():
+            raise RuntimeError('simulated receipt delivery is uncertain')
 
     def start(self):
         with self._lifecycle_lock:

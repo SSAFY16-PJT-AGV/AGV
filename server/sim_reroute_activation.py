@@ -35,10 +35,10 @@ def stage_activation(runtime, task_id, receipt_inbox, robot_receiver):
                 or robot.robot_id not in receipt_inbox._keys
                 or not hmac.compare_digest(robot_receiver._key, receipt_inbox._keys[robot.robot_id])):
             raise ValueError('reroute receipt key or robot instance changed')
-        with robot._lock, runtime._lock:
+        with robot_receiver._lifecycle_lock, robot_receiver._connection_fence, robot._lock, runtime._lock:
             runtime._ready()
             receiver = runtime.receiver
-            with receiver._dispatch_lock, runtime.inbox._lock:
+            with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
                 if (not robot.ready or robot._event_uncertain or not robot._queue.empty()
                         or robot._client is not robot_receiver._robot_client
                         or not robot_receiver._ready.is_set() or robot_receiver._failed.is_set()

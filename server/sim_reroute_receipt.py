@@ -60,7 +60,7 @@ class SimRerouteReceiptInbox:
             with robot._lock, runtime._lock:
                 runtime._ready()
                 receiver = runtime.receiver
-                with receiver._dispatch_lock, runtime.inbox._lock:
+                with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
                     if not robot.ready or robot._event_uncertain or not robot._queue.empty():
                         raise ValueError('simulated robot is unavailable')
                     with runtime.progress._transaction() as db:
