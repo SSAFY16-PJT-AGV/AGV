@@ -152,13 +152,27 @@ class SimRuntime:
     @staticmethod
     def _close_client(client):
         if client is not None:
+            errors = []
             try:
                 client.disconnect()
-            finally:
+            except BaseException as exc:
+                errors.append(exc)
+            loop_stopped = False
+            try:
                 client.loop_stop()
-                thread = getattr(client, '_thread', None)
-                if thread is not None and thread.is_alive():
-                    raise RuntimeError('simulation network thread is still running')
+                loop_stopped = True
+            except BaseException as exc:
+                errors.append(exc)
+            if loop_stopped:
+                from server.sim_mqtt_cleanup import reset_stopped_client
+                try:
+                    reset_stopped_client(client)
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors:
+                for extra in errors[1:]:
+                    errors[0].add_note('additional simulation MQTT cleanup failure: ' + type(extra).__name__)
+                raise errors[0]
 
     @staticmethod
     def _guard_receiver_callbacks(client, receiver, cancel):
