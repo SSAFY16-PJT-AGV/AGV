@@ -108,6 +108,7 @@ def run(mat_path, out_dir, seed=0, max_time_s=420.0, dt=0.05, video=False,
         dist += abs(v) * dt
         t += dt
         clock.t += dt
+        runner.sim_truth = (x, y, th)      # 시험용: 실제 자세(mm, rad). 선반 작업 시뮬레이션이 카메라 장면에 씀
         if on_step is not None:
             on_step(runner, t)
         if int(t / dt) % 4 == 0:

@@ -377,3 +377,114 @@ python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --start N01 --to
 | 위치를 자주 다시 잡음 | 맵을 만든 뒤 테이프를 바꿨거나 색 보정이 달라짐. 맵을 다시 만든다 |
 | 패치 앞이나 뒤에 섬 | `--stop-offset`(mm)으로 조정. 속도 보정이 안 됐으면(`runlog` 속도 보정 칸) 거리도 틀린다 |
 | `nav_gave_up` | 목표로 가는 갈림길을 계속 반대로 탐: 위 "엉뚱한 쪽"과 같음 |
+
+## 10. 선반 인식 (집기·놓기 팔 동작 빼고)
+
+선반 칸 상태를 카메라로 보고 서버에 보고하는 데까지 시험한다. 실제로 집고 놓는 팔 동작은 팔 담당 코드(`agv/task/grip.py`)가 들어온 뒤에 한다. 설계는 [docs/perception/shelf-perception.md](../docs/perception/shelf-perception.md), 메시지는 [docs/protocol/shelf-task.md](../docs/protocol/shelf-task.md).
+
+선반 하나(N01용)로 10-1~10-5를 먼저 끝내고, 선반이 더 생기면 10-6을 한다. 1단계 렌즈 보정과 9단계(goto, 스퍼 주차)가 끝나 있어야 한다.
+
+**미리 노트북에서 연습**(실물 없이 같은 순서·같은 출력): 브로커를 띄우고 터미널 둘에서
+```bash
+python3 sim/link_demo.py --host 127.0.0.1 --tasks                     # 가상 로봇(가상 창고·가상 팔)
+python3 sim/link_demo.py --dispatch-only --robot-id sim-r1 --host 127.0.0.1 \
+    --dispatch N01,D01 --action '{"type":"observe","shelf":"N01"}'      # 배차기
+```
+
+**10-0. 마커 인쇄와 붙이기** (노트북)
+
+```bash
+python3 -m agv.tools.markers           # data/markers/markers.pdf (shelves_*.png, items_*.png)
+```
+
+- [ ] **실제 크기(100%, "페이지 맞춤" 끔)**로 무광 종이에 인쇄하고, 페이지 아래 100mm 눈금을 자로 잰다(±1mm). 다르면 프린터 설정을 고친다. 마커 한 변(검은 테두리 바깥)이 25mm인지도 잰다.
+- [ ] 선반 띠: 그 선반의 띠(N01은 ID 1~4)를 점선대로 통째로 잘라 선반 앞판에 붙인다. 마커 가운데가 윗면 모서리에서 18mm 아래, 칸 1이 선반을 마주 볼 때 왼쪽. 띠를 자르지 않고 통째로 붙여야 칸 간격(70mm)이 맞는다.
+- [ ] 물건: 박스 앞면(로봇 쪽) 가운데에 바로 세워 붙인다(우유 30, 휴지 31, 계란 32, 주스 33). 다른 면에는 안 붙인다.
+- [ ] 흰 여백을 자르거나 그 위에 글씨를 쓰지 않았다. 들뜬 곳이 없다.
+
+**10-1. 선반 놓기**
+
+1. 9단계처럼 로봇을 N01 스퍼 끝에 주차시킨다: `python3 -m agv.explore --mode goto --map maps/mat_ssafy_v3.json --start N01 --to D01 --enable-motors`.
+2. 멈춘 자리에서 **차체 회전 중심(궤도 가운데)부터 170mm 앞**에 선반 앞 모서리가 오게, 스퍼 선과 직각으로 선반을 놓는다. 바닥에 테이프로 선반 자리를 표시한다.
+3. 같은 주차를 2번 더 해서 멈추는 자리가 얼마나 흔들리는지 잰다(앞뒤·좌우 mm, 비틀림). 이 값이 팔이 감당해야 할 오차다.
+
+- [ ] 주차 3번이 앞뒤 ±15mm, 좌우 ±10mm, 비틀림 ±5도 안. 넘으면 결과를 적어 둔다(인식은 되지만 팔 쪽이 어려워짐).
+
+**10-2. 관측 자세 찾기** — 로봇을 스퍼 끝에 세운 채로(모터 꺼도 됨)
+
+```bash
+python3 -m agv.tools.shelfcheck --shelf N01 --sweep -45,-35,-25,-15,-5 --save-observe
+```
+
+5번(카메라 상하)을 바꿔 가며 10장씩 보고, 가장 잘 보인 각도를 로봇 설정(`config/robots/<ID>/perception.json`의 `observe_pose`)에 저장한다. 끝나면 주행 자세로 돌아간다.
+
+- [ ] 가장 잘 보인 각도에서 `선반 찾음 10장`, `본 마커 ID`에 1~4가 다 있다.
+- [ ] `debug_*.png`에서 마커 네 개가 초록 테두리로 잡히고 칸 판정 글자가 맞다.
+- [ ] 끝난 뒤 카메라가 라인을 보는 자세로 돌아왔다(`camtool snap`의 화면이 1단계와 같음).
+
+**10-3. 칸 판정** — 박스를 바꿔 놓으며 매번
+
+```bash
+python3 -m agv.tools.shelfcheck --shelf N01
+```
+
+| 놓는 법 | 기대 결과 |
+| --- | --- |
+| 다 비움 | `1=empty 2=empty 3=empty 4=empty` |
+| 칸 1 우유, 칸 3 주스 | `1=milk 2=empty 3=juice 4=empty` |
+| 네 칸 다(우유·휴지·계란·주스) | 그대로 |
+| 칸 2 휴지를 칸 안쪽 끝까지 밀어 둠(앞 모서리에서 15mm 안쪽) | `2=tissue` |
+| 칸 4에 박스 두 개(앞뒤로) 또는 옆으로 돌려 마커가 안 보이게 | `4=unknown`(틀린 물건이 아니라 모름) |
+
+- [ ] 모든 경우 틀린 판정(다른 물건, 있는데 empty)이 0. `unknown`은 위 마지막 경우에만.
+- [ ] `판정`이 장당 1000ms 안(젯슨). 느리면 시간을 적어 둔다.
+- [ ] `하얗게 날아감`, `검게 묻힘`이 각각 5% 아래. 조명이 바뀌는 자리(창가 등)면 시간대를 바꿔 한 번 더.
+
+**10-4. 위치 정확도** (팔로 집을 때 쓸 값)
+
+shelfcheck 출력의 `선반 앞 모서리 가운데: 앞 …mm, 왼쪽 …mm, 비틀림 …도`를 줄자로 잰 값과 비교한다(차체 회전 중심 기준, 왼쪽이 +).
+
+- [ ] 앞·왼쪽 모두 줄자와 10mm 안, 비틀림 3도 안.
+- 넘으면: 렌즈 보정을 했는지 확인하고(1단계), 카메라 위치(`perception.json`의 `robot_geom`: 1번 축 위치 `s1_axis_x_mm`, 카메라 높이 `camera_z_mm`, 1번 축에서 카메라까지 `camera_x_from_s1_mm`)를 줄자로 다시 재서 로봇 파일 `config/robots/<ID>/perception.json`에 적는다. 앞뒤만 일정하게 어긋나면 `camera_x_from_s1_mm`, 높이에 따라 어긋나면 `camera_z_mm`이나 `tilt_offset_deg`다. 칸 판정(10-3)은 이 값이 조금 틀려도 맞는다.
+
+**10-5. 비뚤게 섰을 때**
+
+로봇을 스퍼 끝에서 손으로 좌우 2cm 옮기거나 10도 돌려 놓고 10-3을 한 번씩 한다. `--pan 20`, `--pan -20`(1번을 돌려 봄)도 해 본다.
+
+- [ ] 틀린 판정은 0. 화면 밖으로 나간 칸만 `unknown`.
+
+**10-6. 서버 주문으로 보기** — 젯슨에서 선반 작업을 켠 serve, 노트북에서 배차기
+
+```bash
+# 젯슨: 로봇은 N01 앞(라인 위)에 놓음
+MQTT_HOST=<노트북 IP> python3 -m agv.explore --mode serve --map maps/mat_ssafy_v3.json --start N01 --tasks --enable-motors --view
+# 노트북
+python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \
+    --dispatch N01,D01 --action '{"type":"observe","shelf":"N01"}' \
+    --then "D01,N01,J02;J02,J07,N03,N02,N07,N01,D01" --then-action '{"type":"load","shelf":"N01","slot":1}'
+```
+
+(한 주문 안에서 같은 노드를 두 번 지나는 경로는 스퍼 끝이 있으면 안 받으므로, 한 바퀴를 J02에서 끊어 두 작업으로 보낸다.)
+
+- [ ] 첫 작업: D01에 주차 → 카메라가 선반을 봄 → 배차기에 `선반 N01(before): …`(실제와 같음), `작업 결과 … observe N01: done`. 상태가 `WORKING`이었다가 `IDLE`.
+- [ ] 카메라가 주행 자세로 돌아오고, 둘째·셋째 작업으로 스퍼를 빠져나와 안쪽 왼쪽 세로선을 거쳐 한 바퀴 돌아 다시 D01에 주차한다.
+- [ ] 셋째 작업(집기)은 팔 동작이 아직 없으니 `failed (arm_unavailable)`로 끝나고, 선반 상태(before)는 맞게 온다. 로봇은 다음 주문을 받을 수 있다(`IDLE`).
+- [ ] 선반을 치우고 첫 작업을 다시 하면 `failed (shelf_not_seen)`.
+- [ ] 경로가 스퍼 끝에서 끝나지 않는 작업 주문(예: `--dispatch N01,J02` + action)은 배차기에 `[거절] … must end at that shelf's spur end`.
+
+선반이 더 있으면 N03(휴지, 스퍼가 합류 바로 뒤라 비뚤게 주차될 수 있음)에서 한 번 더 한다. 칸이 화면 밖이면 로봇 기록(`events.jsonl`)에 `task_pan`(1번을 그 칸 쪽으로 돌려 다시 봄)이 나와야 한다.
+
+**안 되면**
+
+| 증상 | 확인할 것 |
+| --- | --- |
+| 마커를 하나도 못 찾음 | 10-2 각도 범위를 넓혀 다시. `raw_*.png`에 선반이 보이는지. 밝기(`하얗게 날아감`/`검게 묻힘`)가 크면 조명. 주행 해상도에서만 안 되면 `--full`로 비교해 보고 결과를 알려 줌 |
+| 칸 마커는 찾는데 물건이 `unknown` | 물건 마커가 비스듬하거나 광택 반사. 무광, 바로 세워 붙였는지 |
+| 다른 물건으로 판정 | 박스에 붙인 마커 ID 확인(물건 이름 옆 id). 박스 다른 면에도 마커가 있으면 뗌 |
+| `다른 선반(…)의 칸 마커만 보여요` | 선반 띠를 다른 선반 것으로 붙임 |
+| 선반 위치가 줄자와 1cm 넘게 다름 | 10-4 |
+| 서버 주문이 `[거절]` | 젯슨에서 `--tasks`를 켰는지, 경로가 그 선반의 스퍼 끝(D0k)에서 끝나는지 |
+| 작업 뒤 라인을 못 따라감 | 주행 자세로 안 돌아옴: 저장한 카메라 자세(`camtool arm --read`)와 비교. 팔이 걸렸는지 |
+| `timeout` | 서보 통신. `camtool arm --read`로 1·5번이 읽히는지 |
+
+시험한 폴더(`data/shelfcheck/<시각>/`, `data/runs/<시각>/`)와 배차기 기록(`data/link_demo/dispatch.jsonl`)을 같이 공유한다. `raw_*.png`가 있으면 노트북에서 `shelfcheck --camera "image:<폴더>/raw_*.png" --no-arm`으로 그대로 다시 볼 수 있다.

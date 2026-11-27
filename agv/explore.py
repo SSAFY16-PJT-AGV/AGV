@@ -212,6 +212,28 @@ def _status_rows(a, runner, elapsed, left, right, fps, nav=None):
     ]
 
 
+def _make_tasks(a, cfg, rid, note):
+    """serve --tasks: 선반 작업 실행기. 카메라는 주행 프레임을 그대로 쓰고(카메라 모델은 프레임 크기에 맞춤),
+    1·5번은 agv.arm으로 움직인다. 집기·놓기 팔 동작은 agv/task/grip.py의 grip(cmd)(팔 담당)이고, 그 파일이
+    없으면 load/unload는 arm_unavailable로 실패하고 observe(보기만)는 된다."""
+    from . import arm as arm_mod
+    from .perception.shelf import ShelfLayout, camera_from_config, load_config
+    from .task import TaskExecutor, ThreadedArm
+    pcfg = load_config(robot=rid)
+    drive = arm_mod.saved_pose(cfg)
+    observe = dict(drive or {})
+    observe.update(dict((str(k), float(v)) for k, v in pcfg["observe_pose"]["servo_angles"].items()))
+    try:
+        from .task.grip import grip as grip_fn       # 팔 담당: grip(cmd) -> (ok, reason). cmd는 arm_driver.py 설명
+    except ImportError:
+        grip_fn = None
+    arm = ThreadedArm(lambda ang: arm_mod.move(ang, settle_s=1.0), grip_fn=grip_fn,
+                      read_fn=lambda: arm_mod.read_pose(("1", "5")), servo_angles=drive)
+    print(u"선반 작업 켬: 관측 자세 %s, 주행 자세 %s, 집기·놓기 %s" % (
+        arm_mod.fmt(observe), arm_mod.fmt(drive), u"agv/task/grip.py" if grip_fn else u"팔 동작 없음(보기만 됨)"))
+    return TaskExecutor(pcfg, camera_from_config(pcfg, rid), ShelfLayout(pcfg), arm, observe, drive, log=note)
+
+
 def _start_link(a, cfg, nav, nmap, runner, logger):
     """serve: MQTT 연결과 주문 처리기. 실패하면 (None, None)."""
     from .link import LinkController, LinkUnavailable, MqttLink, settings_from
@@ -233,10 +255,11 @@ def _start_link(a, cfg, nav, nmap, runner, logger):
     except (LinkUnavailable, ValueError) as e:
         print(u"MQTT 연결을 못 만들었어요: %s" % e)
         return None, None
+    tasks = _make_tasks(a, cfg, rid, note) if getattr(a, "tasks", False) else None
     ctl = LinkController(link, nav, nmap.raw, start_node=a.start, waiting=lc.get("waiting", "zones"),
                          state_hz=lc.get("state_hz", 5.0), link_loss_s=lc.get("link_loss_s", 1.0),
                          resume_after_reconnect=bool(lc.get("resume_after_reconnect", False)),
-                         battery=make_battery(lc), log=note)
+                         battery=make_battery(lc), log=note, tasks=tasks)
     ctl.attach(runner)
     ok = link.wait_connected(5.0)
     print(u"MQTT %s:%d %s, 로봇 %s, 맵 %s - 첫 주문을 기다려요(첫 노드 %s)" % (
@@ -267,6 +290,8 @@ def main(argv=None):
                     help="lap 모드에서 갈림길마다 고를 쪽. 매트를 시계 방향으로 돌면 left가 바깥 고리")
     ap.add_argument("--mqtt-host", default=None, help="serve: 브로커 주소(기본 MQTT_HOST, config link.host)")
     ap.add_argument("--mqtt-port", type=int, default=None, help="serve: 브로커 포트(기본 1883)")
+    ap.add_argument("--tasks", action="store_true",
+                    help="serve: 주문 끝 동작(선반 load/unload/observe)을 함. 없으면 끝 동작은 무시")
     ap.add_argument("--enable-motors", action="store_true",
                     help="ask/drive 모드에서 실제로 모터를 돌린다(없으면 거부)")
     ap.add_argument("--camera", default="gst", help="gst | jetbot | video:<경로>")
@@ -435,7 +460,7 @@ def main(argv=None):
             left, right = runner.step(frame, dt)
             motors.set(left, right)
             if ctl is not None:
-                ctl.step()
+                ctl.step(frame=frame)
 
             if a.record:
                 if writer is None:

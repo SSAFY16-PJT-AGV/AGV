@@ -14,6 +14,11 @@
     python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \
         --dispatch N01,J02,J07,N03 --then N03,N02,N07,N01
 
+    # 실물 선반 작업(serve --tasks): 선반 N01 스퍼 끝으로 가서 보기만, 이어서 N03에서 칸 1 집기
+    python3 sim/link_demo.py --dispatch-only --robot-id physical-1 --host 127.0.0.1 \\
+        --dispatch N01,D01 --action '{"type":"observe","shelf":"N01"}' \\
+        --then D01,N01,J02,J07,N03,D03 --then-action '{"type":"load","shelf":"N03","slot":1}'
+
     # 주문 하나를 손으로(mosquitto_pub)
     mosquitto_pub -t agv/sim-r1/order -q 1 -m '{"order_id":"T1","seq":1,"map_id":"mat_ssafy_v3@v0",
         "nodes":["N01","J02","J07","N03"],"released_until":"N03","action_at_end":{"type":"none"}}'
@@ -56,7 +61,9 @@ class Dispatcher(object):
         if st["tls_ca"]:
             self.c.tls_set(ca_certs=st["tls_ca"])
         self.c.on_connect = lambda c, u, f, rc: (c.subscribe("agv/%s/event" % robot_id, qos=1),
-                                                 c.subscribe("agv/%s/state" % robot_id, qos=0))
+                                                 c.subscribe("agv/%s/state" % robot_id, qos=0),
+                                                 c.subscribe("agv/%s/task" % robot_id, qos=1),
+                                                 c.subscribe("agv/%s/shelf" % robot_id, qos=1))
         self.c.on_message = self._on_message
         self.last_state = None
         self.got_state = threading.Event()
@@ -67,11 +74,14 @@ class Dispatcher(object):
         self.k = 0
         self.n = 0
         self.done = threading.Event()
+        self.wait_task = None           # 끝 동작이 있는 작업: 마지막 rear_clear 뒤 결과를 기다림
+        self.results = []
+        self.last_rejected = None
 
     def _send(self):
-        oid, nodes, rel = self.job
+        oid, nodes, rel, act = self.job
         o = {"order_id": oid, "seq": self.k + 1, "map_id": self.map_ref, "nodes": nodes,
-             "released_until": rel[self.k], "action_at_end": {"type": "none"}}
+             "released_until": rel[self.k], "action_at_end": act or {"type": "none"}}
         self.c.publish("agv/%s/order" % self.robot_id, json.dumps(o), qos=1)
         self.log({"dir": "order", "msg": o})
         print(u"주문 %s#%d -> %s" % (oid, o["seq"], o["released_until"]))
@@ -81,8 +91,9 @@ class Dispatcher(object):
             self.done.set()
             return
         self.n += 1
-        nodes, rel = self.jobs.pop(0)
-        self.job, self.k = ("%s-%d" % (self.prefix, self.n), nodes, rel), 0
+        job = self.jobs.pop(0)
+        nodes, rel, act = job if len(job) == 3 else (job[0], job[1], None)
+        self.job, self.k = ("%s-%d" % (self.prefix, self.n), nodes, rel, act), 0
         self._send()
 
     def _on_message(self, c, u, msg):
@@ -92,8 +103,36 @@ class Dispatcher(object):
             except ValueError:
                 return
             self.got_state.set()
+            rej = self.last_state.get("rejected")
+            if rej and rej != self.last_rejected:
+                print(u"[거절] %s#%s: %s" % (rej.get("order_id"), rej.get("seq"), rej.get("reason")))
+            self.last_rejected = rej
+            return
+        if msg.topic.endswith("/task") or msg.topic.endswith("/shelf"):
+            self._on_task(msg)
             return
         self._on_event(c, u, msg)
+
+    def _on_task(self, msg):
+        try:
+            m = json.loads(msg.payload.decode("utf-8"))
+        except ValueError:
+            return
+        self.log({"dir": msg.topic.rsplit("/", 1)[-1], "msg": m})
+        if m.get("type") == "shelf_state":
+            print(u"선반 %s(%s): %s%s" % (m["shelf"], m["phase"], u"  ".join(
+                u"%d=%s" % (s["slot"], s.get("item", s["state"])) for s in m["slots"]), u"" if m["seen"] else u"  (선반 못 찾음)"))
+            return
+        if m.get("type") != "task_result":
+            return
+        self.results.append(m)
+        print(u"작업 결과 %s %s %s 칸%s: %s%s, 들고 있음 %s" % (
+            m["order_id"], m["action"], m["shelf"], m["slot"], m["result"],
+            u" (%s)" % m["reason"] if m["reason"] else u"", m["carrying"]))
+        if self.wait_task is not None and m["order_id"] == self.wait_task:
+            self.wait_task = None
+            time.sleep(1.0)
+            self.next_job()
 
     def _on_event(self, c, u, msg):
         ev = json.loads(msg.payload.decode("utf-8"))
@@ -106,6 +145,9 @@ class Dispatcher(object):
         if self.k + 1 < len(self.job[2]):
             self.k += 1
             self._send()
+        elif self.job[3] and self.job[3].get("type") not in (None, "none"):
+            self.wait_task = self.job[0]
+            print(u"선반 작업(%s)을 기다려요..." % self.job[3].get("type"))
         else:
             self.next_job()
 
@@ -129,7 +171,12 @@ def main(argv=None):
     ap.add_argument("--battery", type=float, default=0.8, help="가상 배터리(0~1). 음수면 안 보냄")
     ap.add_argument("--dispatch", default=None, help="작은 배차기로 보낼 경로(쉼표)")
     ap.add_argument("--releases", default=None, help="--dispatch 경로의 해제 노드들(쉼표). 없으면 끝 노드 한 번")
-    ap.add_argument("--then", default=None, help="첫 작업 뒤 이어서 보낼 경로(쉼표, 끝 노드까지 한 번에 해제)")
+    ap.add_argument("--then", default=None, help="첫 작업 뒤 이어서 보낼 경로(쉼표, 끝 노드까지 한 번에 해제). 여러 작업은 ;로 나눔")
+    ap.add_argument("--action", default=None,
+                    help='--dispatch 작업의 끝 동작(JSON). 예: \'{"type":"observe","shelf":"N01"}\'. 로봇은 serve --tasks')
+    ap.add_argument("--then-action", default=None, help="--then 작업의 끝 동작(JSON)")
+    ap.add_argument("--tasks", action="store_true",
+                    help="가상 로봇도 선반 작업을 함(가상 창고·가상 팔, sim/mat/task_demo.py와 같음). 실물 serve --tasks 연습용")
     ap.add_argument("--dispatch-only", action="store_true",
                     help="가상 로봇 없이 배차기만(실물 로봇에 --dispatch 경로를 보냄). --robot-id physical-1 등")
     ap.add_argument("--max-time", type=float, default=600.0)
@@ -167,25 +214,29 @@ def main(argv=None):
         print(u"브로커 %s:%d에 못 붙었어요" % (st["host"], st["port"]))
         return 2
     notes = []
+    state = {"runner": None, "t0": time.time(), "t": 0.0, "pose": None}
+
+    def note(m, **k):
+        notes.append(m)
+        print(u"[ctl] %s %s" % (m, json.dumps(k, ensure_ascii=False)[:200]))
+    tasks = None
+    if a.tasks:
+        from task_demo import make_task_sim
+        world, _arm, tasks = make_task_sim(state, seed=a.seed, log=note)
+        print(u"가상 창고: %s" % json.dumps(world.snapshot(), ensure_ascii=False))
+        pub_task, pub_shelf = link.publish_task, link.publish_shelf
+        link.publish_task = lambda m: (log_line({"dir": "task", "msg": m}), pub_task(m))[1]
+        link.publish_shelf = lambda m: (log_line({"dir": "shelf", "msg": m}), pub_shelf(m))[1]
     ctl = LinkController(link, nav, raw, start_node=a.start, waiting=a.waiting,
-                         battery=(lambda: a.battery) if a.battery >= 0 else None,
-                         log=lambda m, **k: (notes.append(m), print(u"[ctl] %s %s" % (
-                             m, json.dumps(k, ensure_ascii=False)[:200]))))
+                         battery=(lambda: a.battery) if a.battery >= 0 else None, log=note, tasks=tasks)
     print(u"로봇 %s, 맵 %s, 첫 노드 %s - 주문을 기다려요" % (a.robot_id, ctl.book.map_ref, a.start))
 
     disp = None
     if a.dispatch:
-        nodes = [n.strip() for n in a.dispatch.split(",") if n.strip()]
-        rel = [n.strip() for n in a.releases.split(",")] if a.releases else [nodes[-1]]
-        jobs = [(nodes, rel)]
-        if a.then:
-            t = [n.strip() for n in a.then.split(",") if n.strip()]
-            jobs.append((t, [t[-1]]))
-        disp = Dispatcher(st, a.robot_id, ctl.book.map_ref, jobs, log_line)
-
-    state = {"runner": None, "t0": time.time()}
+        disp = Dispatcher(st, a.robot_id, ctl.book.map_ref, _jobs(a), log_line)
 
     def on_step(runner, t):
+        state["t"], state["pose"] = time.time(), runner.sim_truth
         if state["runner"] is None:
             state["runner"] = runner
             ctl.attach(runner)
@@ -215,13 +266,24 @@ def main(argv=None):
     return 0
 
 
+def _action(text):
+    if not text:
+        return None
+    act = json.loads(text)
+    if not isinstance(act, dict) or "type" not in act:
+        raise ValueError(u"끝 동작은 {\"type\": ...} JSON이어야 해요: %s" % text)
+    return act
+
+
 def _jobs(a):
     nodes = [n.strip() for n in a.dispatch.split(",") if n.strip()]
     rel = [n.strip() for n in a.releases.split(",")] if a.releases else [nodes[-1]]
-    jobs = [(nodes, rel)]
+    jobs = [(nodes, rel, _action(a.action))]
     if a.then:
-        t = [n.strip() for n in a.then.split(",") if n.strip()]
-        jobs.append((t, [t[-1]]))
+        routes = [r for r in a.then.split(";") if r.strip()]
+        for i, r in enumerate(routes):          # 여러 작업은 ;로. --then-action은 마지막 작업에
+            t = [n.strip() for n in r.split(",") if n.strip()]
+            jobs.append((t, [t[-1]], _action(a.then_action) if i == len(routes) - 1 else None))
     return jobs
 
 
