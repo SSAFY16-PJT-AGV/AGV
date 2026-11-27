@@ -7,6 +7,7 @@ session; they do not establish real inventory, a physical stop or safety.
 from contextlib import closing, contextmanager
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import threading
@@ -44,11 +45,16 @@ class TeamShelfOrderSlots:
     both claims remain held. This journal is not connected to physical MQTT.
     """
 
-    def __init__(self, path, *, create):
+    def __init__(self, path, *, create, expected_creation_id=None):
         raw = os.fspath(path)
         if not isinstance(raw, str) or not raw or raw == ':memory:':
             raise ValueError('a file-backed simulation journal is required')
         self.path = os.path.abspath(raw)
+        if expected_creation_id is not None and (not isinstance(expected_creation_id, str)
+                or re.fullmatch(r'[0-9a-f]{64}', expected_creation_id) is None):
+            raise ValueError('invalid simulated slot journal identity')
+        if create and expected_creation_id is not None:
+            raise ValueError('new journal cannot have an expected identity')
         self._lock = threading.RLock()
         self._session = self._snapshot = None
         self._fresh = self._admission_ready = False
@@ -59,7 +65,11 @@ class TeamShelfOrderSlots:
             self._file_identity = (stat.st_dev, stat.st_ino)
             with self._write() as db:
                 db.execute('PRAGMA application_id=1095194691')
-                db.execute('PRAGMA user_version=1')
+                db.execute('PRAGMA user_version=2')
+                db.execute('CREATE TABLE identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
+                           'creation_id TEXT NOT NULL UNIQUE)')
+                self._creation_id = secrets.token_hex(32)
+                db.execute('INSERT INTO identity VALUES (1,?)', (self._creation_id,))
                 db.execute('CREATE TABLE meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
                            'world_id TEXT, session TEXT, mutation INTEGER NOT NULL)')
                 db.execute('INSERT INTO meta VALUES (1,NULL,NULL,0)')
@@ -84,11 +94,25 @@ class TeamShelfOrderSlots:
             stat = os.stat(self.path)
             self._file_identity = (stat.st_dev, stat.st_ino)
             with self._write() as db:
+                version = db.execute('PRAGMA user_version').fetchone()
                 if (db.execute('PRAGMA application_id').fetchone() != (1095194691,)
-                        or db.execute('PRAGMA user_version').fetchone() != (1,)
+                        or version not in ((1,), (2,))
                         or db.execute('PRAGMA quick_check').fetchall() != [('ok',)]
                         or db.execute('PRAGMA foreign_key_check').fetchone() is not None):
                     raise ValueError('invalid simulated slot journal')
+                if version == (1,):
+                    if expected_creation_id is not None:
+                        raise ValueError('legacy journal has no bound identity')
+                    db.execute('CREATE TABLE identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
+                               'creation_id TEXT NOT NULL UNIQUE)')
+                    db.execute('INSERT INTO identity VALUES (1,?)', (secrets.token_hex(32),))
+                    db.execute('PRAGMA user_version=2')
+                identities = db.execute('SELECT creation_id FROM identity WHERE singleton=1').fetchall()
+                if (len(identities) != 1 or not isinstance(identities[0][0], str)
+                        or re.fullmatch(r'[0-9a-f]{64}', identities[0][0]) is None
+                        or (expected_creation_id is not None and identities[0][0] != expected_creation_id)):
+                    raise ValueError('simulated slot journal identity differs')
+                self._creation_id = identities[0][0]
                 actual = db.execute('SELECT slot_id,shelf_id,slot_index,marker_id FROM slots ORDER BY slot_id').fetchall()
                 expected = [(x['slot_id'], x['shelf_id'], x['slot_index'], x['marker_id']) for x in slot_layout()]
                 if actual != expected:
@@ -103,8 +127,16 @@ class TeamShelfOrderSlots:
         return cls(path, create=True)
 
     @classmethod
-    def open_existing(cls, path):
-        return cls(path, create=False)
+    def open_existing(cls, path, *, expected_creation_id=None):
+        return cls(path, create=False, expected_creation_id=expected_creation_id)
+
+    @property
+    def creation_id(self):
+        with self._write() as db:
+            row = db.execute('SELECT creation_id FROM identity WHERE singleton=1').fetchone()
+            if row != (self._creation_id,):
+                raise ValueError('simulated slot journal identity changed')
+            return self._creation_id
 
     @contextmanager
     def _write(self):
@@ -130,8 +162,11 @@ class TeamShelfOrderSlots:
                         db.execute('ROLLBACK')
                     raise
 
-    @staticmethod
-    def _integrity(db):
+    def _integrity(self, db):
+        if (db.execute('PRAGMA application_id').fetchone() != (1095194691,)
+                or db.execute('PRAGMA user_version').fetchone() != (2,)
+                or db.execute('SELECT creation_id FROM identity WHERE singleton=1').fetchone() != (self._creation_id,)):
+            raise ValueError('simulated slot journal identity changed')
         rows = db.execute('SELECT slot_id,shelf_id,slot_index,marker_id,state,product_type '
                           'FROM slots ORDER BY slot_id').fetchall()
         if len(rows) != 24:
