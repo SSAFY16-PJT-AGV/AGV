@@ -1,5 +1,6 @@
 """Unverified persisted results must never clear the original browser key."""
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -60,6 +61,22 @@ class RecoveryReportingTest(unittest.IsolatedAsyncioTestCase):
                          {'request_id': 'r1', 'status': 'unknown'})
         with self.assertRaises(AdmissionStopped):
             self.demo.submit_product_order('milk', 'new')
+
+    async def test_restart_waits_for_same_world_before_reporting_or_accepting(self):
+        self.demo._restart_blocked = False
+        self.demo._world_ready = threading.Event()
+        code, _, lookup = await get_by_key(['existing'])
+        self.assertEqual((code, lookup['status']), (200, 'unknown'))
+        code, body = await request('GET', '/order-demo/api/orders/r1')
+        self.assertEqual((code, json.loads(body)['status']), (200, 'unknown'))
+        self.assertEqual((await request('GET', '/order-demo/api/metrics'))[0], 503)
+        self.assertEqual(self.demo.submit_product_order('milk', 'existing'),
+                         {'request_id': 'r1', 'status': 'unknown'})
+        with self.assertRaises(AdmissionStopped):
+            self.demo.submit_product_order('milk', 'new')
+        self.demo._world_ready.set()
+        code, body = await request('GET', '/order-demo/api/orders/r1')
+        self.assertEqual((code, json.loads(body)['status']), (200, 'completed'))
 
 
 if __name__ == '__main__':

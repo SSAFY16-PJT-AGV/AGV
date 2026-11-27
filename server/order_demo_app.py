@@ -561,7 +561,7 @@ class DemoRuntime:
         if not any(item['id'] == product_id for item in self.products):
             raise ValueError('unknown product')
         if self.journal is not None:
-            if getattr(self, 'team_shelves', False) and self._restart_blocked:
+            if _team_recovery_unverified(self):
                 if request_key is not None:
                     try:
                         original = self.admission.get_by_key(request_key)
@@ -1249,7 +1249,12 @@ def _public_order(row):
 
 
 def _team_recovery_unverified(demo):
-    return bool(getattr(demo, 'team_shelves', False) and getattr(demo, '_restart_blocked', False))
+    if not getattr(demo, 'team_shelves', False):
+        return False
+    world_ready = getattr(demo, '_world_ready', None)
+    return bool(getattr(demo, '_restart_blocked', False) or
+                (getattr(demo, 'journal', None) is not None and world_ready is not None
+                 and not world_ready.is_set()))
 
 
 def _safe_order(demo, row):
@@ -1271,7 +1276,7 @@ def _team_shelf_observation(demo):
     if not getattr(demo, 'team_shelves', False) or type(inventory) is not TeamShelfSimInventory:
         return None
     data = inventory.store.inspect()
-    blocked = getattr(demo, '_restart_blocked', False) is True
+    blocked = _team_recovery_unverified(demo)
     claims = {row['slot_id'] for row in data['claims']}
     shelves = {}
     for row in data['slots']:

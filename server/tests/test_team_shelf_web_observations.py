@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -54,6 +55,16 @@ class TeamShelfObservationTest(unittest.IsolatedAsyncioTestCase):
     async def test_blocked_persistent_recovery_does_not_present_slots_as_known(self):
         app.state.demo.journal = object()
         app.state.demo._restart_blocked = True
+        code, body = await request('GET', '/order-demo/api/inventory')
+        self.assertEqual(code, 200)
+        inventory = json.loads(body)
+        self.assertFalse(inventory['fresh'])
+        self.assertTrue(all(cell is None for row in inventory['shelves'].values() for cell in row['slots']))
+
+    async def test_persistent_inventory_is_unknown_until_same_world_verified(self):
+        app.state.demo.journal = object()
+        app.state.demo._restart_blocked = False
+        app.state.demo._world_ready = threading.Event()
         code, body = await request('GET', '/order-demo/api/inventory')
         self.assertEqual(code, 200)
         inventory = json.loads(body)
