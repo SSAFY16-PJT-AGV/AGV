@@ -27,6 +27,15 @@ content = project / 'Content'
 if os.lstat(str(content)).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
     raise RuntimeError('Content must be an independent directory, not a junction')
 
+# This optional arrangement is used only for deterministic virtual-reroute
+# tests, with the matching C++ guard patch and simulated start configuration.
+variant = os.environ.get('AGV_V3_SCENE_VARIANT', 'standard')
+if variant not in ('standard', 'reroute'):
+    raise RuntimeError('unknown isolated v3 scene variant')
+pickup_nodes = ('N01', 'N04') if variant == 'reroute' else ('D01', 'D06')
+shelf_nodes = ('D01', 'D04') if variant == 'reroute' else ('D04', 'D03')
+robot_nodes = ('N05', 'J02') if variant == 'reroute' else ('D07', 'D08')
+
 source = Path(__file__).resolve().parents[1] / 'examples' / 'mat_ssafy_v3_unreal_sim.json'
 world_map = json.loads(source.read_text(encoding='utf-8'))
 if world_map.get('map_id') != 'mat_ssafy_v3' or world_map.get('coordinate_unit') != 'meter':
@@ -146,14 +155,14 @@ for actor in legacy_props:
     mark_actor_edited(actor)
 
 unreal.log('AGV_V3_SCENE_PLACING_SHELVES')
-for shelf, node, offset in ((red_shelves[0], 'D04', -7.0), (blue_shelves[0], 'D03', 7.0)):
+for shelf, node, offset in ((red_shelves[0], shelf_nodes[0], -7.0), (blue_shelves[0], shelf_nodes[1], 7.0)):
     move(shelf, node, dy=offset)
     scale(shelf, 0.1)
     shelf.set_editor_property('initial_occupied_slots', [])
     mark_actor_edited(shelf)
 
 unreal.log('AGV_V3_SCENE_PLACING_PRODUCTS')
-for items, node in ((red_products[:3], 'D01'), (blue_products[:3], 'D06')):
+for items, node in ((red_products[:3], pickup_nodes[0]), (blue_products[:3], pickup_nodes[1])):
     x, y = xy(node)
     for product, dx in zip(items, (-5.0, 0.0, 5.0)):
         move_position(product, x + dx, y, 2.0)
@@ -165,13 +174,13 @@ for robot in robots:
     robot_id = str(robot.get_editor_property('agv_id'))
     if robot_id not in ('AGV_01', 'AGV_02'):
         raise RuntimeError('unexpected robot identifier')
-    move(robot, 'D07' if robot_id == 'AGV_01' else 'D08', z=3.0)
+    move(robot, robot_nodes[0] if robot_id == 'AGV_01' else robot_nodes[1], z=3.0)
     scale(robot, .1)
     mark_actor_edited(robot)
 
 if len(starts) != 1:
     raise RuntimeError('expected one team player start for the spawned pawn')
-move(starts[0], 'D07', z=3.0)
+move(starts[0], robot_nodes[0], z=3.0)
 mark_actor_edited(starts[0])
 
 camera = cameras[0]

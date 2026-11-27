@@ -8,6 +8,7 @@ physical safety.  It never writes the project or the loaded level.
 """
 import json
 import math
+import os
 from pathlib import Path
 
 import unreal
@@ -61,6 +62,11 @@ def one(prefix):
 
 
 nodes = {node['id']: node for node in actual_map['nodes']}
+variant = os.environ.get('AGV_V3_SCENE_VARIANT', 'standard')
+require(variant in ('standard', 'reroute'), 'unknown isolated v3 scene variant')
+pickup_nodes = ('N01', 'N04') if variant == 'reroute' else ('D01', 'D06')
+shelf_nodes = ('D01', 'D04') if variant == 'reroute' else ('D04', 'D03')
+robot_nodes = ('N05', 'J02') if variant == 'reroute' else ('D07', 'D08')
 
 
 def position(node, z=0.0, dx=0.0, dy=0.0):
@@ -68,7 +74,7 @@ def position(node, z=0.0, dx=0.0, dy=0.0):
     return (row['x'] * 100.0 + dx, row['y'] * 100.0 + dy, z)
 
 
-for color, node in (('Red', 'D01'), ('Blue', 'D06')):
+for color, node in (('Red', pickup_nodes[0]), ('Blue', pickup_nodes[1])):
     products = classes('BP_{}Object_'.format(color))
     require(len(products) == 3, '{} pickup must contain three demo products'.format(color))
     actual = sorted((actor.get_actor_location().x, actor.get_actor_location().y,
@@ -80,7 +86,7 @@ for color, node in (('Red', 'D01'), ('Blue', 'D06')):
         require(near(actor.get_actor_scale3d(), (.08, .08, .08)), color + ' product scale mismatch')
 require(not classes('BP_GreenObject_'), 'unexpected green demo pickup')
 
-for color, node, offset in (('Red', 'D04', -7.0), ('Blue', 'D03', 7.0)):
+for color, node, offset in (('Red', shelf_nodes[0], -7.0), ('Blue', shelf_nodes[1], 7.0)):
     shelf = one('BP_{}Shelf_'.format(color))
     require(str(shelf.get_editor_property('shelf_id')) == 'SHELF_' + color.upper(), 'shelf ID mismatch')
     require(near(shelf.get_actor_location(), position(node, dy=offset)), color + ' shelf position mismatch')
@@ -88,9 +94,9 @@ for color, node, offset in (('Red', 'D04', -7.0), ('Blue', 'D03', 7.0)):
 
 robot = one('BP_AGVRobot_')
 require(str(robot.get_editor_property('agv_id')) == 'AGV_02', 'expected placed AGV_02')
-require(near(robot.get_actor_location(), position('D08', z=3.0)), 'AGV_02 start mismatch')
+require(near(robot.get_actor_location(), position(robot_nodes[1], z=3.0)), 'AGV_02 start mismatch')
 require(near(robot.get_actor_scale3d(), (.1, .1, .1)), 'AGV_02 scale mismatch')
-require(near(one('PlayerStart').get_actor_location(), position('D07', z=3.0)), 'AGV_01 start mismatch')
+require(near(one('PlayerStart').get_actor_location(), position(robot_nodes[0], z=3.0)), 'AGV_01 start mismatch')
 
 camera = one('BP_WarehouseCameraPawn_')
 require(near(camera.get_actor_location(), (100.0, 50.0, 0.0)), 'camera center mismatch')

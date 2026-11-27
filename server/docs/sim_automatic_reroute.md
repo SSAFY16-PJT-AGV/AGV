@@ -62,3 +62,40 @@ Unreal 화면과 팀 v3 맵은 별도 시연 검증이 필요하다. 상태 API�
   검증했다. 실제 Unreal 화면, 기본 시작점과 실물 로봇 시험은 아니다. 재현은
   `python -m unittest server.tests.test_sim_reroute_multi_auto_web`이며 격리
   aMQTT 경로 `AMQTT_TEST_PATH`가 필요하다.
+## 실제 Unreal 렌더링 격리 시험
+
+`server.tools.v3_rendered_reroute_test`는 별도 Unreal v3 시험 사본,
+새 SQLite DB, 루프백 전용 MQTT와 웹 주문 API를 사용한다. 실제 상품·장비가
+아닌 가상 배치다. 두 AGV 시작점 N05/J02와 두 주문이 배정될 때까지
+진행을 보류하는 테스트 전용 장벽은 경합을 재현하기 위해 설정한다. 그
+이후 이동은 가상 AGV가 격리 MQTT 명령을 처리하고 서버가 Unreal에
+WebSocket 상태를 보내는 경로다. 초기 배치는 주행으로 간주하지 않는다.
+
+준비는 `field_v3_unreal.md`의 **독립 Unreal 프로젝트 준비**를 먼저 따른다.
+기존 v3 패치 스택의 별도 사본에서만 `unreal_v3_reroute_fixture.patch`를
+`git apply --check`로 확인하고 적용한 뒤 빌드한다. 이는 상품 픽업을
+N01/N04, 빨강/파랑 선반을 D01/D04로 옮긴 시험 전용 UE 검증 설정이다.
+기존 빨강·파랑 두 품목과 선반 두 개를 쓰며, 팀 6선반 SKU 모드의
+자동 우회 시험이 아니다.
+원본 팀 프로젝트나 다른 사용 중인 프로젝트에 적용하지 않는다. 동일한
+독립 사본에서 `AGV_V3_SCENE_VARIANT=reroute`를 설정해 기존
+`create_v3_unreal_scene.py`와 `verify_v3_unreal_scene.py`를 차례로
+실행하고 저장·재개방 성공 마커를 확인한다. 사본 Content는 공유 링크가
+아닌 독립 디렉터리여야 한다.
+
+8000 포트가 비어 있을 때 다음을 실행한다. 실행마다 이전 결과가 없는
+새 `--output-dir`을 지정한다. Unreal 게임 창을 띄우며 해당 도구가 시작한
+프로세스만 종료한다.
+
+```powershell
+.\.venv\Scripts\python.exe -m server.tools.v3_rendered_reroute_test `
+  --unreal-editor 'D:\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe' `
+  --uproject 'D:\경로\독립-Unreal-사본\agvSimulation.uproject' `
+  --ddc 'D:\경로\독립-DDC' --output-dir 'D:\경로\새-시험-결과'
+```
+
+두 주문 완료, 로봇별 Unreal 수신 위치 변화, 집기·적재 요청과 동기화된
+재고·선반 슬롯, DB의 완료된 다중 구간 우회를 모두 검사한다. 결과와
+Unreal 로그 및 `reroute-db-evidence.json`은 출력된 증거 폴더에 남는다.
+시각적 장면 관찰은 자동화하지 않으며 로그 검사만으로 화면을 보았다고
+주장하지 않는다. 장치의 물리적 정지·충돌 안전을 검증하는 시험이 아니다.

@@ -1,0 +1,37 @@
+diff --git a/Source/agvSimulation/AGVRobot.cpp b/Source/agvSimulation/AGVRobot.cpp
+--- a/Source/agvSimulation/AGVRobot.cpp
++++ b/Source/agvSimulation/AGVRobot.cpp
+@@ -422,8 +422,8 @@ static bool CollectPickupObjects(UWorld* World, EProductType ProductType,
+ {
+     if (!IsValid(World) || !IsInGameThread()) return false;
+     FString NodeId;
+-    if (ProductType == EProductType::Red) NodeId = TEXT("D01");
+-    else if (ProductType == EProductType::Blue) NodeId = TEXT("D06");
++    if (ProductType == EProductType::Red) NodeId = TEXT("N01");
++    else if (ProductType == EProductType::Blue) NodeId = TEXT("N04");
+     else return false;
+ 
+     int32 LoaderCount = 0;
+@@ -686,8 +686,8 @@ static bool V3ShelfLocationMatches(UWorld* World, const AAGVDisplayShelf* Shelf,
+     if (!Loader) return false;
+     if (Loader->LoadedMapId != TEXT("mat_ssafy_v3")) return true;
+     FString Target;
+-    if (Shelf->GetShelfId() == TEXT("SHELF_RED")) Target = TEXT("D04");
+-    else if (Shelf->GetShelfId() == TEXT("SHELF_BLUE")) Target = TEXT("D03");
++    if (Shelf->GetShelfId() == TEXT("SHELF_RED")) Target = TEXT("D01");
++    else if (Shelf->GetShelfId() == TEXT("SHELF_BLUE")) Target = TEXT("D04");
+     else return false;
+     int32 Matches = 0;
+     FVector NodePosition = FVector::ZeroVector;
+diff --git a/Source/agvSimulation/AGVWebSocketClient.cpp b/Source/agvSimulation/AGVWebSocketClient.cpp
+--- a/Source/agvSimulation/AGVWebSocketClient.cpp
++++ b/Source/agvSimulation/AGVWebSocketClient.cpp
+@@ -386,7 +386,7 @@ void AAGVWebSocketClient::HandleMessage(
+                 FVector Center;
+                 if (!AAGVRobot::GetPickupAvailability(Self->GetWorld(), Type, Available, Center)) return;
+                 TSharedRef<FJsonObject> Pickup = MakeShared<FJsonObject>();
+-                Pickup->SetStringField(TEXT("source_id"), I == 0 ? TEXT("D01") : TEXT("D06"));
++                Pickup->SetStringField(TEXT("source_id"), I == 0 ? TEXT("N01") : TEXT("N04"));
+                 Pickup->SetStringField(TEXT("product_type"), I == 0 ? TEXT("Red") : TEXT("Blue"));
+                 Pickup->SetNumberField(TEXT("available"), Available);
+                 PickupValues.Add(MakeShared<FJsonValueObject>(Pickup));
