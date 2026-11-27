@@ -25,7 +25,7 @@ from server.tests.test_twin_broker_integration import BROKER, free_port, stop, w
 from server.tools.twin_multi_test import isolated_environment
 from sim.mqtt_order_robot import SimMqttOrderRobot
 from sim.order_executor import SimOrderExecutor
-from sim.order_inbox import SimOrderInbox
+from sim.order_inbox import OrderRejected, SimOrderInbox
 
 
 def cycle_map():
@@ -154,6 +154,29 @@ class SimRerouteMqttTest(unittest.TestCase):
                 self.assertEqual(proposal['direction_source'], 'simulated_route_and_executor_checkpoint')
                 self.assertEqual(proposal['reservation'], 'not_reserved')
                 self.assertEqual(read_tables(path), before)
+
+                # A candidate is not an executable route generation. Even at
+                # a confirmed stop, neither a command with the old prefix nor
+                # a newly truncated route may replace the active route. Check
+                # both durable robot inbox and virtual pose remain unchanged.
+                executor = robots['sim-r1'].executor
+                snapshot_before = executor.snapshot()
+                robot_db = folder / 'sim-r1.sqlite3'
+                with closing(sqlite3.connect(robot_db)) as db:
+                    inbox_before = db.execute('SELECT * FROM sim_inbox_orders ORDER BY rowid').fetchall()
+                for nodes in (['S1'] + proposal['nodes'], proposal['nodes']):
+                    forged = dict(snapshot_before['order'], seq=snapshot_before['receipt']['seq'] + 1,
+                                  nodes=nodes, released_until=nodes[-1])
+                    encoded = json.dumps(forged).encode('utf-8')
+                    with self.assertRaises(OrderRejected):
+                        executor.accept(encoded)
+                    with self.assertRaises(OrderRejected):
+                        executor._inbox.accept(encoded)
+                    self.assertEqual(executor.tick(10), snapshot_before)
+                    with closing(sqlite3.connect(robot_db)) as db:
+                        self.assertEqual(db.execute('SELECT * FROM sim_inbox_orders ORDER BY rowid').fetchall(),
+                                         inbox_before)
+                    self.assertEqual(read_tables(path), before)
 
                 executor = robots['sim-r1'].executor
                 with robots['sim-r1']._lock:
