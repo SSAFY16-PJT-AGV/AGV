@@ -31,7 +31,7 @@ class RerouteReservationTest(unittest.TestCase):
             with self.subTest(handoff_store=handoff):
                 self._exercise(handoff)
 
-    def _exercise(self, handoff):
+    def _exercise(self, handoff, after_prepare=None):
         data, port = cycle_map(), free_port()
         data['schema'] = 'agv-map-v1'
         for edge in (data['edges'][3], data['edges'][4]):
@@ -152,6 +152,8 @@ class RerouteReservationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     with SimOrderAuthorizer(runtime, robot_id='sim-r1').guard(payload):
                         pass
+                if after_prepare is not None:
+                    after_prepare(runtime, robots)
                 saved = runtime.store.list_occupancy()
                 runtime.stop()
                 reopened = (SimHandoffStore.open_existing(path, expected_creation_id=store.creation_id,

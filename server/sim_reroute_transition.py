@@ -6,6 +6,7 @@ The old and proposed first segments are held together in the existing
 allocation_occupancy table until a future, separately verified transition.
 """
 import json
+import hashlib
 import re
 import secrets
 import sqlite3
@@ -95,7 +96,7 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
         if (generation != 1 or type(transition_id) is not str or not re.fullmatch('[0-9a-f]{32}', transition_id)
                 or saved_robot != robot or type(session) is not str or not session or type(parent_seq) is not int
                 or parent_seq != seq or saved_payload != payload or saved_stop != stopped
-                or type(epoch) is not int or epoch < 0 or state != 'prepared'):
+                or type(epoch) is not int or epoch < 0 or state not in ('prepared', 'uncertain', 'accepted')):
             raise ValueError('reroute parent or state changed')
         nodes, edges = json.loads(nodes_json), json.loads(edges_json)
         blocked_raw, resources_raw = json.loads(blocked_json), json.loads(resources_json)
@@ -123,6 +124,36 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
                 or parsed['order_id'] != task_id or parsed['robot_session'] != session
                 or parsed['seq'] != seq or parsed['stopped_at'] != stopped or parsed['map_id'] != progress._map_id):
             raise ValueError('reroute event evidence is inconsistent')
+        if state == 'accepted':
+            # The cryptographic key is in the live isolated session, not in
+            # this DB. This check preserves consistency after restart; an
+            # eventual activation must independently verify the signature.
+            receipt = db.execute('SELECT robot_id,payload,digest,state FROM sim_reroute_server_receipts '
+                                 'WHERE transition_id=? AND task_id=?', (transition_id, task_id)).fetchone()
+            if (receipt is None or receipt[0] != robot or not isinstance(receipt[1], bytes)
+                    or hashlib.sha256(receipt[1]).hexdigest() != receipt[2]
+                    or receipt[3] != 'recorded_not_activated'):
+                raise ValueError('accepted reroute receipt is missing or inconsistent')
+            signed = json.loads(receipt[1].decode('utf-8'))
+            if not isinstance(signed, dict) or not isinstance(signed.get('data'), dict):
+                raise ValueError('accepted reroute receipt format changed')
+            data = signed['data']
+            from sim.order_inbox import _decode
+            old_order, _old_canonical, parent_digest = _decode(saved_payload.encode('utf-8'), robot, progress._map_id)
+            proposal = {'type': 'sim.reroute.prepare.v1', 'data': {
+                'transition_id': transition_id, 'generation': generation, 'robot_id': robot,
+                'robot_session': session, 'task_id': task_id, 'parent_seq': seq, 'parent_digest': parent_digest,
+                'map_id': progress._map_id, 'stopped_at': stopped, 'incoming_edge': incoming,
+                'nodes': nodes, 'edge_ids': edges, 'blocked_resources': blocked_raw,
+                'released_until': plan_segment(progress._map, nodes).released_until,
+                'action_at_end': old_order['action_at_end']}}
+            proposal_digest = hashlib.sha256(_json(proposal).encode('ascii')).hexdigest()
+            if (signed.get('type') != 'sim.reroute.receipt.v1' or data.get('transition_id') != transition_id
+                    or data.get('robot_id') != robot or data.get('robot_session') != session
+                    or data.get('task_id') != task_id or data.get('generation') != generation
+                    or data.get('parent_seq') != seq or data.get('digest') != proposal_digest
+                    or data.get('state') != 'accepted_not_executed'):
+                raise ValueError('accepted reroute receipt identity changed')
         return resources - old_resources
     except (ValueError, TypeError, KeyError, IndexError, RecursionError, sqlite3.Error, UnicodeError) as exc:
         raise AllocationConflict('prepared reroute is inconsistent') from exc
