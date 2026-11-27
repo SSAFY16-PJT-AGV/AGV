@@ -224,6 +224,18 @@ class SimRuntime:
             try:
                 self.store = self._simulation_store or (AllocationStore(self.path, field_required=True)
                                                         if self._field_simulation else AllocationStore(self.path))
+                if self._field_simulation:
+                    # Completed reroute handoffs retain locally verified Unreal
+                    # ACKs, but this DB alone cannot authenticate them on a new
+                    # process boot. Preserve the DB and require reconciliation.
+                    with closing(self.store._connect()) as db:
+                        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                        if 'sim_reroute_generations' in tables:
+                            if 'tasks' not in tables:
+                                raise RuntimeError('reroute handoff history is incomplete')
+                            if db.execute("SELECT 1 FROM sim_reroute_generations g JOIN tasks t "
+                                          "ON t.task_id=g.task_id WHERE t.status='DONE' LIMIT 1").fetchone():
+                                raise RuntimeError('completed reroute handoff requires manual reconciliation before restart')
                 if self._simulation_store is not None:
                     # Repeat after the process-wide lock: a validated file may
                     # have been replaced or modified while ownership was pending.
@@ -978,6 +990,20 @@ class SimRuntime:
 
     def prepare_field(self, task_id, destination, candidates, action, *, handoff_store=None):
         """Prepare a team-map order in the explicitly enabled simulation only."""
+        from server.sim_handoff_store import SimHandoffCoordinatorStore, _reroute_handoff_fence
+        if type(handoff_store) is SimHandoffCoordinatorStore:
+            context = handoff_store._context
+            guard = context.get('reroute_guard')
+            if guard is not None:
+                if getattr(guard, 'runtime', None) is not self:
+                    raise ValueError('reroute handoff guard belongs to another runtime')
+                with _reroute_handoff_fence(guard, context['source_task_id'], handoff_store._store,
+                                            context['progress'], context['receiver'], context['gate']):
+                    return self._prepare_field_locked(task_id, destination, candidates, action,
+                                                      handoff_store=handoff_store)
+        return self._prepare_field_locked(task_id, destination, candidates, action, handoff_store=handoff_store)
+
+    def _prepare_field_locked(self, task_id, destination, candidates, action, *, handoff_store=None):
         with self._lock:
             self._ready()
             if not self._field_simulation:

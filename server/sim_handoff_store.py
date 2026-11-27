@@ -14,7 +14,7 @@ import re
 import secrets
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import closing, contextmanager
 
 from server.allocation_store import (AllocationStore, AllocationConflict, InvalidAllocation, _fingerprint,
                                      _id, _input, _field_route, _verify_field_global)
@@ -29,6 +29,7 @@ from sim.event_receiver import SimEventReceiver
 
 
 _CONSTRUCTION_KEY = object()
+_HANDOFF_FENCE_LOCAL = threading.local()
 _SCHEMA_HASHES = {
     False: 'f7bb0641f03d58fbcd478b1a4c0117b33bd1971b7704732bb7c6e786ac011b22',
     True: '77c77335f721d5cd94bee5bbb60b5707bcf0e81f42f6a546bcda9755bf1a82ca',
@@ -37,6 +38,45 @@ _SCHEMA_HASHES = {
 
 class SimResourceBusy(AllocationConflict):
     """A verified segment is occupied in the isolated simulation transaction."""
+
+
+@contextmanager
+def _reroute_handoff_fence(guard, source_task, store, progress, receiver, gate):
+    if guard is None:
+        yield None
+        return
+    from server.sim_reroute_execute_wire import SimRerouteExecutionGuard
+    from server.sim_reroute_activate_wire import _check_binding
+    if type(guard) is not SimRerouteExecutionGuard:
+        raise ValueError('exact live simulated reroute guard required')
+    identity = (guard, source_task, store, progress, receiver, gate)
+    active = getattr(_HANDOFF_FENCE_LOCAL, 'active', None)
+    if active is not None:
+        if (active[0][1] != source_task
+                or any(active[0][i] is not identity[i] for i in (0, 2, 3, 4, 5))):
+            raise ValueError('different simulated reroute handoff fence is active')
+        yield active[1]
+        return
+    runtime = guard.runtime
+    if runtime.store is not store or runtime.progress is not progress or runtime.receiver is not receiver or runtime.gate is not gate:
+        raise ValueError('reroute handoff must use the bound runtime')
+    with runtime._runtime_read_operation():
+        robot = _check_binding(runtime, source_task, guard.receipt_inbox, guard.robot_receiver)
+        endpoint = guard._execution_receiver
+        if endpoint is None:
+            raise ValueError('live simulated execution receiver required')
+        with guard.robot_receiver._lifecycle_lock, guard.robot_receiver._connection_fence, \
+                guard.activation_receiver.endpoint._connection_fence, endpoint.endpoint._connection_fence, \
+                robot._lock, runtime._lock:
+            runtime._ready()
+            if runtime.receiver is not receiver or not receiver.ready:
+                raise ValueError('simulated event receiver changed')
+            with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+                _HANDOFF_FENCE_LOCAL.active = (identity, robot)
+                try:
+                    yield robot
+                finally:
+                    _HANDOFF_FENCE_LOCAL.active = None
 
 
 class SimHandoffStore(AllocationStore):
@@ -350,7 +390,7 @@ class SimHandoffStore(AllocationStore):
                          resources, action_at_end, map_fingerprint, source_task_id,
                          robot_session, seq, stopped_at, event_id, action_ack,
                          expected_twin_id, gate, progress, receiver, simulation_enabled=False,
-                         release_index=None, field_context=None):
+                         release_index=None, field_context=None, reroute_guard=None):
         """Atomically transfer the source stop into an entirely reserved new leg.
 
         action_ack is a caller-verified Unreal simulation acknowledgement. This
@@ -401,17 +441,19 @@ class SimHandoffStore(AllocationStore):
                 or (release_index is not None and release_index != segment.end_index)):
             raise ValueError('target leg must reserve its exact first segment from the stopped node')
         try:
-            with receiver._dispatch_lock, gate.transaction() as db:
+            with _reroute_handoff_fence(reroute_guard, source_task_id, self, progress, receiver, gate) as reroute_robot, \
+                    receiver._dispatch_lock, gate.transaction() as db:
                 if not receiver.ready:
                     raise RuntimeError('simulation receiver is not ready')
                 progress._check_database(db)
                 if progress._field_required:
                     self._verify_field_fleet(db)
                 _verify_field_global(db, field_required=progress._field_required)
-                gate.require_reconciled(db, source_task_id, robot_session,
-                                        expected_seq=seq, expected_stopped_at=stopped_at)
                 prior_robot, prior_path, prior_stop = progress._job(db, source_task_id, robot_id)
-                if field_context is not None:
+                if reroute_guard is None:
+                    gate.require_reconciled(db, source_task_id, robot_session,
+                                            expected_seq=seq, expected_stopped_at=stopped_at)
+                if field_context is not None and reroute_guard is None:
                     row = db.execute('SELECT incoming_edge FROM field_route_provenance WHERE task_id=?',
                                      (source_task_id,)).fetchone()
                     if row is None:
@@ -423,9 +465,24 @@ class SimHandoffStore(AllocationStore):
                         raise AllocationConflict('handoff incoming direction differs from finished route')
                 latest_seq, _prior_payload, prior_state, _order = progress._latest(
                     db, source_task_id, prior_robot, prior_path, prior_stop)
-                if (prior_robot != robot_id or prior_stop != stopped_at or prior_path[-1] != stopped_at
-                        or latest_seq != seq or prior_state != 'acked'):
-                    raise AllocationConflict('source leg is not finished at its acknowledged destination')
+                if reroute_guard is None:
+                    if (prior_robot != robot_id or prior_stop != stopped_at or prior_path[-1] != stopped_at
+                            or latest_seq != seq or prior_state != 'acked'):
+                        raise AllocationConflict('source leg is not finished at its acknowledged destination')
+                else:
+                    from server.sim_reroute_execute_wire import _execution
+                    _execution_payload, generation = _execution(db, reroute_guard, source_task_id,
+                                                                 reroute_robot, state='finished')
+                    if (field_context is None or prior_robot != robot_id or prior_state != 'acked'
+                            or generation['robot_session'] != robot_session
+                            or generation['parent_seq'] != latest_seq or seq != latest_seq + 1
+                            or generation['nodes'][-1] != stopped_at
+                            or not generation['edge_ids'] or field_context['incoming_edge'] != generation['edge_ids'][-1]):
+                        raise AllocationConflict('completed reroute does not match the next leg')
+                    finish = db.execute('SELECT robot_id,event_id FROM sim_reroute_finishes WHERE task_id=?',
+                                        (source_task_id,)).fetchone()
+                    if finish != (robot_id, event_id):
+                        raise AllocationConflict('completed reroute event differs')
                 required_action = {'load': 'grab', 'unload': 'place'}.get(_order['action_at_end'].get('type'))
                 if required_action is None or action_ack['action'] != required_action:
                     raise AllocationConflict('source leg and acknowledged action do not match')
@@ -440,12 +497,17 @@ class SimHandoffStore(AllocationStore):
                                  'FROM sim_event_inbox i JOIN progress_events p '
                                  'ON p.robot_id=i.robot_id AND p.event_id=i.event_id '
                                  'WHERE i.robot_id=? AND i.event_id=?', (robot_id, event_id)).fetchone()
-                if row is None:
+                if reroute_guard is not None:
+                    # _execution has already revalidated the distinct final
+                    # event, both generation records and its held destination.
+                    row = None
+                if row is None and reroute_guard is None:
                     raise AllocationConflict('applied final event not found')
-                event, canonical, digest = _event(row[0].encode('ascii'))
-                result = json.loads(row[6]) if row[6] else None
-                expected_cleared = set(progress._segment_for_task(db, source_task_id, prior_path, stopped_at).resources) - {('node', stopped_at)}
-                if (canonical != row[0] or digest != row[1] or digest != row[7]
+                if row is not None:
+                    event, canonical, digest = _event(row[0].encode('ascii'))
+                    result = json.loads(row[6]) if row[6] else None
+                    expected_cleared = set(progress._segment_for_task(db, source_task_id, prior_path, stopped_at).resources) - {('node', stopped_at)}
+                    if (canonical != row[0] or digest != row[1] or digest != row[7]
                         or row[2:6] != (robot_session, source_task_id, seq, 'applied')
                         or row[8:12] != (source_task_id, seq, None, 'finished')
                         or event['event_id'] != event_id or event['robot_session'] != robot_session
@@ -453,8 +515,8 @@ class SimHandoffStore(AllocationStore):
                         or event['map_id'] != map_id or event['stopped_at'] != stopped_at
                         or _resources(event['cleared_resources']) != expected_cleared
                         or not isinstance(result, dict) or result.get('status') != 'finished'
-                        or result.get('task_id') != source_task_id or result.get('next_seq') is not None):
-                    raise AllocationConflict('finished event and simulated proof do not match')
+                            or result.get('task_id') != source_task_id or result.get('next_seq') is not None):
+                        raise AllocationConflict('finished event and simulated proof do not match')
                 if db.execute('SELECT 1 FROM sim_handoff_transfers WHERE source_task_id=? OR target_task_id=? OR action_id=?',
                               (source_task_id, task_id, action_ack['action_id'])).fetchone():
                     raise AllocationConflict('handoff or action was already used')
@@ -462,6 +524,15 @@ class SimHandoffStore(AllocationStore):
                 db.execute('INSERT INTO sim_handoff_transfers VALUES (?,?,?,?,?,?,?,?,?)',
                            (source_task_id, task_id, robot_id, robot_session, seq, stopped_at,
                             event_id, action_ack['action_id'], json.dumps(action_ack, sort_keys=True)))
+                if reroute_guard is not None:
+                    canonical_ack = json.dumps(action_ack, sort_keys=True, ensure_ascii=True,
+                                               allow_nan=False, separators=(',', ':')).encode('ascii')
+                    db.execute('CREATE TABLE IF NOT EXISTS sim_reroute_handoff_proofs ('
+                               'source_task_id TEXT PRIMARY KEY NOT NULL REFERENCES allocation_jobs(task_id), '
+                               'expected_twin_id TEXT NOT NULL, action_id TEXT NOT NULL, ack_digest TEXT NOT NULL)')
+                    db.execute('INSERT INTO sim_reroute_handoff_proofs VALUES (?,?,?,?)',
+                               (source_task_id, expected_twin_id, action_ack['action_id'],
+                                hashlib.sha256(canonical_ack).hexdigest()))
                 if db.execute('DELETE FROM sim_active_robots WHERE robot_id=? AND task_id=?',
                               (robot_id, source_task_id)).rowcount != 1:
                     raise AllocationConflict('active ownership changed')
@@ -496,7 +567,7 @@ class SimHandoffCoordinatorStore:
 
     def __init__(self, store, *, target_task_id, source_task_id, robot_id, robot_session,
                  seq, stopped_at, event_id, action_ack, expected_twin_id, gate, progress,
-                 receiver, simulation_enabled=False):
+                 receiver, simulation_enabled=False, reroute_guard=None):
         if simulation_enabled is not True or not isinstance(store, SimHandoffStore):
             raise ValueError('fresh isolated simulation store and explicit enablement required')
         _id(target_task_id, 'target_task_id')
@@ -509,7 +580,7 @@ class SimHandoffCoordinatorStore:
                          'seq': seq, 'stopped_at': stopped_at, 'event_id': event_id,
                          'action_ack': copy.deepcopy(action_ack), 'expected_twin_id': expected_twin_id,
                          'gate': gate, 'progress': progress, 'receiver': receiver,
-                         'simulation_enabled': True}
+                         'simulation_enabled': True, 'reroute_guard': reroute_guard}
         self._lock = threading.Lock()
         self._used = False
 

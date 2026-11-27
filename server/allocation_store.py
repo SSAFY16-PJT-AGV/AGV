@@ -100,9 +100,55 @@ def _verify_field_global(db, *, field_required=False):
         for task_id, status, map_id, nodes_json, stopped in jobs:
             robot, path, stop = progress._job(db, task_id) if status == 'ASSIGNED' else (None, None, None)
             if status != 'ASSIGNED':
-                from server.sim_reroute_transition import is_prepared
+                from server.sim_reroute_transition import is_prepared, verify_prepared
                 if is_prepared(db, task_id):
-                    raise AllocationConflict('completed task retains an unfinished reroute')
+                    # Completed reroutes retain the complete parent history.
+                    # They may lose their final node only through a recorded
+                    # handoff whose new-generation stop and session agree.
+                    row = db.execute('SELECT robot_id,nodes_json,released_until FROM allocation_jobs WHERE task_id=?',
+                                     (task_id,)).fetchone()
+                    completed_robot, completed_nodes, completed_stop = row[0], json.loads(row[1]), row[2]
+                    completed_seq, completed_payload, _, completed_order = progress._latest(
+                        db, task_id, completed_robot, completed_nodes, completed_stop)
+                    old = set(progress._segment_for_task(db, task_id, completed_nodes, completed_stop).resources)
+                    verify_prepared(db, progress, task_id, completed_robot, completed_nodes, completed_stop,
+                                    completed_seq, completed_payload, old)
+                    from server.sim_reroute_finish import finished_resources
+                    kept = finished_resources(db, progress, task_id, completed_robot, completed_nodes, old)
+                    generation = db.execute('SELECT robot_session,event_id FROM sim_reroute_generations WHERE task_id=?',
+                                            (task_id,)).fetchone()
+                    final = db.execute('SELECT event_id FROM sim_reroute_finishes WHERE task_id=?', (task_id,)).fetchone()
+                    transfer = db.execute('SELECT target_task_id,robot_id,robot_session,seq,stopped_at,event_id,action_id,ack_json '
+                                          'FROM sim_handoff_transfers '
+                                          'WHERE source_task_id=?', (task_id,)).fetchone()
+                    if (kept != {('node', completed_nodes[-1])} or generation is None or final is None
+                            or transfer is None or transfer[1:6] != (completed_robot, generation[0], completed_seq + 1,
+                                                                     completed_nodes[-1], final[0])):
+                        raise AllocationConflict('completed reroute has no matching simulated handoff')
+                    target, _, _, _, _, _, action_id, ack_json = transfer
+                    ack = json.loads(ack_json)
+                    ack_canonical = json.dumps(ack, sort_keys=True, ensure_ascii=True, allow_nan=False,
+                                               separators=(',', ':')).encode('ascii')
+                    proof = db.execute('SELECT expected_twin_id,action_id,ack_digest FROM sim_reroute_handoff_proofs '
+                                       'WHERE source_task_id=?', (task_id,)).fetchone()
+                    expected_action = {'load': 'grab', 'unload': 'place'}.get(completed_order['action_at_end'].get('type'))
+                    target_job = db.execute('SELECT robot_id,map_id,nodes_json FROM allocation_jobs WHERE task_id=?',
+                                            (target,)).fetchone()
+                    target_field = db.execute('SELECT incoming_edge FROM field_route_provenance WHERE task_id=?',
+                                              (target,)).fetchone()
+                    detour = db.execute('SELECT edges_json FROM sim_reroute_generations WHERE task_id=?',
+                                        (task_id,)).fetchone()
+                    if (expected_action is None or not isinstance(ack, dict)
+                            or set(ack) != {'order_id', 'action_id', 'agv_id', 'action', 'applied'}
+                            or ack['order_id'] != task_id or ack['action_id'] != action_id
+                            or not isinstance(action_id, str) or not action_id
+                            or not isinstance(ack['agv_id'], str) or not ack['agv_id']
+                            or proof != (ack['agv_id'], action_id, hashlib.sha256(ack_canonical).hexdigest())
+                            or ack['action'] != expected_action or ack['applied'] is not True
+                            or target_job is None or target_job[0:2] != (completed_robot, map_id)
+                            or json.loads(target_job[2])[0] != completed_nodes[-1]
+                            or target_field != (json.loads(detour[0])[-1],)):
+                        raise AllocationConflict('completed reroute handoff action or target differs')
                 # The separate handoff workflow can retain completed history,
                 # but completed jobs must no longer own active resources.
                 if status != 'DONE' or db.execute('SELECT 1 FROM allocation_occupancy WHERE task_id=?',

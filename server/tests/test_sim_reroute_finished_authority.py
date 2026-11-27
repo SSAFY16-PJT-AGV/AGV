@@ -55,6 +55,13 @@ class FinishedAuthorityTest(unittest.TestCase):
                             _execution(db, guard, task, robot, state='finished')
                     finally:
                         db.execute("UPDATE recovery_challenges SET status='verified' WHERE task_id=?", (task,))
+                    expires = db.execute('SELECT expires FROM recovery_challenges WHERE task_id=?', (task,)).fetchone()[0]
+                    db.execute('UPDATE recovery_challenges SET expires=? WHERE task_id=?', (runtime.gate._now(), task))
+                    try:
+                        with self.assertRaises(ValueError):
+                            _execution(db, guard, task, robot, state='finished')
+                    finally:
+                        db.execute('UPDATE recovery_challenges SET expires=? WHERE task_id=?', (expires, task))
                     snapshot = robot.executor.snapshot()
                     snapshot['current_node'] = 'wrong-stop'
                     with patch.object(robot.executor, 'snapshot', return_value=snapshot):
