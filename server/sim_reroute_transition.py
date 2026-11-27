@@ -27,6 +27,9 @@ def initialize(db):
                'stopped_at TEXT NOT NULL, incoming_edge TEXT NOT NULL, '
                'nodes_json TEXT NOT NULL, edges_json TEXT NOT NULL, blocked_json TEXT NOT NULL, '
                'new_resources_json TEXT NOT NULL, recovery_epoch INTEGER NOT NULL, state TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS sim_reroute_multiseg_routes ('
+               'task_id TEXT PRIMARY KEY NOT NULL REFERENCES sim_reroute_generations(task_id), '
+               'resources_json TEXT NOT NULL)')
 
 
 def _json(value):
@@ -35,6 +38,21 @@ def _json(value):
 
 def _pairs(value):
     return [list(item) for item in sorted(value)]
+
+
+def route_resources(map_data, nodes):
+    """Union every segment, including shared zones, of one simple route."""
+    if not isinstance(nodes, list) or len(nodes) < 2 or len(nodes) > 256 or len(nodes) != len(set(nodes)):
+        raise ValueError('a bounded non-repeating reroute is required')
+    resources, offset = set(), 0
+    while offset < len(nodes) - 1:
+        segment = plan_segment(map_data, nodes[offset:])
+        resources.update(segment.resources)
+        next_offset = nodes.index(segment.released_until, offset + 1)
+        if next_offset <= offset:
+            raise ValueError('reroute segment does not advance')
+        offset = next_offset
+    return resources
 
 
 def is_prepared(db, task_id):
@@ -48,7 +66,8 @@ def reserve(db, runtime, task_id, wait, path, incoming, candidate, blocked, old_
     if is_prepared(db, task_id):
         raise AllocationConflict('a reroute is already prepared')
     segment = plan_segment(progress._map, list(candidate.nodes))
-    new_resources = set(segment.resources)
+    multiple = segment.released_until != candidate.nodes[-1]
+    new_resources = (route_resources(progress._map, list(candidate.nodes)) if multiple else set(segment.resources))
     if not new_resources or new_resources & blocked:
         raise AllocationConflict('reroute conflicts with existing resources')
     if progress._occupancy(db, task_id) != old_resources:
@@ -75,6 +94,11 @@ def reserve(db, runtime, task_id, wait, path, incoming, candidate, blocked, old_
                    (task_id, 1, transition_id, wait['robot_id'], event[2], seq, wait['event_id'], event[1], old_payload,
                     wait['stopped_at'], incoming, _json(list(candidate.nodes)), _json(list(candidate.edge_ids)),
                     _json(_pairs(blocked)), _json(_pairs(new_resources)), epoch, 'prepared'))
+        if multiple:
+            db.execute('CREATE TABLE IF NOT EXISTS sim_reroute_multiseg_routes ('
+                       'task_id TEXT PRIMARY KEY NOT NULL REFERENCES sim_reroute_generations(task_id), '
+                       'resources_json TEXT NOT NULL)')
+            db.execute('INSERT INTO sim_reroute_multiseg_routes VALUES (?,?)', (task_id, _json(_pairs(new_resources))))
     except sqlite3.IntegrityError as exc:
         raise AllocationConflict('reroute reservation conflicts with another task') from exc
     return {'state': 'prepared', 'task_id': task_id, 'generation': 1, 'transition_id': transition_id,
@@ -104,6 +128,16 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
                 (blocked_raw, blocked_json), (resources_raw, resources_json))):
             raise ValueError('reroute journal is not canonical')
         blocked, resources = _resources(blocked_raw), _resources(resources_raw)
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_reroute_multiseg_routes'").fetchone()
+        marker = db.execute('SELECT resources_json FROM sim_reroute_multiseg_routes WHERE task_id=?',
+                            (task_id,)).fetchone() if table else None
+        first_resources = set(plan_segment(progress._map, nodes).resources)
+        if marker is None:
+            expected_resources = first_resources  # Existing prepared records remain readable.
+        else:
+            expected_resources = route_resources(progress._map, nodes)
+            if marker != (_json(_pairs(expected_resources)),) or expected_resources == first_resources:
+                raise ValueError('whole-route reservation marker differs')
         if len(set(path)) != len(path) or path.index(stopped) == 0:
             raise ValueError('unsupported parent route')
         from server.sim_reroute_candidate import _incoming
@@ -113,7 +147,7 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
                                      goal=path[-1], blocked_resources=blocked)
         if (nodes != list(candidate.nodes) or edges != list(candidate.edge_ids) or len(nodes) < 2
                 or len(nodes) > 256 or len(nodes) != len(set(nodes)) or nodes[0] != stopped
-                or resources != set(plan_segment(progress._map, nodes).resources) or resources & blocked):
+                or resources != expected_resources or resources & blocked):
             raise ValueError('reroute plan or reservation changed')
         event = db.execute('SELECT payload,digest,task_id,robot_session,seq,state,result FROM sim_event_inbox '
                            'WHERE robot_id=? AND event_id=?', (robot, event_id)).fetchone()
