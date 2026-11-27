@@ -3,7 +3,9 @@
 The two databases are deliberately not presented as one transaction. An
 interrupted dispatch or a mismatch blocks recovery and preserves claims.
 """
-from server.order_persistence import PersistentOrderStore
+import uuid
+
+from server.order_persistence import PersistentOrderStore, _text
 from server.team_shelf_order_slots import TeamShelfOrderSlots
 
 
@@ -14,6 +16,42 @@ class TeamShelfPersistentOrders(PersistentOrderStore):
         self.slots = slots
         super().__init__(path, map_id, catalog)
         self.bind_pickup_id(slots.creation_id)
+
+    def submit_approved(self, product_id, request_key, *, threshold):
+        """Persist only an approval's identity, not its temporary authority."""
+        _text(product_id, 'product ID')
+        _text(request_key, 'idempotency key', 128)
+        if product_id not in self.products or type(threshold) is not int or not 1 <= threshold <= 4:
+            raise ValueError('invalid synthetic replenishment approval')
+        fingerprint = 'synthetic-replenishment:{}:{}'.format(product_id, threshold)
+        with self._write() as db:
+            old = db.execute('SELECT request_id,product_id,state,result_json,error,fingerprint '
+                             'FROM orders WHERE request_key=?', (request_key,)).fetchone()
+            if old is not None:
+                if old[5] != fingerprint:
+                    raise ValueError('request key belongs to a different order')
+                return self._order(old[:5])
+            request_id = uuid.uuid4().hex
+            db.execute('INSERT INTO orders(request_id,request_key,fingerprint,product_id,state) '
+                       "VALUES (?,?,?,?,'queued')", (request_id, request_key, fingerprint, product_id))
+            db.execute("INSERT INTO order_events(request_id,state) VALUES (?,'queued')", (request_id,))
+            return self._order((request_id, product_id, 'queued', None, None), created=True)
+
+    def get_approval(self, request_id):
+        """Return durable approval parameters, or None for an ordinary order."""
+        _text(request_id, 'request ID')
+        with self._read() as db:
+            row = db.execute('SELECT product_id,fingerprint FROM orders WHERE request_id=?',
+                             (request_id,)).fetchone()
+        if row is None:
+            raise KeyError(request_id)
+        product, fingerprint = row
+        if fingerprint == 'product:' + product:
+            return None
+        for threshold in range(1, 5):
+            if fingerprint == 'synthetic-replenishment:{}:{}'.format(product, threshold):
+                return product, threshold
+        raise ValueError('durable simulated order fingerprint is invalid')
 
     def _validate_assignment(self, db, request_id, product_id, result):
         product = self.products[product_id]
