@@ -102,6 +102,31 @@ class SimRerouteAutoSession:
                 raise RuntimeError('reroute session cleanup failed') from exc
 
     @_serialized
+    def retry_waiting(self, task, event_id):
+        """Retry one classified event under a tracked live proof clock."""
+        self._check_waiting_session(task)
+        from server.sim_wait_refresh import retry_wait
+        return retry_wait(self.runtime, task, self.robot, event_id, simulation_enabled=True)
+
+    def _check_waiting_session(self, task):
+        if not self._started or self._phase not in ('idle', 'finished'):
+            raise RuntimeError('virtual waiting session is unavailable')
+        if self.runtime._tasks.get(task) != (self.robot.robot_id, self.session):
+            raise ValueError('waiting task is not bound to this virtual session')
+        if self._phase == 'finished' and task != self._task:
+            with closing(sqlite3.connect(self.runtime.path)) as db:
+                previous = db.execute('SELECT status FROM tasks WHERE task_id=?', (self._task,)).fetchone()
+            if previous != ('DONE',):
+                raise RuntimeError('previous simulated reroute has not been handed off')
+
+    @_serialized
+    def refresh_waiting(self, task, event_id):
+        """Reconfirm a live, still-valid stopped wait without replaying MQTT."""
+        self._check_waiting_session(task)
+        from server.sim_wait_refresh import refresh_wait
+        return refresh_wait(self.runtime, task, self.robot, event_id, simulation_enabled=True)
+
+    @_serialized
     def begin(self, task):
         """Reserve one safe candidate once; a missing candidate causes no write."""
         if self._phase == 'finished' and task != self._task:

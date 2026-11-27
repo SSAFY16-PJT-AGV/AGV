@@ -22,6 +22,7 @@ class PickupWorkflow:
     TASK = 'web-pickup'
     SESSION = 'demo-session'
     ROBOT = 'sim-r1'
+    MAX_AUTOMATIC_WAIT_SECONDS = 120.0
 
     def __init__(self, runtime, robot, map_data, product_lookup, *, simulation_enabled=False,
                  clock=time.monotonic, timeout_seconds=30, task_id=TASK, session=SESSION,
@@ -84,6 +85,7 @@ class PickupWorkflow:
         self._deadline = None
         self._last_position = None
         self._paused_at = None
+        self._reservation_wait_started = None
 
     def pause_for_reconnect(self):
         with self.lock:
@@ -241,12 +243,26 @@ class PickupWorkflow:
         if stored is not None and stored.get('state') == 'pending' and self.wait_for_reservation:
             if self._next_retry is None or self.clock() >= self._next_retry:
                 self._next_retry = self.clock() + .25
-                result = self.runtime.receiver.retry_occupied_event(self.ROBOT, waiting['event_id'])
+                result = (self.reroute_session.retry_waiting(self.task_id, waiting['event_id'])
+                          if self.reroute_session is not None else
+                          self.runtime.receiver.retry_occupied_event(self.ROBOT, waiting['event_id']))
                 if result.get('status') == 'occupied':
                     self._status = 'waiting_reservation'
-                    if self.reroute_session is not None and self.reroute_session.begin(self.task_id):
-                        self._status = 'rerouting'
-                        self._reset_deadline()
+                    if self.reroute_session is not None:
+                        now = self.clock()
+                        if self._reservation_wait_started is None:
+                            self._reservation_wait_started = now
+                        if (now < self._reservation_wait_started
+                                or now - self._reservation_wait_started >= self.MAX_AUTOMATIC_WAIT_SECONDS):
+                            raise RuntimeError('virtual reservation wait limit reached')
+                        fresh = self.reroute_session.refresh_waiting(self.task_id, waiting['event_id'])
+                        if fresh.get('state') == 'refreshed':
+                            self._reset_deadline()
+                        elif fresh.get('state') != 'not_due':
+                            raise ValueError('virtual waiting proof result is unknown')
+                        if self.reroute_session.begin(self.task_id):
+                            self._status = 'rerouting'
+                            self._reset_deadline()
                 elif result.get('status') == 'not_occupied':
                     if self._status == 'waiting_reservation':
                         raise ValueError('reservation wait evidence disappeared')
@@ -277,6 +293,7 @@ class PickupWorkflow:
             self._segment_start_index = waiting['end_index']
         self._expected_seq += 1
         self._waiting = None
+        self._reservation_wait_started = None
         self._status = 'awaiting_order'
         self._reset_deadline()
         return True
