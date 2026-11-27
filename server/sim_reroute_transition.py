@@ -115,10 +115,17 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
                 or len(nodes) > 256 or len(nodes) != len(set(nodes)) or nodes[0] != stopped
                 or resources != set(plan_segment(progress._map, nodes).resources) or resources & blocked):
             raise ValueError('reroute plan or reservation changed')
-        event = db.execute('SELECT payload,digest,task_id,robot_session,seq,state FROM sim_event_inbox '
+        event = db.execute('SELECT payload,digest,task_id,robot_session,seq,state,result FROM sim_event_inbox '
                            'WHERE robot_id=? AND event_id=?', (robot, event_id)).fetchone()
-        if event is None or event[1:] != (digest, task_id, session, seq, 'pending'):
+        if event is None or event[1:5] != (digest, task_id, session, seq):
             raise ValueError('reroute event changed')
+        if event[5:] != ('pending', None):
+            finish_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_reroute_finishes'").fetchone()
+            finish = (db.execute('SELECT transition_id FROM sim_reroute_finishes WHERE task_id=?', (task_id,)).fetchone()
+                      if finish_table else None)
+            superseded = _json({'status': 'superseded_by_reroute', 'transition_id': transition_id})
+            if event[5:] != ('rejected', superseded) or finish != (transition_id,):
+                raise ValueError('reroute parent event finalization differs')
         parsed, canonical, actual = _event(event[0].encode('ascii'))
         if (canonical != event[0] or actual != digest or parsed['event_id'] != event_id
                 or parsed['order_id'] != task_id or parsed['robot_session'] != session

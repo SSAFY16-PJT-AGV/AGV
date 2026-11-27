@@ -145,8 +145,13 @@ def _verify_field_global(db, *, field_required=False):
             from server.sim_reroute_transition import is_prepared, verify_prepared
             if finished and is_prepared(db, task_id):
                 raise AllocationConflict('finished task retains an unfinished reroute')
+            old_expected = set(expected)
             expected |= verify_prepared(db, progress, task_id, robot, path, stop, seq,
-                                        initial[0] if not rows else _payload, expected)
+                                        initial[0] if not rows else _payload, old_expected)
+            from server.sim_reroute_finish import finished_resources
+            completed = finished_resources(db, progress, task_id, robot, path, old_expected)
+            if completed is not None:
+                expected = completed
             held = set(db.execute('SELECT kind,resource_id FROM allocation_occupancy WHERE task_id=?',
                                   (task_id,)).fetchall())
             if held != expected:
