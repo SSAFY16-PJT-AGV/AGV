@@ -26,7 +26,7 @@ class ProductControlEngine:
 
     def __init__(self, runtime, robot, sim_map, product_lookup, *,
                  robot_id='sim-r1', twin_id='AGV_01', session='demo-session', task_prefix='web',
-                 wait_for_reservation=False):
+                 wait_for_reservation=False, defer_delivery_handoff=False):
         if not isinstance(product_lookup, dict) or not product_lookup:
             raise ValueError('explicit simulated product mapping required')
         for name, value in (('robot_id', robot_id), ('twin_id', twin_id),
@@ -39,6 +39,9 @@ class ProductControlEngine:
         if type(wait_for_reservation) is not bool:
             raise ValueError('reservation waiting must be explicit')
         self.wait_for_reservation = wait_for_reservation
+        if type(defer_delivery_handoff) is not bool:
+            raise ValueError('deferred handoff must be explicit')
+        self.defer_delivery_handoff = defer_delivery_handoff
         self.runtime, self.robot = runtime, robot
         self.map = copy.deepcopy(sim_map)
         self.graph = MapGraph(self.map)
@@ -55,6 +58,7 @@ class ProductControlEngine:
         self._pickup_evidence = self._delivery_evidence = self._last_place_ack = None
         self._pickup_task = self._delivery_task = None
         self._suspended_state = None
+        self._deferred_grab = None
 
     @property
     def control_ready(self):
@@ -282,6 +286,7 @@ class ProductControlEngine:
     def _mark_unknown(self):
         self._status, self._phase, self._pending = 'unknown', 'unknown', None
         self._suspended_state = None
+        self._deferred_grab = None
 
     def suspend(self, uncertain_action_id=None):
         """Freeze an in-process demo without inventing an Unreal result."""
@@ -396,6 +401,11 @@ class ProductControlEngine:
                 return self.snapshot()
             if self._pending is not None:
                 return self.snapshot()
+            if self._deferred_grab is not None:
+                ack = self._deferred_grab
+                self._deferred_grab = None
+                self._start_delivery(ack)
+                return self.snapshot()
             try:
                 pickup = self._current_leg == 'pickup'
                 workflow = self._pickup_workflow if pickup else self._delivery_workflow
@@ -440,29 +450,37 @@ class ProductControlEngine:
                 except Exception:
                     self._mark_unknown()
                 return True
-            try:
-                evidence = self._validate_finished(self._pickup_evidence, self._pickup_task, self._pickup)
-                ack = {'order_id': order_id, 'action_id': action_id, 'agv_id': agv_id,
-                       'action': action, 'applied': True}
-                adapter = SimHandoffCoordinatorStore(
-                    self.runtime.store, target_task_id=self._delivery_task,
-                    source_task_id=self._pickup_task, robot_id=self.ROBOT,
-                    robot_session=self.SESSION, seq=evidence['seq'], stopped_at=self._pickup,
-                    event_id=evidence['event_id'], action_ack=ack, expected_twin_id=self.TWIN,
-                    gate=self.runtime.gate, progress=self.runtime.progress,
-                    receiver=self.runtime.receiver, simulation_enabled=True)
-                products = {self._product: {'pickup_node': self._destination}}
-                self._delivery_workflow = PickupWorkflow(
-                    self.runtime, self.robot, self.map, products, simulation_enabled=True,
-                    task_id=self._delivery_task, session=self.SESSION, robot_id=self.ROBOT,
-                    wait_for_reservation=self.wait_for_reservation,
-                    action_at_end={'type': 'unload'}, accept_preceding=(self._pickup_task, self._pickup),
-                    prepare_options={'handoff_store': adapter})
-                result = self._delivery_workflow.submit(self._product)
-                if result.get('status') == 'unknown':
-                    raise RuntimeError('delivery allocation outcome unknown')
-                self._status, self._phase = 'moving', 'to_destination'
-                self._current_leg = 'delivery'
-            except Exception:
-                self._mark_unknown()
+            ack = {'order_id': order_id, 'action_id': action_id,
+                   'agv_id': agv_id, 'action': action, 'applied': True}
+            if self.defer_delivery_handoff:
+                self._deferred_grab = ack
+                self._status, self._phase = 'waiting', 'delivery_pending'
+                return True
+            self._start_delivery(ack)
             return True
+
+    def _start_delivery(self, ack):
+        """Begin the next simulated leg after the caller's action fence."""
+        try:
+            evidence = self._validate_finished(self._pickup_evidence, self._pickup_task, self._pickup)
+            adapter = SimHandoffCoordinatorStore(
+                self.runtime.store, target_task_id=self._delivery_task,
+                source_task_id=self._pickup_task, robot_id=self.ROBOT,
+                robot_session=self.SESSION, seq=evidence['seq'], stopped_at=self._pickup,
+                event_id=evidence['event_id'], action_ack=ack, expected_twin_id=self.TWIN,
+                gate=self.runtime.gate, progress=self.runtime.progress,
+                receiver=self.runtime.receiver, simulation_enabled=True)
+            products = {self._product: {'pickup_node': self._destination}}
+            self._delivery_workflow = PickupWorkflow(
+                self.runtime, self.robot, self.map, products, simulation_enabled=True,
+                task_id=self._delivery_task, session=self.SESSION, robot_id=self.ROBOT,
+                wait_for_reservation=self.wait_for_reservation,
+                action_at_end={'type': 'unload'}, accept_preceding=(self._pickup_task, self._pickup),
+                prepare_options={'handoff_store': adapter})
+            result = self._delivery_workflow.submit(self._product)
+            if result.get('status') == 'unknown':
+                raise RuntimeError('delivery allocation outcome unknown')
+            self._status, self._phase = 'moving', 'to_destination'
+            self._current_leg = 'delivery'
+        except Exception:
+            self._mark_unknown()
