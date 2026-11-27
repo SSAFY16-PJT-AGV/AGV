@@ -28,12 +28,14 @@ def _reject_constant(_value):
     raise ValueError('invalid JSON constant')
 
 
-def review_robot_acl(manifest):
+def review_robot_acl(manifest, *, isolated_reconciliation=False):
     """Return discrepancies in declared robot grants against the proposal.
 
     Fields are intentionally strict. A match proves only that the supplied
     declaration matches these example topic rules, not what a broker enforces.
     """
+    if type(isolated_reconciliation) is not bool:
+        raise ValueError('reconciliation profile must be explicitly selected')
     if not isinstance(manifest, dict) or set(manifest) != {'robots'}:
         raise ValueError('invalid manifest')
     robots = manifest['robots']
@@ -55,6 +57,10 @@ def review_robot_acl(manifest):
         expected = {'publish': {'agv/{}/{}'.format(robot_id, suffix)
                                 for suffix in ('state', 'event', 'conn')},
                     'subscribe': {'agv/{}/order'.format(robot_id)}}
+        if isolated_reconciliation:
+            expected['publish'].add('agv/{}/reconcile/response'.format(robot_id))
+            expected['subscribe'].update('agv/{}/reconcile/{}'.format(robot_id, suffix)
+                                         for suffix in ('request', 'commit'))
         for direction in ('publish', 'subscribe'):
             topics = robot[direction]
             if (not isinstance(topics, list) or len(topics) > 128
@@ -71,6 +77,8 @@ def review_robot_acl(manifest):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Offline comparison of a proposed robot topic matrix')
+    parser.add_argument('--isolated-reconciliation', action='store_true',
+                        help='include opt-in isolated team reconciliation topics')
     parser.add_argument('manifest', help='path to a JSON proposal (no credentials)')
     args = parser.parse_args(argv)
     try:
@@ -80,11 +88,13 @@ def main(argv=None):
             raise ValueError('manifest too large')
         manifest = json.loads(data.decode('utf-8'), object_pairs_hook=_unique_pairs,
                               parse_constant=_reject_constant)
-        issues = review_robot_acl(manifest)
+        issues = review_robot_acl(manifest, isolated_reconciliation=args.isolated_reconciliation)
     except (OSError, UnicodeError, ValueError, RecursionError):
         print(json.dumps({'error': 'invalid proposal'}), file=sys.stderr)
         return 2
-    print(json.dumps({'scope': 'offline_proposal_only', 'matches_proposal': not issues,
+    print(json.dumps({'scope': 'offline_proposal_only',
+                      'profile': 'isolated_reconciliation_v1' if args.isolated_reconciliation else 'baseline',
+                      'matches_proposal': not issues,
                       'issues': issues}, ensure_ascii=True))
     return 1 if issues else 0
 

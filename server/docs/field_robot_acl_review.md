@@ -18,6 +18,22 @@
 클라이언트가 임시 client ID를 쓸 때도 같은 계정으로 해당 토픽을 발행할 수
 있는지와 client ID 정책을 별도 시험해야 한다.
 
+팀 `feature/field-run` `7e6e6bb`의 재동기화 코드를 **격리 실험에서 명시적으로
+사용할 때만** 다음 권한을 추가할 수 있다. 로봇은 자기 ID에 대해서만
+`agv/{id}/reconcile/response`를 발행하고, 자기 ID의
+`agv/{id}/reconcile/request`, `agv/{id}/reconcile/commit`을 구독한다.
+다른 로봇 토픽이나 와일드카드 권한은 제안하지 않는다. 기본 검사는 기존
+네 종류만 허용하며, 실험 제안은 CLI에 `--isolated-reconciliation`을 넣어
+별도로 선택한다. 출력 `profile`은 각각 `baseline`과
+`isolated_reconciliation_v1`이다. 이 토픽은 현재 loopback 격리 실험용이며
+운영 환경에서 재동기화나 로봇 주행을 허가하는 설정이 아니다.
+
+인증·TLS의 격리 Mosquitto에서 같은 로봇 토픽만 실제로 전달되고 다른 로봇
+토픽은 전달되지 않는지 시험했다. 팀 로봇 MQTT 코드와 서버 관측 코드를 같은
+TLS 브로커에 연결한 정지 확인 교환에서도 기존 점유와 차단이 유지됐다. 이
+시험은 임시 계정·인증서와 가짜 주행기를 사용하고 운영 ACL·실제 장비를
+증명하지 않는다. 재현 시험은 `server.tests.test_mosquitto_tls_reconcile_acl`이다.
+
 ## 입력 예시
 
 다음과 같은 **가상의** 파일을 로컬에 준비한다. 실제 비밀번호·토큰·인증서와

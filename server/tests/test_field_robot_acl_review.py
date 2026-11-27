@@ -21,6 +21,45 @@ def proposal():
 
 
 class FieldRobotAclReviewTests(unittest.TestCase):
+    def test_isolated_reconciliation_profile_requires_only_own_additional_topics(self):
+        data = proposal()
+        for index, robot in enumerate(data['robots'], 1):
+            prefix = 'agv/r{}/reconcile/'.format(index)
+            robot['publish'].append(prefix + 'response')
+            robot['subscribe'].extend((prefix + 'request', prefix + 'commit'))
+        self.assertEqual(review_robot_acl(data, isolated_reconciliation=True), [])
+        self.assertTrue(review_robot_acl(data), 'default profile must not silently grant reconciliation')
+        data['robots'][0]['publish'].append('agv/r2/reconcile/response')
+        data['robots'][1]['subscribe'].append('agv/r1/reconcile/request')
+        issues = review_robot_acl(data, isolated_reconciliation=True)
+        self.assertEqual([(item['direction'], item['problem'], item['topic']) for item in issues], [
+            ('publish', 'unexpected', 'agv/r2/reconcile/response'),
+            ('subscribe', 'unexpected', 'agv/r1/reconcile/request')])
+
+    def test_isolated_profile_reports_missing_reconciliation_topics(self):
+        issues = review_robot_acl(proposal(), isolated_reconciliation=True)
+        self.assertEqual(len(issues), 6)
+        self.assertTrue(all(item['problem'] == 'missing' for item in issues))
+        with self.assertRaises(ValueError):
+            review_robot_acl(proposal(), isolated_reconciliation=1)
+
+    def test_cli_requires_explicit_flag_for_reconciliation_profile(self):
+        data = proposal()
+        for index, robot in enumerate(data['robots'], 1):
+            prefix = 'agv/r{}/reconcile/'.format(index)
+            robot['publish'].append(prefix + 'response')
+            robot['subscribe'].extend((prefix + 'request', prefix + 'commit'))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'proposal.json'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-m', 'server.field_robot_acl_review',
+                                     '--isolated-reconciliation', str(path)],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result_data = json.loads(result.stdout)
+        self.assertEqual(result_data['profile'], 'isolated_reconciliation_v1')
+        self.assertTrue(result_data['matches_proposal'])
+
     def test_exact_separate_robot_matrix_has_no_reported_issues(self):
         self.assertEqual(review_robot_acl(proposal()), [])
 
