@@ -67,6 +67,7 @@ class SimMqttOrderRobot:
         self._pending_mid = None
         self._event_segments = set()
         self._reroute_driver = None
+        self._reroute_next_inflight = False
         self._client = self._new_client()
 
     def _new_client(self):
@@ -183,6 +184,8 @@ class SimMqttOrderRobot:
     def _checkpoint(self):
         # The caller holds the robot lock; the executor lock also prevents an
         # accidental direct tick from changing its cursor while copying it.
+        if self._reroute_next_inflight:
+            raise RuntimeError('a generation segment acceptance is in progress')
         with self.executor._lock:
             self.executor._verify_field_execution()
             return (id(self), id(self.executor), id(self.executor._inbox),
@@ -203,7 +206,7 @@ class SimMqttOrderRobot:
         """Capture in-process simulated state after an observed disconnect."""
         with self._lock:
             if (not self._started or self._stopped or not self._failed.is_set()
-                    or not self._recoverable_disconnect or self._event_uncertain
+                    or not self._recoverable_disconnect or self._event_uncertain or self._reroute_next_inflight
                     or not self._queue.empty()):
                 raise RuntimeError('simulated state cannot be checkpointed')
             return self._checkpoint()
@@ -216,14 +219,14 @@ class SimMqttOrderRobot:
         physical position or authorize a robot to move.
         """
         with self._lock:
-            if not self.ready or self._event_uncertain or not self._queue.empty():
+            if not self.ready or self._event_uncertain or self._reroute_next_inflight or not self._queue.empty():
                 raise RuntimeError('connected simulated state cannot be checkpointed')
             return self._checkpoint()
 
     def check_recovery_checkpoint(self, checkpoint):
         """Compare a checkpoint while the caller keeps simulator ticks stopped."""
         with self._lock:
-            if self._stopped or self._event_uncertain or not self._queue.empty():
+            if self._stopped or self._event_uncertain or self._reroute_next_inflight or not self._queue.empty():
                 return False
             try:
                 return self._checkpoint() == checkpoint
@@ -241,7 +244,7 @@ class SimMqttOrderRobot:
             raise ValueError('a server-side authorization guard is required')
         with self._lock:
             if (not self._started or self._stopped or not self._failed.is_set()
-                    or not self._recoverable_disconnect or self._event_uncertain):
+                    or not self._recoverable_disconnect or self._event_uncertain or self._reroute_next_inflight):
                 raise RuntimeError('simulated robot is not eligible for reconnect')
             self._stopping = True
             old_client = self._client
@@ -309,12 +312,15 @@ class SimMqttOrderRobot:
             raise
 
     def tick(self, dt_seconds):
+        next_message = None
         with self._lock:
             if not self.ready:
                 raise RuntimeError('simulated MQTT robot is unavailable')
             driver = self._reroute_driver
             if driver is None:
                 return self._tick_regular_locked(dt_seconds)
+            if self._reroute_next_inflight:
+                raise RuntimeError('a generation segment is already being accepted')
             try:
                 state = self.executor.snapshot()
                 if self._queue.empty() and state.get('status') == 'stopped':
@@ -324,22 +330,31 @@ class SimMqttOrderRobot:
                     payload, mid, qos = self._queue.get_nowait()
                     order, _canonical, _digest = _decode(payload, self.robot_id, self.executor._inbox.map_id)
                     current = state.get('order') or {}
-                    if (order['seq'] != 1 or order['order_id'] == current.get('order_id')
-                            or state['status'] != 'stopped' or state['current_node'] != current['nodes'][-1]):
-                        raise ValueError('generation continuation requires a separate guarded driver')
-                    guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
-                    with guard:
-                        if not self.ready:
-                            raise _ConnectionLost('simulated MQTT connection lost')
-                        if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
-                            raise ValueError('new order does not match a reserved segment')
-                        self.executor.accept(payload)
-                    if self.executor._reroute_transition is not None or not self.ready:
-                        raise ValueError('previous generation did not close')
-                    if self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
-                        raise RuntimeError('simulated order acknowledgement failed')
-                    self._reroute_driver = None
-                    return self._tick_regular_locked(dt_seconds)
+                    if (order['seq'] != 1 and order['order_id'] == current.get('order_id')
+                            and state.get('status') == 'stopped' and order['seq'] == current.get('seq', 0) + 1):
+                        self._reroute_next_inflight = True
+                        next_message = (payload, mid, qos, False)
+                    elif (order['seq'] != 1 and order['order_id'] == current.get('order_id')
+                          and order['seq'] == current.get('seq')):
+                        self._reroute_next_inflight = True
+                        next_message = (payload, mid, qos, True)
+                    elif (order['seq'] != 1 or order['order_id'] == current.get('order_id')
+                          or state['status'] != 'stopped' or state['current_node'] != current['nodes'][-1]):
+                        raise ValueError('generation continuation requires the exact next segment')
+                    else:
+                        guard = self._authorization_guard(payload) if self._authorization_guard else nullcontext()
+                        with guard:
+                            if not self.ready:
+                                raise _ConnectionLost('simulated MQTT connection lost')
+                            if self._order_authorizer is not None and self._order_authorizer(payload) is not True:
+                                raise ValueError('new order does not match a reserved segment')
+                            self.executor.accept(payload)
+                        if self.executor._reroute_transition is not None or not self.ready:
+                            raise ValueError('previous generation did not close')
+                        if self._client.ack(mid, qos) != mqtt.MQTT_ERR_SUCCESS:
+                            raise RuntimeError('simulated order acknowledgement failed')
+                        self._reroute_driver = None
+                        return self._tick_regular_locked(dt_seconds)
             except Exception as exc:
                 self._fail()
                 raise RuntimeError('simulated generation processing stopped') from exc
@@ -348,6 +363,21 @@ class SimMqttOrderRobot:
         # checks the identical driver immediately before each virtual tick.
         execution, payload, generation_guard = driver
         try:
+            if next_message is not None:
+                next_payload, mid, qos, duplicate = next_message
+                try:
+                    execution.accept_next(payload, next_payload, guard=generation_guard,
+                                          expected_driver=driver, acknowledgement=(mid, qos), duplicate=duplicate)
+                except Exception:
+                    # Keep the in-flight marker set until failure is latched:
+                    # another tick must not move an accepted but unacknowledged
+                    # segment in the interval before _fail().
+                    with self._lock:
+                        self._fail()
+                        self._reroute_next_inflight = False
+                    raise
+                with self._lock:
+                    self._reroute_next_inflight = False
             return execution.tick(payload, dt_seconds, guard=generation_guard, expected_driver=driver)
         except Exception as exc:
             with self._lock:

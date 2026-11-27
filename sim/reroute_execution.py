@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from server.field_map_planner import plan_field_route, validate_field_route
 from server.segment_progress import _resources
 from server.segments import plan_segment
-from sim.order_inbox import OrderRejected, _object_pairs, _constant, _finite, _validated_history
+from sim.order_inbox import OrderRejected, _object_pairs, _constant, _finite, _validated_history, _decode
 from sim.reroute_acceptance import _FIELDS, _MAX_BYTES, _canonical
 from sim.reroute_activation import SimRerouteActivation
 
@@ -274,12 +274,36 @@ class SimRerouteExecution:
                 raise OrderRejected('the requested generation is not installed')
             return self.executor.tick(dt_seconds)
 
-    def accept_next(self, payload, order_payload, *, guard):
+    def accept_next(self, payload, order_payload, *, guard, expected_driver=None, acknowledgement=None,
+                    duplicate=False):
         """Accept a later released segment only under its own server fence."""
         if not isinstance(order_payload, bytes):
             raise OrderRejected('next simulated order must be bytes')
-        with self._authority(payload, guard, next_order=order_payload):
+        if type(duplicate) is not bool:
+            raise OrderRejected('duplicate flag must be explicit')
+        with self._authority(payload, guard, next_order=None if duplicate else order_payload):
+            robot = guard.robot_receiver.robot
+            if expected_driver is not None and (robot._reroute_driver is not expected_driver or not robot.ready):
+                raise OrderRejected('simulated generation driver or connection changed')
+            if acknowledgement is not None and (expected_driver is None or not isinstance(acknowledgement, tuple)
+                    or len(acknowledgement) != 2 or type(acknowledgement[0]) is not int
+                    or type(acknowledgement[1]) is not int or acknowledgement[1] != 1):
+                raise OrderRejected('bound MQTT acknowledgement is required')
             data = self._matching_record(payload)
             if self.executor._reroute_transition != data['transition_id']:
                 raise OrderRejected('the requested generation is not installed')
-            return self.executor.accept(order_payload)
+            if duplicate:
+                order, _, digest = _decode(order_payload, self.inbox.robot_id, self.inbox.map_id)
+                current = self.executor.snapshot()
+                receipt = current.get('receipt') or {}
+                if (order.get('order_id') != data['task_id'] or order.get('seq') != receipt.get('seq')
+                        or digest != receipt.get('digest')):
+                    raise OrderRejected('duplicate does not match the current generation segment')
+            receipt = self.executor.accept(order_payload)
+            if duplicate and receipt.new:
+                raise OrderRejected('duplicate unexpectedly created a new segment')
+            if acknowledgement is not None:
+                import paho.mqtt.client as mqtt
+                if not robot.ready or robot._client.ack(*acknowledgement) != mqtt.MQTT_ERR_SUCCESS:
+                    raise OrderRejected('simulated MQTT acknowledgement failed after accepting a segment')
+            return receipt
