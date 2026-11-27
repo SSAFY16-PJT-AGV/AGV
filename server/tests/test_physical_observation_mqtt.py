@@ -1,8 +1,9 @@
 """MQTT routing cannot make evidence executable or authorize robot motion."""
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from server.physical_reconcile_mqtt import PhysicalReconcileMqtt
+from server.physical_reconcile_mqtt import PhysicalReconcileMqtt, isolated_gate_reconciliation
 from server.tests.test_physical_observation_exchange import PhysicalReconcileExchangeTests
 
 
@@ -15,6 +16,16 @@ class FakeClient:
 
 
 class ReconcileMqttTests(PhysicalReconcileExchangeTests):
+    def test_context_forwards_explicit_authenticated_tls_client(self):
+        supplied = object()
+        with patch('server.physical_reconcile_mqtt.PhysicalReconcileMqtt') as adapter:
+            with isolated_gate_reconciliation(self.gate, self.inbox, self.watcher,
+                    {'physical-1': b'A' * 32}, port=1, client=supplied, isolated=True) as bridge:
+                self.assertIs(bridge, adapter.return_value)
+                self.assertIs(adapter.call_args.kwargs['client'], supplied)
+                adapter.return_value.start.assert_called_once()
+            adapter.return_value.stop.assert_called_once()
+
     def test_separate_topics_route_valid_signed_exchange_only(self):
         client = FakeClient()
         bridge = PhysicalReconcileMqtt(self.service, port=1883, client=client, isolated=True)

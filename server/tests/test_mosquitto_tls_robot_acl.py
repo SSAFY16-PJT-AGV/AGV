@@ -65,8 +65,20 @@ class IsolatedTlsRobotAclTest(unittest.TestCase):
             lines.extend('topic write agv/sim-r{}/{}'.format(index, suffix)
                          for suffix in ('state', 'event', 'conn'))
             lines.append('topic read agv/sim-r{}/order'.format(index))
+            if getattr(cls, 'ISOLATED_RECONCILIATION', False):
+                lines.append('topic write agv/sim-r{}/reconcile/response'.format(index))
+                lines.extend('topic read agv/sim-r{}/reconcile/{}'.format(index, suffix)
+                             for suffix in ('request', 'commit'))
+                lines.extend('topic write agv/physical-{}/{}'.format(index, suffix)
+                             for suffix in ('state', 'event', 'conn', 'reconcile/response'))
+                lines.extend('topic read agv/physical-{}/{}'.format(index, suffix)
+                             for suffix in ('order', 'reconcile/request', 'reconcile/commit'))
         # Test-only observer: validates actual message delivery in both directions.
         lines += ['user observer', 'topic read agv/+/+', 'topic write agv/+/order']
+        if getattr(cls, 'ISOLATED_RECONCILIATION', False):
+            lines += ['topic read agv/+/reconcile/response',
+                      'topic write agv/+/reconcile/request',
+                      'topic write agv/+/reconcile/commit']
         acl.write_text('\n'.join(lines) + '\n', encoding='ascii')
         cls.port = free_port()
         config = root / 'mosquitto.conf'

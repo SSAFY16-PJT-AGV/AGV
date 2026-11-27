@@ -22,6 +22,12 @@ inbox 뷰, `server.physical_reconcile`의 서명 장부,
 관찰을 무효화하고 작업 차단을 유지한다. watcher와 어댑터는 로컬
 `127.0.0.1` 및 명시적 `isolated=True`를 요구하며 자동 재연결하지 않는다.
 기존 서버 시작 경로나 웹 API는 이 실험을 자동으로 켜지 않는다.
+호출자는 관측 watcher와 `isolated_gate_reconciliation` 각각에 별도의 Paho
+클라이언트를 명시 전달해 loopback 브로커의 사용자 인증과 TLS를 설정할 수
+있다. 양 클라이언트 모두 자동 재연결을 끄고 호스트를 `127.0.0.1`로 둔다.
+서버의 클라이언트 설정, CA와 이름 검증, 계정·비밀 관리는 호출자가 책임진다.
+TLS가 없거나 다른 클라이언트가 같은 접속을 공유하는 것을 이 기능이 자동으로
+안전하게 바꿔 주지는 않는다. 메시지 인증 키와 브로커 비밀을 로그에 남기지 않는다.
 별도 시험 호출자는 같은 DB의 `PhysicalEvidenceInbox`와 기존 `RecoveryGate`에
 `PhysicalEvidenceWatcher`를 묶고, watcher가 연결된 상태에서
 `isolated_gate_reconciliation(...)` 컨텍스트를 명시적으로 연다.
@@ -31,6 +37,13 @@ inbox 뷰, `server.physical_reconcile`의 서명 장부,
 서명 확인 행은 gate와 같은 DB의 별도 `physical_reconcile` 테이블에 기록되고,
 기존 event inbox는 읽기만 한다. 테스트 키는 임시로 만들며 실제 키를 저장소나
 로그에 남기지 않는다.
+
+실제 팀 로봇 MQTT 코드와 인증·TLS 및 토픽별 ACL을 설정한 임시 Mosquitto를
+사용해 단절·재접속 뒤 같은 세션의 서명된 정지 기록 교환을 시험했다.
+가짜 주행기와 시험 DB만 사용하고 점유와 차단을 유지했다. 실행한 시험의
+환경과 범위는 `server.tests.test_mosquitto_tls_reconcile_acl` 및
+[`field_robot_acl_review.md`](field_robot_acl_review.md)를 참고한다. 이 시험은
+실제 장비의 TLS 설정이나 실제 정지·후단 이탈을 검증하지 않는다.
 
 로봇별 별도 비밀 키와 HMAC, 서버 nonce·epoch·로봇 nonce·세션·순번·명령 및
 이벤트 digest를 검증한다. 서버는 기존 gate·점유·inbox를 검사하고 이벤트

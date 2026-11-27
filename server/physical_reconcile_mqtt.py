@@ -153,11 +153,14 @@ class PhysicalReconcileMqtt:
 
 
 @contextmanager
-def isolated_gate_reconciliation(gate, inbox, watcher, robot_keys, *, port, isolated=False, timeout=5):
+def isolated_gate_reconciliation(gate, inbox, watcher, robot_keys, *, port, isolated=False, timeout=5,
+                                 client=None):
     """Use an already active gate and inbox only for loopback hold evidence.
 
     The caller owns the gate, database and watcher. This does not enable the
     physical runtime, event progression, proof generation, or automatic motion.
+    An explicitly configured client may supply local broker TLS credentials;
+    direct loopback checks and the no-reconnect requirement still apply.
     """
     from server.recovery import RecoveryGate
     from server.physical_evidence_observer import PhysicalEvidenceInbox, PhysicalEvidenceWatcher
@@ -173,7 +176,7 @@ def isolated_gate_reconciliation(gate, inbox, watcher, robot_keys, *, port, isol
             raise ValueError('the gate must own the live loopback observer')
         service = PhysicalReconciler(gate, inbox, robot_keys, isolated=True)
         adapter = PhysicalReconcileMqtt(service, host='127.0.0.1', port=port,
-                                        isolated=True, timeout=timeout)
+                                        isolated=True, timeout=timeout, client=client)
     adapter.start()
     try:
         yield adapter
