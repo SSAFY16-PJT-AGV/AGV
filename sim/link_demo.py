@@ -121,7 +121,7 @@ class Dispatcher(object):
         self.log({"dir": msg.topic.rsplit("/", 1)[-1], "msg": m})
         if m.get("type") == "shelf_state":
             print(u"선반 %s(%s): %s%s" % (m["shelf"], m["phase"], u"  ".join(
-                u"%d=%s" % (s["slot"], s["state"]) for s in m["slots"]), u"" if m["seen"] else u"  (선반 못 찾음)"))
+                u"%d=%s" % (s["slot"], s.get("item", s["state"])) for s in m["slots"]), u"" if m["seen"] else u"  (선반 못 찾음)"))
             return
         if m.get("type") != "task_result":
             return

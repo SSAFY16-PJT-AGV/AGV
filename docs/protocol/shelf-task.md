@@ -27,6 +27,8 @@
 | `slot` | 1~4 | `load`·`unload`에 필요. 칸 1은 선반을 마주 본 로봇의 왼쪽 |
 | `item` | `"milk"` \| `"tissue"` \| `"egg"` \| `"juice"` | 선택. `load`: 이 물건이어야 집음(없으면 아무거나), `unload`: 이걸 들고 있어야 놓음 |
 
+서버 선반 모델(`server/team_shelf_order_slots.py`)의 이름도 그대로 받는다: `type` `pick`/`place`(= `load`/`unload`), `slot_id`(전체 칸 번호 1~24 = 칸 마커 ID, `shelf`·`slot` 대신. N0k의 칸 j = 4(k-1)+j), `product_type`(= `item`). 예: `{"type": "pick", "slot_id": 10, "product_type": "tissue"}`는 N03 칸 2에서 휴지 집기.
+
 ```json
 {"order_id": "T7", "seq": 1, "map_id": "mat_ssafy_v3@v0",
  "nodes": ["N05", "N08", "N06", "J06", "J07", "N03", "N02", "N07", "N01", "D01"], "released_until": "D01",
@@ -40,14 +42,16 @@
 ```json
 {"type": "task_result", "event_id": "9a9b77ec8f674d34-t3", "robot_session": "9a9b77ec8f674d34",
  "ts": 1795662394.3, "map_id": "mat_ssafy_v3@v0", "order_id": "T7",
- "action": "load", "shelf": "N01", "slot": 2, "item": "tissue",
+ "action": "load", "shelf": "N01", "slot": 2, "slot_id": 2, "item": "tissue",
  "result": "done", "reason": null, "carrying": "tissue",
  "shelf_state": {"shelf": "N01", "seen": true, "wrong_shelf": null,
-                 "slots": [{"slot": 1, "state": "milk", "marker_id": 30}, {"slot": 2, "state": "empty"},
-                           {"slot": 3, "state": "egg", "marker_id": 32}, {"slot": 4, "state": "juice", "marker_id": 33}]}}
+                 "slots": [{"slot": 1, "slot_id": 1, "state": "occupied", "product_type": "milk", "item": "milk", "marker_id": 30},
+                           {"slot": 2, "slot_id": 2, "state": "empty", "product_type": null, "item": "empty"},
+                           {"slot": 3, "slot_id": 3, "state": "occupied", "product_type": "egg", "item": "egg", "marker_id": 32},
+                           {"slot": 4, "slot_id": 4, "state": "occupied", "product_type": "juice", "item": "juice", "marker_id": 33}]}}
 ```
 
-- `result`: `done` | `failed`. `carrying`: 작업이 끝난 뒤 들고 있는 물건(없으면 null).
+- `result`: `done` | `failed`. `carrying`: 작업이 끝난 뒤 들고 있는 물건(없으면 null). `slot_id`: 작업한 칸의 전체 번호.
 - `shelf_state`: 작업 뒤 본 선반(못 봤으면 작업 전).
 - `reason`(실패 이유):
 
@@ -75,12 +79,24 @@
 {"type": "shelf_state", "event_id": "9a9b77ec8f674d34-t2", "robot_session": "9a9b77ec8f674d34",
  "ts": 1795662390.1, "map_id": "mat_ssafy_v3@v0", "order_id": "T7", "phase": "before",
  "shelf": "N01", "seen": true, "wrong_shelf": null,
- "slots": [{"slot": 1, "state": "milk", "marker_id": 30}, {"slot": 2, "state": "tissue", "marker_id": 31},
-           {"slot": 3, "state": "egg", "marker_id": 32}, {"slot": 4, "state": "juice", "marker_id": 33}]}
+ "slots": [{"slot": 1, "slot_id": 1, "state": "occupied", "product_type": "milk", "item": "milk", "marker_id": 30},
+           {"slot": 2, "slot_id": 2, "state": "occupied", "product_type": "tissue", "item": "tissue", "marker_id": 31},
+           {"slot": 3, "slot_id": 3, "state": "empty", "product_type": null, "item": "empty"},
+           {"slot": 4, "slot_id": 4, "state": "unknown", "product_type": null, "item": "unknown"}]}
 ```
 
-칸 `state`: 물건 종류 | `empty`(칸 마커가 보이고 물건 없음) | `unknown`(판단 못 함). `unknown`은 "모른다"이지
-"비었다"가 아니므로, 서버는 그 칸의 이전 상태를 그대로 두는 것이 맞다.
+칸마다 서버 선반 모델과 같은 `slot_id`·`state`·`product_type`과, 읽기 쉬운 `item`을 같이 보낸다.
+
+| 필드 | 값 |
+| --- | --- |
+| `slot` | 선반 안 칸 1~4 (칸 1은 선반을 마주 본 로봇의 왼쪽) |
+| `slot_id` | 전체 칸 번호 1~24 (= 칸 마커 ID, 서버 `slot_layout()`과 같음) |
+| `state` | `occupied` \| `empty`(칸 마커가 보이고 물건 없음) \| `unknown`(판단 못 함) |
+| `product_type` | `occupied`일 때 물건 종류, 아니면 null |
+| `item` | 물건 종류 \| `empty` \| `unknown` (위 둘을 한 칸으로) |
+| `marker_id` | `occupied`일 때 본 물건 마커 ID |
+
+`{"slot_id", "state", "product_type"}`만 골라 쓰면 서버의 `apply_snapshot` 행과 같은 모양이다(한 선반 4칸만이라 24칸 전체 스냅숏은 아님). `unknown`은 "모른다"이지 "비었다"가 아니므로, 서버는 그 칸의 이전 상태를 그대로 두는 것이 맞다.
 
 ## 상태 메시지 `agv/{id}/state`에 더한 것
 
@@ -92,7 +108,9 @@
 
 ## 서버 쪽과 다른 점 / 맞출 것
 
-- 서버 브랜치는 이미 `{"type": "load"}`, `{"type": "unload", "shelf": "S2"}`를 쓴다. 종류 이름은 같게 했고,
-  `slot`·`item`을 더했다. 선반 이름은 맵 노드(N01~N06)로 했다(서버의 `SHELF_RED` 같은 이름과 다르면 맞춘다).
+- 서버 가상 주행 쪽은 `{"type": "load"}`, `{"type": "unload", "shelf": "S2"}`를, 팀 선반 모델(Unreal 슬롯 동작, 11/26~)은
+  `pick`/`place`, `slot_id` 1~24, `product_type`, 정지 노드 D0k를 쓴다. 로봇은 둘 다 받고, 칸 관측도 팀 선반 모델 모양으로 보낸다.
+  상품→선반은 서버와 같다(우유 N02, 휴지 N03, 계란 N04, 주스 N05, 집는 곳 N01).
+- 아직 서버에 실물 로봇용 작업 결과·재동기화 계약이 없다(서버 인계 문서 "다음에 이어 할 일" 3번). 정해지면 이 형식을 맞춘다.
 - 기존 `event` 토픽에는 새 종류를 보내지 않는다(서버가 모르는 종류를 오류로 봄). 그래서 토픽을 둘 더 썼다.
 - 결과·관측은 QoS 1이라 두 번 갈 수 있다. `event_id`로 중복을 거른다.

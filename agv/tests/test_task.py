@@ -44,6 +44,22 @@ class TestMessages(unittest.TestCase):
         self.assertIsNone(decode_action({"type": "none"}, ["N01", "D01"], self.m))
         self.assertIsNone(decode_action({"type": "dance"}, ["N01", "D01"], self.m))   # 모르는 종류는 무시
 
+    def test_decode_server_names(self):
+        """서버 선반 모델 이름: pick/place, slot_id(전체 칸 번호 1~24), product_type."""
+        from agv.perception.shelf import ShelfLayout, load_config
+        L = ShelfLayout(load_config())
+        t = decode_action({"type": "pick", "slot_id": 10, "product_type": "tissue"},
+                          ["N01", "J02", "J07", "N03", "D03"], self.m, slot_of=L.slot_marker.get)
+        self.assertEqual(t, Task("load", "N03", 2, "tissue"))
+        t = decode_action({"type": "place", "shelf": "N01", "slot_id": 1}, ["N05", "N01", "D01"], self.m,
+                          slot_of=L.slot_marker.get)
+        self.assertEqual(t, Task("unload", "N01", 1, None))
+        for act in ({"type": "pick", "slot_id": 10}, {"type": "pick", "slot_id": 99},
+                    {"type": "pick", "slot_id": 2, "slot": 3}, {"type": "pick", "slot_id": 2, "item": "egg",
+                                                                "product_type": "milk"}):
+            with self.assertRaises(TaskRejected, msg=act):
+                decode_action(act, ["N05", "N01", "D01"], self.m, slot_of=L.slot_marker.get)
+
     def test_decode_rejects(self):
         bad = [({"type": "load", "shelf": "N02", "slot": 1}, ["N01", "D01"]),    # 다른 선반의 스퍼
                ({"type": "load", "slot": 1}, ["N01", "J02"]),                     # 스퍼 끝이 아님
@@ -56,15 +72,21 @@ class TestMessages(unittest.TestCase):
 
     def test_encode(self):
         from agv.task import TaskOutcome
-        ctx = {"session": "s", "event_id": "s-t1", "ts": 1.0, "order_id": "J1", "map_id": "m@v0"}
+        ctx = {"session": "s", "event_id": "s-t1", "ts": 1.0, "order_id": "J1", "map_id": "m@v0",
+               "slot_ids": [1, 2, 3, 4]}
         before, after = view(["milk", "tissue", "empty", "unknown"]), view(["milk", "empty", "empty", "unknown"])
         out = TaskOutcome(Task("load", "N01", 2, "tissue"), True, None, "tissue", before, after)
         r = encode_result(out, ctx)
         self.assertEqual((r["type"], r["result"], r["reason"], r["carrying"]), ("task_result", "done", None, "tissue"))
-        self.assertEqual([s["state"] for s in r["shelf_state"]["slots"]], ["milk", "empty", "empty", "unknown"])
+        self.assertEqual([s["item"] for s in r["shelf_state"]["slots"]], ["milk", "empty", "empty", "unknown"])
+        self.assertEqual(r["slot_id"], 2)
         sh = encode_shelf(before, "before", ctx)
-        self.assertEqual(sh["slots"][0], {"slot": 1, "state": "milk", "marker_id": 30})
-        self.assertEqual(sh["slots"][2], {"slot": 3, "state": "empty"})
+        # 서버 선반 모델(slot_id, state unknown|empty|occupied, product_type)과 읽기 쉬운 item을 같이
+        self.assertEqual(sh["slots"][0], {"slot": 1, "slot_id": 1, "state": "occupied", "product_type": "milk",
+                                          "item": "milk", "marker_id": 30})
+        self.assertEqual(sh["slots"][2], {"slot": 3, "slot_id": 3, "state": "empty", "product_type": None,
+                                          "item": "empty"})
+        self.assertEqual(sh["slots"][3]["state"], "unknown")
         self.assertEqual(state_fields(None), {"carrying": None, "task": None})
 
 
@@ -193,7 +215,8 @@ class TestSimTasks(unittest.TestCase):
         # 선반 관측: 작업 전 상태가 실제와 같음(판단 못 한 칸 빼고)
         first = link.shelves[0]
         self.assertEqual((first["shelf"], first["phase"]), ("N01", "before"))
-        self.assertEqual([s["state"] for s in first["slots"]], ["milk", "tissue", "egg", "juice"])
+        self.assertEqual([s["item"] for s in first["slots"]], ["milk", "tissue", "egg", "juice"])
+        self.assertEqual([s["slot_id"] for s in first["slots"]], [1, 2, 3, 4])
         # 상태 메시지: 작업 중 WORKING, 들고 가는 동안 carrying
         sts = link.states
         self.assertIn("WORKING", set(s["status"] for s in sts))
@@ -206,7 +229,7 @@ class TestSimTasks(unittest.TestCase):
                           geom_err={"camera_x_from_s1_mm": -25, "camera_z_mm": 15})
         m = r["link"].tasks[0]
         self.assertEqual((m["result"], m["reason"], m["carrying"]), ("failed", "grip_missed", None))
-        self.assertEqual(m["shelf_state"]["slots"][1]["state"], "tissue")
+        self.assertEqual(m["shelf_state"]["slots"][1]["item"], "tissue")
         self.assertEqual(r["world"].snapshot()["N01"][2], "tissue")
 
     def test_bad_route_for_shelf_rejected(self):

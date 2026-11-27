@@ -257,7 +257,8 @@ class LinkController(object):
         task = None
         if d.kind == "new":
             try:
-                task = decode_action(o["action_at_end"], o["nodes"], self.nav.m)
+                task = decode_action(o["action_at_end"], o["nodes"], self.nav.m,
+                                     slot_of=getattr(self.tasks, "slot_of", None))
             except TaskRejected as e:
                 self._reject(o, e.args[0])
                 return
@@ -433,10 +434,11 @@ class LinkController(object):
         self._note("link_stopped", order_id=o["order_id"], seq=o["seq"], node=release, final=final)
 
     # ---------- 선반 작업 ----------
-    def _ctx(self, now, o):
+    def _ctx(self, now, o, shelf=None):
         self._msg_n += 1
+        ids = self.tasks.slot_ids(shelf) if (shelf and hasattr(self.tasks, "slot_ids")) else None
         return {"session": self.session, "event_id": "%s-t%d" % (self.session, self._msg_n),
-                "ts": round(now, 3), "order_id": o["order_id"], "map_id": o["map_id"]}
+                "ts": round(now, 3), "order_id": o["order_id"], "map_id": o["map_id"], "slot_ids": ids}
 
     def _publish(self, kind, msg):
         f = getattr(self.link, "publish_" + kind, None)
@@ -454,8 +456,8 @@ class LinkController(object):
         o = self._task["order"]
         for phase, view in (("before", out.before), ("after", out.after)):
             if view is not None:
-                self._publish("shelf", encode_shelf(view, phase, self._ctx(now, o)))
-        self._publish("task", encode_result(out, self._ctx(now, o)))
+                self._publish("shelf", encode_shelf(view, phase, self._ctx(now, o, view.shelf)))
+        self._publish("task", encode_result(out, self._ctx(now, o, out.task.shelf)))
         self._note("link_task_done", order_id=o["order_id"], ok=out.ok, reason=out.reason, carrying=out.carrying)
         self._task = None
         self.book.mark_finished()

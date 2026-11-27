@@ -227,6 +227,14 @@ class TaskExecutor(object):
         self.phase = None
         return out
 
+    def slot_ids(self, shelf):
+        """선반 칸 1..n의 전체 칸 번호(= 칸 마커 ID, 서버 선반 모델의 slot_id)."""
+        return list(self.layout.shelves.get(shelf, []))
+
+    def slot_of(self, slot_id):
+        """전체 칸 번호 -> (선반, 칸) 또는 None."""
+        return self.layout.slot_marker.get(slot_id)
+
     def info(self):
         """상태 메시지용: 진행 중인 작업과 단계."""
         if not self.busy:

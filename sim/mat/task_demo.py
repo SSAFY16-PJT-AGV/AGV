@@ -143,7 +143,7 @@ def summary(r):
             u" (%s)" % m["reason"] if m["reason"] else u"", m["carrying"]))
     for m in getattr(link, "shelves", []):
         lines.append(u"  선반 %s %s %s: %s" % (m["order_id"], m["shelf"], m["phase"],
-                                             " ".join("%d:%s" % (s["slot"], s["state"]) for s in m["slots"])))
+                                             " ".join("%d:%s" % (s["slot"], s["item"]) for s in m["slots"])))
     lines.append(u"  실제 창고: %s" % json.dumps(world.snapshot(), ensure_ascii=False))
     return u"\n".join(lines)
 
