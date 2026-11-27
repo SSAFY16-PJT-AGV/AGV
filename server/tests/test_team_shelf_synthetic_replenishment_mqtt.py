@@ -35,7 +35,10 @@ class TeamShelfSyntheticMqttTest(unittest.TestCase):
     def test_approved_shortage_runs_existing_mqtt_workflow_to_slot_actions(self):
         self._exercise(('milk',))
 
-    def _exercise(self, product_ids, *, repeat=False):
+    def test_expired_unreal_snapshot_is_refreshed_before_approval(self):
+        self._exercise(('milk',), delay_capture=True)
+
+    def _exercise(self, product_ids, *, repeat=False, delay_capture=False):
         broker_port, server_port = free_port(), free_port()
         while broker_port == server_port or 8000 in (broker_port, server_port):
             broker_port, server_port = free_port(), free_port()
@@ -101,6 +104,8 @@ class TeamShelfSyntheticMqttTest(unittest.TestCase):
                          additional_headers={'X-AGV-Twin-Token': token}) as twin:
                 actions = []
                 submitted = False
+                ready_at = capture_future = None
+                snapshot_count = 0
                 futures = {}
                 assignments = {}
                 second_started = False
@@ -115,6 +120,7 @@ class TeamShelfSyntheticMqttTest(unittest.TestCase):
                         data = message['data']
                         robots[data['agv_id']].update(x=data['x'], y=data['y'], yaw=data['yaw'])
                     elif message and message.get('type') == 'team.shelf.snapshot.request.v1':
+                        snapshot_count += 1
                         twin.send(json.dumps({'type': 'team.shelf.snapshot.v1', 'data': {
                             'request_id': message['data']['request_id'], 'world_id': 'a' * 32,
                             'robots': list(robots.values()), 'slots': slots}}))
@@ -134,7 +140,18 @@ class TeamShelfSyntheticMqttTest(unittest.TestCase):
                                               'data': dict(data, applied=True)}))
                     status = request(server_port, '/order-demo/api/status')
                     if not submitted and status.get('accepting_orders'):
-                        report = request(server_port, '/order-demo/api/synthetic-shortages', {'threshold': 1})
+                        if delay_capture:
+                            if ready_at is None:
+                                ready_at = time.monotonic()
+                            if capture_future is None and time.monotonic() - ready_at >= 5.2:
+                                capture_future = pool.submit(request, server_port,
+                                                             '/order-demo/api/synthetic-shortages', {'threshold': 1})
+                            if capture_future is None or not capture_future.done():
+                                continue
+                            report = capture_future.result()
+                            self.assertGreaterEqual(snapshot_count, 2, 'stale Unreal snapshot must be refreshed')
+                        else:
+                            report = request(server_port, '/order-demo/api/synthetic-shortages', {'threshold': 1})
                         self.assertEqual(report['products']['milk']['status'], 'shortage')
                         def approve():
                             data = json.dumps({'product_id': 'milk', 'threshold': 1, 'approved': True}).encode()

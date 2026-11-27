@@ -79,9 +79,16 @@ class SyntheticReplenishmentTest(unittest.TestCase):
         self.assertEqual(report['milk']['status'], 'shortage')
         result = self.service.submit('milk', threshold=1, approved=True, request_key='same')
         repeated = self.service.submit('milk', threshold=1, approved=True, request_key='same')
-        self.assertEqual(result, repeated)
-        self.assertEqual(len(self.engine.calls), 1)
         admission = self.demo.admission.get_by_key('same')
+        deadline = time.monotonic() + 3
+        while admission['status'] == 'pending' and time.monotonic() < deadline:
+            time.sleep(.01)
+            admission = self.demo.admission.get_by_key('same')
+        self.assertEqual(admission['status'], 'completed')
+        request_id = admission['request_id']
+        for response in (result, repeated):
+            self.assertEqual(response.get('request_id', response.get('reservation_id')), request_id)
+        self.assertEqual(len(self.engine.calls), 1)
         self.assertEqual(self.store.inspect()['orders'][0]['request_id'], admission['request_id'])
         self.assertEqual({x['slot_id'] for x in self.store.inspect()['claims']}, {1, 5})
 

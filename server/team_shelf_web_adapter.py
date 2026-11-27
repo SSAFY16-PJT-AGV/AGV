@@ -6,6 +6,7 @@ adapter never publishes an MQTT command itself.
 """
 import math
 import secrets
+import threading
 import time
 
 from server.order_demo_actions import DemoActionSession, SNAPSHOT_RETRY_SECONDS
@@ -15,18 +16,41 @@ from server.team_shelf_twin_protocol import TeamShelfTwinSession
 
 class TeamShelfSimInventory:
     """Adapt the 24-slot journal to the existing fleet inventory interface."""
-    def __init__(self, store, *, validate_initial=None, claim_world=None):
+    def __init__(self, store, *, validate_initial=None, claim_world=None, clock=time.monotonic):
         if type(store) is not TeamShelfOrderSlots:
             raise ValueError('explicit team slot journal required')
         if validate_initial is not None and not callable(validate_initial):
             raise ValueError('initial world validator must be callable')
         if claim_world is not None and not callable(claim_world):
             raise ValueError('world claim must be callable')
+        if not callable(clock):
+            raise ValueError('monotonic snapshot clock required')
         self.store = store
         self.validate_initial = validate_initial
         self.claim_world = claim_world
         self.owner = self.session = self.world_id = self.fence = None
         self.pending = None
+        self._clock, self._last_clock = clock, None
+        self._snapshot_at, self._snapshot_generation = None, 0
+        self.snapshot_event = threading.Event()
+
+    def _now(self):
+        now = self._clock()
+        if (type(now) not in (int, float) or not math.isfinite(now)
+                or (self._last_clock is not None and now < self._last_clock)):
+            self._snapshot_at = None
+            raise ValueError('Unreal snapshot clock unavailable or moved backwards')
+        self._last_clock = float(now)
+        return float(now)
+
+    def fresh_snapshot(self, max_age):
+        """Return the unchanged UE observation generation only while fresh."""
+        if not self.ready or self._snapshot_at is None:
+            return None
+        age = self._now() - self._snapshot_at
+        if age > max_age:
+            return None
+        return self._snapshot_generation
 
     @property
     def shelf_ids(self):
@@ -40,6 +64,8 @@ class TeamShelfSimInventory:
         if owner is None or self.owner is not None:
             raise ValueError('one authenticated owner required')
         self.owner = owner
+        self._snapshot_at = None
+        self.snapshot_event.clear()
         self.pending = secrets.token_hex(16)
         return self.pending
 
@@ -47,6 +73,8 @@ class TeamShelfSimInventory:
         if owner is not self.owner or self.session is None:
             raise ValueError('stale simulated owner')
         self.fence = self.store.begin_snapshot(self.session, invalidate=True)
+        self._snapshot_at = None
+        self.snapshot_event.clear()
         self.pending = secrets.token_hex(16)
         return self.pending
 
@@ -56,6 +84,7 @@ class TeamShelfSimInventory:
                 or data['request_id'] != self.pending):
             raise ValueError('stale simulated slot snapshot')
         world, robots = data['world_id'], data['robots']
+        self._now()
         if (not isinstance(world, str) or len(world) != 32
                 or any(c not in '0123456789abcdefABCDEF' for c in world)
                 or not isinstance(robots, list) or len(robots) != 2):
@@ -86,7 +115,11 @@ class TeamShelfSimInventory:
                 self.store.end_session(self.session)
                 self.session = None
                 raise
+        observed_at = self._now()
         self.pending = self.fence = None
+        self._snapshot_generation += 1
+        self._snapshot_at = observed_at
+        self.snapshot_event.set()
         return True
 
     def invalidate(self, owner):
@@ -96,6 +129,8 @@ class TeamShelfSimInventory:
                     self.store.end_session(self.session)
             finally:
                 self.owner = self.session = self.world_id = self.pending = self.fence = None
+                self._snapshot_at = None
+                self.snapshot_event.set()
 
     def can_reserve(self, shelf_id, product_type):
         if not self.ready or PRODUCT_SHELVES.get(product_type) != shelf_id:

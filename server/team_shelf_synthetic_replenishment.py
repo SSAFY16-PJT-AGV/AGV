@@ -6,6 +6,7 @@ observations or evidence of any physical shelf or robot.
 """
 import threading
 import time
+import math
 
 from server.order_demo_admission import AdmissionOutcomeUnknown
 from server.simulated_shelf_perception import SimulatedShelfPerception
@@ -15,15 +16,19 @@ from server.team_shelf_web_adapter import TeamShelfSimInventory
 
 
 class SyntheticReplenishment:
-    def __init__(self, demo, *, clock=time.monotonic, max_age_seconds=5.0):
+    def __init__(self, demo, *, clock=time.monotonic, max_age_seconds=5.0,
+                 refresh_timeout_seconds=3.0):
         inventory = getattr(getattr(demo, 'engine', None), 'inventory', None)
         if (getattr(demo, 'team_shelves', False) is not True or demo.journal is not None
-                or type(inventory) is not TeamShelfSimInventory or not callable(clock)):
+                or type(inventory) is not TeamShelfSimInventory or not callable(clock)
+                or type(refresh_timeout_seconds) not in (int, float)
+                or not math.isfinite(refresh_timeout_seconds) or not 0 < refresh_timeout_seconds <= 10):
             raise ValueError('explicit nonpersistent team-shelf simulation required')
         self.demo, self.inventory = demo, inventory
         self.clock, self.max_age = clock, max_age_seconds
+        self.refresh_timeout = float(refresh_timeout_seconds)
         self._lock = threading.RLock()
-        self._perception = self._owner = self._session = self._world = None
+        self._perception = self._owner = self._session = self._world = self._source = None
 
     def _bound(self):
         owner = self.demo.actions.owner
@@ -32,12 +37,39 @@ class SyntheticReplenishment:
             raise ConnectionError('a fresh authenticated simulated world is required')
         return owner, self.inventory.session, self.inventory.world_id
 
+    def _ensure_fresh_source(self):
+        """Request a correlated UE observation without blocking its receiver."""
+        with self.demo.lock, self.demo.actions.motion_guard() as available:
+            if not available or not self.demo._ready():
+                raise ConnectionError('the simulated world is unavailable')
+            owner, session, world = self._bound()
+            if self.inventory.fresh_snapshot(self.max_age) is not None:
+                return
+            actions = self.demo.actions
+            if actions.sent_at is not None:
+                raise ConnectionError('a simulated action is still pending')
+            if self.inventory.pending is None:
+                actions._shelf_request_id = self.inventory.request_snapshot(owner)
+                actions._shelf_request_sent = False
+                actions._shelf_requested_at = None
+            event = self.inventory.snapshot_event
+        if not event.wait(self.refresh_timeout):
+            raise ConnectionError('Unreal snapshot refresh timed out')
+        with self.demo.lock, self.demo.actions.motion_guard() as available:
+            if (not available or self._bound() != (owner, session, world)
+                    or self.inventory.fresh_snapshot(self.max_age) is None):
+                raise ConnectionError('Unreal snapshot refresh was not confirmed')
+
     def capture(self, *, threshold):
         """Derive a six-frame synthetic view from the current UE slot journal."""
+        self._ensure_fresh_source()
         with self.demo.lock, self.demo.actions.motion_guard() as available, self._lock:
             if not available or not self.demo._ready():
                 raise ConnectionError('the simulated world is unavailable')
             owner, session, world = self._bound()
+            source = self.inventory.fresh_snapshot(self.max_age)
+            if source is None:
+                raise ValueError('a recent Unreal snapshot is required')
             store = self.inventory.store
             # The same store lock covers reading the UE snapshot and applying
             # the synthetic view; the capture's mutation fence rejects any
@@ -65,9 +97,11 @@ class SyntheticReplenishment:
                     perception.accept_frame(token, shelf, {'frame': 'robot_base',
                         'shelf': {'ok': True, 'marker_id': (number - 1) * 4 + 1}, 'slots': slots})
                 result = perception.shortages(threshold=threshold)
-            if self._bound() != (owner, session, world):
+            if (self._bound() != (owner, session, world)
+                    or self.inventory.fresh_snapshot(self.max_age) != source):
                 raise ConnectionError('the simulated world changed during capture')
             self._perception, self._owner, self._session, self._world = perception, owner, session, world
+            self._source = source
             return result
 
     def submit(self, product_id, *, threshold, approved, request_key):
@@ -80,11 +114,15 @@ class SyntheticReplenishment:
             if self._perception is None or self._bound() != (self._owner, self._session, self._world):
                 raise ValueError('a fresh capture in the same world and session is required')
             perception, owner, session, world = self._perception, self._owner, self._session, self._world
+            source = self._source
+            if source is None or self.inventory.fresh_snapshot(self.max_age) != source:
+                raise ValueError('the underlying Unreal snapshot expired or changed')
 
         def operation(request_id):
             with self.demo.lock, self.demo.actions.motion_guard() as available, self._lock:
                 if (not available or not self.demo._ready() or self._bound() != (owner, session, world)
-                        or self._perception is not perception):
+                        or self._perception is not perception
+                        or self.inventory.fresh_snapshot(self.max_age) != source):
                     raise ConnectionError('the approved simulated world changed')
                 state = self.demo.engine.snapshot()
                 robots = state.get('robots')
