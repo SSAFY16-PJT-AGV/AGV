@@ -18,6 +18,7 @@ from server.sim_reroute_activate_receipt import ActivationReceiptInbox
 from server.sim_reroute_wire import _message
 from sim.mqtt_order_robot import _verify_no_proxy
 from sim.reroute_activation_mqtt import SimRerouteActivationMqttReceiver, verify_activation_receipt
+from sim.order_inbox import _decode
 
 
 class SimRerouteExecutionGuard:
@@ -86,6 +87,54 @@ def _live_endpoint(endpoint):
             and endpoint._client.is_connected())
 
 
+def _finished_message(db, runtime, task_id, robot):
+    """Recheck parent proof and completed generation without requiring the old hold."""
+    from server.segments import plan_segment
+    from server.sim_reroute_finish import finished_resources
+
+    progress, gate = runtime.progress, runtime.gate
+    if not db.in_transaction or getattr(gate._local, 'db', None) is not db:
+        raise ValueError('current simulated recovery transaction is required')
+    row = db.execute('SELECT generation,transition_id,robot_id,robot_session,parent_seq,old_payload,'
+                     'stopped_at,incoming_edge,nodes_json,edges_json,blocked_json,recovery_epoch,state '
+                     'FROM sim_reroute_generations WHERE task_id=?', (task_id,)).fetchone()
+    if row is None:
+        raise ValueError('completed simulated reroute is missing')
+    generation, transition, rid, session, seq, payload, stopped, incoming, nodes, edges, blocked, epoch, state = row
+    if (state != 'accepted' or rid != robot.robot_id or runtime._tasks.get(task_id) != (rid, session)
+            or not isinstance(payload, str) or type(seq) is not int or seq < 1):
+        raise ValueError('completed simulated reroute identity changed')
+    with gate._state_lock:
+        if task_id in gate._blocked or gate._generations.get(task_id, 0) != epoch:
+            raise ValueError('simulated recovery generation changed')
+    gate._active(db)
+    old, _encoded, digest = _decode(payload.encode('utf-8'), rid, progress._map_id)
+    challenge = db.execute('SELECT epoch,robot_session,seq,stopped_at,expires,status,robot_id,map_id,'
+                           'order_id,order_digest,map_fingerprint FROM recovery_challenges WHERE task_id=?',
+                           (task_id,)).fetchone()
+    if (challenge is None or challenge[:4] != (gate._epoch, session, seq, stopped)
+            or gate._now() >= challenge[4] or challenge[5:] !=
+            ('verified', rid, progress._map_id, task_id, digest, progress._fingerprint)):
+        raise ValueError('current simulated parent recovery proof is unavailable')
+    prior_robot, path, prior_stop = progress._job(db, task_id, rid)
+    prior_seq, prior_payload, prior_state, prior_order = progress._latest(db, task_id, rid, path, prior_stop)
+    if (prior_robot != rid or prior_seq != seq or prior_stop != stopped or prior_payload != payload
+            or prior_state != 'acked' or prior_order != old):
+        raise ValueError('completed simulated parent order changed')
+    old_resources = set(progress._segment_for_task(db, task_id, path, stopped).resources)
+    if (finished_resources(db, progress, task_id, rid, path, old_resources) != {('node', path[-1])}
+            or progress._occupancy(db, task_id) != {('node', path[-1])}):
+        raise ValueError('completed simulated destination is not reserved')
+    nodes = json.loads(nodes)
+    message = {'type': 'sim.reroute.prepare.v1', 'data': {
+        'transition_id': transition, 'generation': generation, 'robot_id': rid, 'robot_session': session,
+        'task_id': task_id, 'parent_seq': seq, 'parent_digest': digest, 'map_id': progress._map_id,
+        'stopped_at': stopped, 'incoming_edge': incoming, 'nodes': nodes, 'edge_ids': json.loads(edges),
+        'blocked_resources': json.loads(blocked), 'released_until': plan_segment(progress._map, nodes).released_until,
+        'action_at_end': old['action_at_end']}}
+    return _canonical(message)
+
+
 def _execution(db, guard, task_id, robot, *, state):
     runtime, proposal_receiver = guard.runtime, guard.robot_receiver
     _verify_field_global(db, field_required=True)
@@ -96,7 +145,8 @@ def _execution(db, guard, task_id, robot, *, state):
             or not _live_endpoint(guard.activation_receiver.endpoint)
             or guard._execution_receiver is None or not _live_endpoint(guard._execution_receiver.endpoint)):
         raise ValueError('live virtual robot and reroute connections required')
-    proposal = _message(db, runtime, task_id, required_state='accepted')
+    proposal = (_finished_message(db, runtime, task_id, robot) if state == 'finished'
+                else _message(db, runtime, task_id, required_state='accepted'))
     original = json.loads(proposal)['data']
     # The proposed route's single reserved segment must reach its goal.
     if original['released_until'] != original['nodes'][-1]:
@@ -137,6 +187,8 @@ def _execution(db, guard, task_id, robot, *, state):
     prior = snapshot.get('receipt') or {}
     transition = snapshot.get('reroute_transition_id')
     if transition is None:
+        if state == 'finished':
+            raise ValueError('completed generation is not installed on the live virtual robot')
         stopped, incoming = robot.executor.field_stop_direction()
         if (snapshot.get('status') != 'stopped' or stopped != original['stopped_at']
                 or incoming != original['incoming_edge'] or prior.get('order_id') != task_id
@@ -151,6 +203,11 @@ def _execution(db, guard, task_id, robot, *, state):
                 or order.get('nodes') != original['nodes'] or order.get('released_until') != original['released_until']
                 or _canonical(order.get('action_at_end')) != _canonical(original['action_at_end'])):
             raise ValueError('virtual robot execution differs from the reserved generation')
+        if state == 'finished' and (snapshot.get('status') != 'stopped'
+                or snapshot.get('current_node') != original['nodes'][-1]
+                or snapshot.get('visit_index') != snapshot.get('released_index')
+                or prior.get('state') != 'completed'):
+            raise ValueError('virtual robot is not stopped at the completed destination')
     execution = _canonical({'type': 'sim.reroute.execute.v1', 'data':
         dict(json.loads(activation)['data'], activation_digest=hashlib.sha256(activation).hexdigest())})
     if state is not None:
