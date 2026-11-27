@@ -100,7 +100,7 @@ def finish_reroute(runtime, task_id, event_id, guard):
                 robot._lock, runtime._lock:
             runtime._ready()
             receiver = runtime.receiver
-            with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+            with receiver._dispatch_lock, runtime.inbox._lock, guard._fresh_stop_proof.motion_fence(robot):
                 with runtime.progress._transaction() as db:
                     payload, data = _execution(db, guard, task_id, robot, state='uncertain')
                     from server.sim_reroute_multi_progress import validate_steps
@@ -129,6 +129,8 @@ def finish_reroute(runtime, task_id, event_id, guard):
                             or event['map_id'] != data['map_id'] or event['stopped_at'] != data['nodes'][-1]
                             or _resources(event['cleared_resources']) != held - keep or not keep <= held):
                         raise ValueError('new virtual clearance does not match the held generation')
+                    if data['released_until'] != data['nodes'][-1]:
+                        guard._fresh_stop_proof.issue(db, task_id, robot, event_id, final=True)
                     db.execute('CREATE TABLE IF NOT EXISTS sim_reroute_finishes ('
                                'task_id TEXT PRIMARY KEY NOT NULL REFERENCES sim_reroute_generations(task_id), '
                                'transition_id TEXT UNIQUE NOT NULL,robot_id TEXT NOT NULL,event_id TEXT NOT NULL,'

@@ -36,6 +36,8 @@ class SimRerouteExecutionGuard:
         self.runtime, self.receipt_inbox, self.robot_receiver = runtime, receipt_inbox, robot_receiver
         self.activation_inbox, self.activation_receiver = activation_inbox, activation_receiver
         self._execution_receiver = None
+        from server.sim_reroute_fresh_proof import FreshStopProof
+        self._fresh_stop_proof = FreshStopProof(self)
 
     def bind_receiver(self, receiver):
         from sim.reroute_execute_mqtt import SimRerouteExecutionMqttReceiver
@@ -71,7 +73,7 @@ class SimRerouteExecutionGuard:
                     robot._lock, runtime._lock:
                 runtime._ready()
                 receiver = runtime.receiver
-                with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+                with receiver._dispatch_lock, runtime.inbox._lock, self._fresh_stop_proof.motion_fence(robot):
                     with runtime.progress._transaction() as db:
                         expected, _original = _execution(db, self, task_id, robot, state='uncertain',
                                                          allow_queued=allow_queued)
@@ -184,8 +186,29 @@ def _execution(db, guard, task_id, robot, *, state, allow_queued=False):
             or not _live_endpoint(guard.activation_receiver.endpoint)
             or guard._execution_receiver is None or not _live_endpoint(guard._execution_receiver.endpoint)):
         raise ValueError('live virtual robot and reroute connections required')
-    proposal = (_finished_message(db, runtime, task_id, robot) if state == 'finished'
-                else _message(db, runtime, task_id, required_state='accepted'))
+    try:
+        proposal = (_finished_message(db, runtime, task_id, robot) if state == 'finished'
+                    else _message(db, runtime, task_id, required_state='accepted'))
+    except (ValueError, RuntimeError) as original:
+        # Only expiration of the original proof may be supplemented. Changed
+        # identity, revoked status, another epoch, or inconsistent journals
+        # must still fail, even if a virtual stop proof once existed.
+        challenge = db.execute('SELECT expires FROM recovery_challenges WHERE task_id=?', (task_id,)).fetchone()
+        if (challenge is None or type(challenge[0]) not in (int, float)
+                or runtime.gate._now() < challenge[0]):
+            raise
+        try:
+            proposal = guard._fresh_stop_proof.authorize(db, task_id, robot, finished=state == 'finished')
+        except (ValueError, RuntimeError):
+            raise original
+    else:
+        # Once this generation has a fresh proof, its continuity and clock
+        # remain mandatory even while the older parent challenge is valid.
+        lease = guard._fresh_stop_proof._lease
+        if lease is not None and lease.task == task_id:
+            refreshed = guard._fresh_stop_proof.authorize(db, task_id, robot, finished=state == 'finished')
+            if refreshed != proposal:
+                raise ValueError('fresh virtual proof differs from the parent generation')
     original = json.loads(proposal)['data']
     # Multi-segment movement is permitted only when the entire route was
     # reserved atomically by the newer whole-route preparation protocol.

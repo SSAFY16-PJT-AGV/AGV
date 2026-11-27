@@ -96,7 +96,7 @@ def stage_next(runtime, task_id, event_id, guard):
                 guard.activation_receiver.endpoint._connection_fence, endpoint.endpoint._connection_fence, \
                 robot._lock, runtime._lock:
             runtime._ready(); receiver = runtime.receiver
-            with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+            with receiver._dispatch_lock, runtime.inbox._lock, guard._fresh_stop_proof.motion_fence(robot):
                 with runtime.progress._transaction() as db:
                     _payload, data = _execution(db, guard, task_id, robot, state='uncertain')
                     if data['released_until'] == data['nodes'][-1]:
@@ -122,6 +122,7 @@ def stage_next(runtime, task_id, event_id, guard):
                             or event['seq'] != seq or event['map_id'] != data['map_id']
                             or event['stopped_at'] != data['nodes'][index] or event['cleared_resources'] != []):
                         raise ValueError('intermediate event does not match the reserved generation')
+                    guard._fresh_stop_proof.issue(db, task_id, robot, event_id, final=False)
                     following = plan_segment(runtime.progress._map, data['nodes'][index:])
                     next_order = {'order_id': task_id, 'seq': seq + 1, 'map_id': data['map_id'],
                                   'nodes': data['nodes'], 'released_until': following.released_until,
@@ -176,7 +177,7 @@ def publish_next(runtime, task_id, guard):
                     guard.activation_receiver.endpoint._connection_fence, endpoint.endpoint._connection_fence, \
                     robot._lock, runtime._lock:
                 runtime._ready(); receiver = runtime.receiver
-                with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+                with receiver._dispatch_lock, runtime.inbox._lock, guard._fresh_stop_proof.motion_fence(robot):
                     with runtime.progress._transaction() as db:
                         _execution_payload, data = _execution(db, guard, task_id, robot, state='uncertain')
                         steps = validate_steps(db, runtime.progress._map, data)

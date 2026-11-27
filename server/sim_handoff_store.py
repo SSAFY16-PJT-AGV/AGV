@@ -71,7 +71,7 @@ def _reroute_handoff_fence(guard, source_task, store, progress, receiver, gate):
             runtime._ready()
             if runtime.receiver is not receiver or not receiver.ready:
                 raise ValueError('simulated event receiver changed')
-            with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
+            with receiver._dispatch_lock, runtime.inbox._lock, guard._fresh_stop_proof.motion_fence(robot):
                 _HANDOFF_FENCE_LOCAL.active = (identity, robot)
                 try:
                     yield robot
