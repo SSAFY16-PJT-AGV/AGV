@@ -35,6 +35,12 @@ class FakeServerGuard:
             raise ValueError('server did not authorize the next segment')
         yield
 
+    @contextmanager
+    def guard_duplicate(self, _payload, _order_payload):
+        if not self.allow:
+            raise ValueError('server did not authorize the duplicate')
+        yield
+
 
 class RerouteMotionTest(unittest.TestCase):
     def setUp(self):

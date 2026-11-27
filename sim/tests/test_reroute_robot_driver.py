@@ -171,16 +171,24 @@ class RerouteRobotDriverTest(unittest.TestCase):
     def test_mqtt_next_generation_segment_uses_server_guard_and_advances(self):
         robot, execution, guard, order_payload = self._multi_segment_robot()
         robot._queue.put((order_payload, 31, 1))
-        with patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS) as ack:
+        @contextmanager
+        def checked_next(_guard, _payload, _order):
+            self.assertEqual(robot._reroute_next_owner, threading.get_ident())
+            self.assertIs(getattr(execution._accept_context, 'active', False), True)
+            yield
+        with patch.object(fixture.FakeServerGuard, 'guard_next', checked_next), \
+                patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS) as ack:
             state = robot.tick(10)
         self.assertEqual((state['status'], state['current_node'], state['order']['seq']), ('stopped', 'D1', 3))
         ack.assert_called_once_with(31, 1)
+        self.assertIsNone(robot._reroute_next_owner)
+        self.assertIsNot(getattr(execution._accept_context, 'active', False), True)
         with closing(sqlite3.connect(execution.inbox.path)) as db:
             self.assertEqual(db.execute("SELECT seq,state FROM sim_inbox_orders WHERE order_id='T1' ORDER BY seq")
                              .fetchall(), [(1, 'completed'), (2, 'completed'), (3, 'completed')])
 
     def test_denied_next_generation_segment_does_not_move_or_ack(self):
-        robot, _execution, guard, order_payload = self._multi_segment_robot()
+        robot, execution, guard, order_payload = self._multi_segment_robot()
         before = robot.executor.snapshot()
         guard.allow = False
         robot._queue.put((order_payload, 32, 1))
@@ -189,6 +197,8 @@ class RerouteRobotDriverTest(unittest.TestCase):
                 robot.tick(10)
         self.assertEqual(robot.executor.snapshot()['pose'], before['pose'])
         ack.assert_not_called()
+        self.assertIsNone(robot._reroute_next_owner)
+        self.assertIsNot(getattr(execution._accept_context, 'active', False), True)
 
     def test_ack_failure_after_next_acceptance_preserves_pose_and_blocks_retry(self):
         robot, execution, _guard, order_payload = self._multi_segment_robot()
@@ -217,8 +227,107 @@ class RerouteRobotDriverTest(unittest.TestCase):
             state = robot.tick(.01)
         self.assertEqual(state['status'], 'moving')
         self.assertEqual(state['order']['seq'], 3)
-        self.assertNotEqual(state['pose'], first['pose'])
+        self.assertEqual(state['pose'], first['pose'])
         self.assertEqual(ack.call_count, 2)
+
+    def test_duplicate_before_next_packet_preserves_queue_and_does_not_tick(self):
+        robot, execution, _guard, next_payload = self._multi_segment_robot()
+        before = robot.executor.snapshot()
+        duplicate = json.dumps(before['order'], separators=(',', ':')).encode('utf-8')
+        robot._queue.put((duplicate, 41, 1))
+        robot._queue.put((next_payload, 42, 1))
+        @contextmanager
+        def guard_checked(guard, _payload):
+            actual = guard.robot_receiver.robot
+            if not actual._queue.empty() and not actual._reroute_next_inflight:
+                raise ValueError('unprocessed packet blocks a new movement tick')
+            yield
+        @contextmanager
+        def duplicate_checked(guard, _payload, _order):
+            actual = guard.robot_receiver.robot
+            self.assertEqual(getattr(actual, '_reroute_next_owner', None), threading.get_ident())
+            self.assertIs(getattr(getattr(execution, '_accept_context', None), 'active', None), True)
+            yield
+        with patch.object(fixture.FakeServerGuard, 'guard', guard_checked), \
+                patch.object(fixture.FakeServerGuard, 'guard_duplicate', duplicate_checked), \
+                patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS) as ack:
+            after_duplicate = robot.tick(10)
+            self.assertEqual(after_duplicate['pose'], before['pose'])
+            self.assertEqual(after_duplicate['order']['seq'], 2)
+            self.assertEqual(robot._queue.qsize(), 1)
+            self.assertEqual(ack.call_count, 1)
+            finished = robot.tick(10)
+        self.assertEqual((finished['status'], finished['current_node'], finished['order']['seq']), ('stopped', 'D1', 3))
+        self.assertEqual(ack.call_count, 2)
+        self.assertIsNone(robot._reroute_next_owner)
+        self.assertIsNot(getattr(execution._accept_context, 'active', False), True)
+
+    def test_direct_other_thread_tick_cannot_use_duplicate_acceptance_context(self):
+        robot, execution, _guard, order_payload = self._multi_segment_robot()
+        robot._queue.put((order_payload, 43, 1))
+        with patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS):
+            moving = robot.tick(.01)
+        driver = robot._reroute_driver
+        robot._queue.put((order_payload, 44, 1))
+        robot._queue.put((order_payload, 45, 1))
+        entered, release, errors = threading.Event(), threading.Event(), []
+        @contextmanager
+        def guarded_tick(guard, _payload):
+            if not guard.robot_receiver.robot._queue.empty():
+                raise ValueError('queued packet blocks direct movement')
+            yield
+        @contextmanager
+        def guarded_duplicate(guard, _payload, _order):
+            current = guard.robot_receiver.robot
+            self.assertEqual(getattr(current, '_reroute_next_owner', None), threading.get_ident())
+            self.assertIs(getattr(getattr(execution, '_accept_context', None), 'active', None), True)
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test barrier timed out')
+            yield
+        def process_duplicate():
+            try:
+                robot.tick(.1)
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(fixture.FakeServerGuard, 'guard', guarded_tick), \
+                patch.object(fixture.FakeServerGuard, 'guard_duplicate', guarded_duplicate), \
+                patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS):
+            worker = threading.Thread(target=process_duplicate)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5), 'duplicate did not enter its dedicated guard')
+                with self.assertRaises(ValueError):
+                    execution.tick(driver[1], .1, guard=driver[2])
+                self.assertEqual(robot.executor.snapshot()['pose'], moving['pose'])
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_new_segment_before_duplicate_waits_for_separate_packet_validation(self):
+        robot, _execution, _guard, next_payload = self._multi_segment_robot()
+        before = robot.executor.snapshot()
+        robot._queue.put((next_payload, 46, 1))
+        robot._queue.put((next_payload, 47, 1))
+        @contextmanager
+        def guarded_tick(guard, _payload):
+            if not guard.robot_receiver.robot._queue.empty():
+                raise ValueError('queued packet blocks movement')
+            yield
+        with patch.object(fixture.FakeServerGuard, 'guard', guarded_tick), \
+                patch.object(robot._client, 'ack', return_value=mqtt.MQTT_ERR_SUCCESS) as ack:
+            accepted = robot.tick(10)
+            self.assertEqual(accepted['status'], 'moving')
+            self.assertEqual(accepted['pose'], before['pose'])
+            self.assertEqual(robot._queue.qsize(), 1)
+            self.assertEqual(ack.call_count, 1)
+            duplicate = robot.tick(10)
+            self.assertEqual(duplicate['pose'], before['pose'])
+            self.assertEqual(ack.call_count, 2)
+            finished = robot.tick(10)
+        self.assertEqual((finished['status'], finished['current_node']), ('stopped', 'D1'))
 
     def test_changed_duplicate_is_rejected_before_motion_or_ack(self):
         robot, _execution, _guard, order_payload = self._multi_segment_robot()

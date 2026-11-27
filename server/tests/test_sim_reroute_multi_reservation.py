@@ -34,6 +34,9 @@ def resources(data, nodes):
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT')
 class RerouteMultiReservationTest(unittest.TestCase):
     def test_v3_reserves_every_detour_segment_atomically(self):
+        self._exercise()
+
+    def _exercise(self, after_prepare=None):
         data = json.loads((Path(__file__).resolve().parents[1] / 'examples' /
                            'mat_ssafy_v3_simulated_waits.json').read_text(encoding='utf-8'))
         port = free_port(); env = isolated_environment(os.environ); env['PYTHONPATH'] = os.environ['AMQTT_TEST_PATH']
@@ -106,6 +109,8 @@ class RerouteMultiReservationTest(unittest.TestCase):
                     db.execute('DELETE FROM allocation_occupancy WHERE task_id=? AND kind=? AND resource_id=?', ('T1', *target))
                     with self.assertRaises(AllocationConflict): _verify_field_global(db, field_required=True)
                     db.execute('ROLLBACK')
+                if after_prepare is not None:
+                    after_prepare(runtime, robots)
                 saved = runtime.store.list_occupancy()
                 runtime.stop()
                 restarted = SimRuntime(folder / 'sim.sqlite3', data,

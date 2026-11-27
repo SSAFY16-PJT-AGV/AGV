@@ -473,9 +473,11 @@ class SimHandoffStore(AllocationStore):
                     from server.sim_reroute_execute_wire import _execution
                     _execution_payload, generation = _execution(db, reroute_guard, source_task_id,
                                                                  reroute_robot, state='finished')
+                    from server.sim_reroute_multi_progress import validate_steps
+                    steps = validate_steps(db, progress._map, generation)
                     if (field_context is None or prior_robot != robot_id or prior_state != 'acked'
                             or generation['robot_session'] != robot_session
-                            or generation['parent_seq'] != latest_seq or seq != latest_seq + 1
+                            or generation['parent_seq'] != latest_seq or seq != latest_seq + 1 + len(steps)
                             or generation['nodes'][-1] != stopped_at
                             or not generation['edge_ids'] or field_context['incoming_edge'] != generation['edge_ids'][-1]):
                         raise AllocationConflict('completed reroute does not match the next leg')

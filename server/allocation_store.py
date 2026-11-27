@@ -118,11 +118,14 @@ def _verify_field_global(db, *, field_required=False):
                     generation = db.execute('SELECT robot_session,event_id FROM sim_reroute_generations WHERE task_id=?',
                                             (task_id,)).fetchone()
                     final = db.execute('SELECT event_id FROM sim_reroute_finishes WHERE task_id=?', (task_id,)).fetchone()
+                    step_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_reroute_multi_steps'").fetchone()
+                    step_count = (db.execute('SELECT COUNT(*) FROM sim_reroute_multi_steps WHERE task_id=?', (task_id,)).fetchone()[0]
+                                  if step_table else 0)
                     transfer = db.execute('SELECT target_task_id,robot_id,robot_session,seq,stopped_at,event_id,action_id,ack_json '
                                           'FROM sim_handoff_transfers '
                                           'WHERE source_task_id=?', (task_id,)).fetchone()
                     if (kept != {('node', completed_nodes[-1])} or generation is None or final is None
-                            or transfer is None or transfer[1:6] != (completed_robot, generation[0], completed_seq + 1,
+                            or transfer is None or transfer[1:6] != (completed_robot, generation[0], completed_seq + 1 + step_count,
                                                                      completed_nodes[-1], final[0])):
                         raise AllocationConflict('completed reroute has no matching simulated handoff')
                     target, _, _, _, _, _, action_id, ack_json = transfer

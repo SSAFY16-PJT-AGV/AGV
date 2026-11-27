@@ -47,6 +47,11 @@ class SimRerouteExecutionGuard:
 
     @contextmanager
     def guard(self, payload):
+        with self._guard(payload, allow_queued=False):
+            yield
+
+    @contextmanager
+    def _guard(self, payload, *, allow_queued):
         if not isinstance(payload, bytes) or len(payload) > 256 * 1024:
             raise ValueError('bounded simulated execution payload required')
         try:
@@ -68,18 +73,46 @@ class SimRerouteExecutionGuard:
                 receiver = runtime.receiver
                 with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
                     with runtime.progress._transaction() as db:
-                        expected, _original = _execution(db, self, task_id, robot, state='uncertain')
+                        expected, _original = _execution(db, self, task_id, robot, state='uncertain',
+                                                         allow_queued=allow_queued)
                         if payload != expected or receiver is not runtime.receiver or not receiver.ready:
                             raise ValueError('execution differs from the reserved virtual generation')
                         yield
 
     @contextmanager
-    def guard_next(self, _payload, _next_order):
-        # This first supported transition is one segment all the way to its
-        # final destination. Future multi-segment generations need their own
-        # progression proof; do not infer or skip a waiting point.
-        raise ValueError('multi-segment reroute execution is not supported')
-        yield
+    def guard_next(self, payload, next_order):
+        if not isinstance(next_order, bytes) or len(next_order) > 256 * 1024:
+            raise ValueError('bounded next simulated order required')
+        with self._guard(payload, allow_queued=True):
+            data = json.loads(payload.decode('utf-8'))['data']
+            from server.sim_reroute_multi_progress import validate_steps
+            db = getattr(self.runtime.gate._local, 'db', None)
+            if db is None or not db.in_transaction:
+                raise ValueError('live simulated recovery transaction required')
+            steps = validate_steps(db, self.runtime.progress._map, data)
+            if not steps or steps[-1]['state'] != 'uncertain' or steps[-1]['next_payload'] != next_order:
+                raise ValueError('exact attempted next simulated segment required')
+            snapshot = self.robot_receiver.robot.executor.snapshot()
+            order, receipt = snapshot.get('order') or {}, snapshot.get('receipt') or {}
+            if (snapshot.get('status') != 'stopped' or order.get('seq') != steps[-1]['seq']
+                    or receipt.get('state') != 'completed' or receipt.get('seq') != steps[-1]['seq']
+                    or snapshot.get('current_node') != data['nodes'][steps[-1]['stop_index']]):
+                raise ValueError('previous simulated segment is not stopped')
+            yield
+
+    @contextmanager
+    def guard_duplicate(self, payload, duplicate_order):
+        if not isinstance(duplicate_order, bytes) or len(duplicate_order) > 256 * 1024:
+            raise ValueError('bounded duplicate simulated order required')
+        with self._guard(payload, allow_queued=True):
+            data = json.loads(payload.decode('utf-8'))['data']
+            duplicate, _text, digest = _decode(duplicate_order, data['robot_id'], data['map_id'])
+            snapshot = self.robot_receiver.robot.executor.snapshot()
+            current, receipt = snapshot.get('order') or {}, snapshot.get('receipt') or {}
+            if (_canonical(duplicate) != _canonical(current) or receipt.get('order_id') != data['task_id']
+                    or receipt.get('seq') != current.get('seq') or receipt.get('digest') != digest):
+                raise ValueError('duplicate differs from current virtual segment')
+            yield
 
 
 def _live_endpoint(endpoint):
@@ -135,10 +168,16 @@ def _finished_message(db, runtime, task_id, robot):
     return _canonical(message)
 
 
-def _execution(db, guard, task_id, robot, *, state):
+def _execution(db, guard, task_id, robot, *, state, allow_queued=False):
     runtime, proposal_receiver = guard.runtime, guard.robot_receiver
     _verify_field_global(db, field_required=True)
-    if (not robot.ready or robot._event_uncertain or not robot._queue.empty()
+    driver = robot._reroute_driver
+    valid_queued = (robot._reroute_next_inflight and getattr(robot, '_reroute_next_owner', None) == threading.get_ident()
+                    and isinstance(driver, tuple) and len(driver) == 3
+                    and getattr(getattr(driver[0], '_accept_context', None), 'active', False) is True)
+    if (type(allow_queued) is not bool or (allow_queued and not valid_queued)
+            or not robot.ready or robot._event_uncertain
+            or (not allow_queued and (robot._reroute_next_inflight or not robot._queue.empty()))
             or robot._client is not proposal_receiver._robot_client
             or not proposal_receiver._ready.is_set() or proposal_receiver._failed.is_set()
             or proposal_receiver._stopping.is_set() or not proposal_receiver._client.is_connected()
@@ -148,9 +187,14 @@ def _execution(db, guard, task_id, robot, *, state):
     proposal = (_finished_message(db, runtime, task_id, robot) if state == 'finished'
                 else _message(db, runtime, task_id, required_state='accepted'))
     original = json.loads(proposal)['data']
-    # The proposed route's single reserved segment must reach its goal.
+    # Multi-segment movement is permitted only when the entire route was
+    # reserved atomically by the newer whole-route preparation protocol.
     if original['released_until'] != original['nodes'][-1]:
-        raise ValueError('multi-segment reroutes require a later generation protocol')
+        marker = db.execute('SELECT resources_json FROM sim_reroute_multiseg_routes WHERE task_id=?', (task_id,)).fetchone()
+        if marker is None:
+            raise ValueError('whole-route reservation is required for multiple segments')
+    from server.sim_reroute_multi_progress import validate_steps
+    steps = validate_steps(db, runtime.progress._map, original)
     signed = db.execute('SELECT robot_id,payload,digest,state FROM sim_reroute_server_receipts '
                         'WHERE task_id=? AND transition_id=?', (task_id, original['transition_id'])).fetchone()
     key = guard.receipt_inbox._keys.get(robot.robot_id)
@@ -198,11 +242,23 @@ def _execution(db, guard, task_id, robot, *, state):
     else:
         robot.executor._verify_field_execution()
         order = snapshot.get('order') or {}
+        first = {'order_id': task_id, 'seq': original['parent_seq'] + 1, 'map_id': original['map_id'],
+                 'nodes': original['nodes'], 'released_until': original['released_until'],
+                 'action_at_end': original['action_at_end']}
+        allowed = [first] if not steps else [steps[-2]['next_order'] if len(steps) > 1 else first]
+        if steps and steps[-1]['state'] == 'uncertain':
+            allowed.append(steps[-1]['next_order'])
+        matching = next((item for item in allowed if _canonical(item) == _canonical(order)), None)
+        if matching is not None:
+            _parsed, _canonical_text, expected_digest = _decode(_canonical(matching), robot.robot_id, original['map_id'])
+        else:
+            expected_digest = None
         if (transition != original['transition_id'] or snapshot.get('status') not in ('moving', 'stopped')
-                or prior.get('order_id') != task_id or prior.get('seq') != original['parent_seq'] + 1
-                or order.get('nodes') != original['nodes'] or order.get('released_until') != original['released_until']
-                or _canonical(order.get('action_at_end')) != _canonical(original['action_at_end'])):
+                or matching is None or prior.get('order_id') != task_id or prior.get('seq') != matching['seq']
+                or prior.get('digest') != expected_digest):
             raise ValueError('virtual robot execution differs from the reserved generation')
+        if steps and matching['seq'] == steps[-1]['seq'] and snapshot.get('status') != 'stopped':
+            raise ValueError('prior virtual segment must remain stopped until the next order')
         if state == 'finished' and (snapshot.get('status') != 'stopped'
                 or snapshot.get('current_node') != original['nodes'][-1]
                 or snapshot.get('visit_index') != snapshot.get('released_index')

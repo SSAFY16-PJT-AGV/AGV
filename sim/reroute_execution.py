@@ -29,6 +29,7 @@ class SimRerouteExecution:
         self.executor = activation.executor
         self.inbox = activation.inbox
         self.robot_session = activation.robot_session
+        self._accept_context = threading.local()
 
     def initialize(self):
         try:
@@ -171,20 +172,23 @@ class SimRerouteExecution:
             raise OrderRejected('invalid or stale simulated execution request') from exc
 
     @contextmanager
-    def _authority(self, payload, guard, *, next_order=None):
+    def _authority(self, payload, guard, *, next_order=None, duplicate=False):
         """Hold the real simulation server's guard for exactly one operation."""
         try:
             from server.sim_reroute_execute_wire import SimRerouteExecutionGuard
         except ImportError as exc:
             raise OrderRejected('generation-aware server guard is unavailable') from exc
-        method_name = 'guard' if next_order is None else 'guard_next'
+        if duplicate and next_order is None:
+            raise OrderRejected('duplicate guard requires exact order bytes')
+        method_name = 'guard_duplicate' if duplicate else ('guard' if next_order is None else 'guard_next')
         if (type(guard) is not SimRerouteExecutionGuard
                 or getattr(getattr(guard, method_name, None), '__func__', None)
                    is not getattr(SimRerouteExecutionGuard, method_name, None)
                 or getattr(getattr(getattr(guard, 'robot_receiver', None), 'robot', None), 'executor', None)
                    is not self.executor):
             raise OrderRejected('bound generation-aware server guard is required')
-        authority = guard.guard(payload) if next_order is None else guard.guard_next(payload, next_order)
+        authority = (guard.guard_duplicate(payload, next_order) if duplicate else
+                     guard.guard(payload) if next_order is None else guard.guard_next(payload, next_order))
         with authority:
             with self.executor._lock:
                 if self.executor._reroute_guard_thread is not None:
@@ -194,6 +198,16 @@ class SimRerouteExecution:
                     yield
                 finally:
                     self.executor._reroute_guard_thread = None
+
+    @contextmanager
+    def _accepting_next(self):
+        if getattr(self._accept_context, 'active', False):
+            raise OrderRejected('generation acceptance cannot be reentered')
+        self._accept_context.active = True
+        try:
+            yield
+        finally:
+            del self._accept_context.active
 
     def _matching_record(self, payload):
         """Read the exact already-recorded request without making new claims."""
@@ -281,7 +295,7 @@ class SimRerouteExecution:
             raise OrderRejected('next simulated order must be bytes')
         if type(duplicate) is not bool:
             raise OrderRejected('duplicate flag must be explicit')
-        with self._authority(payload, guard, next_order=None if duplicate else order_payload):
+        with self._accepting_next(), self._authority(payload, guard, next_order=order_payload, duplicate=duplicate):
             robot = guard.robot_receiver.robot
             if expected_driver is not None and (robot._reroute_driver is not expected_driver or not robot.ready):
                 raise OrderRejected('simulated generation driver or connection changed')

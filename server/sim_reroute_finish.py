@@ -43,6 +43,12 @@ def finished_resources(db, progress, task, robot, path, old_resources):
             'blocked_resources': json.loads(blocked_raw), 'released_until': plan_segment(progress._map, nodes).released_until,
             'action_at_end': parent['action_at_end']}})
         data = json.loads(proposal)['data']
+        from server.sim_reroute_multi_progress import validate_steps
+        steps = validate_steps(db, progress._map, data)
+        final_seq = seq + 1 + len(steps)
+        final_release = steps[-1]['next_order']['released_until'] if steps else data['released_until']
+        if final_release != nodes[-1] or (steps and steps[-1]['state'] != 'uncertain'):
+            raise ValueError('simulated reroute has not reached its final segment')
         activation = _canonical({'type': 'sim.reroute.activate.v1', 'data': dict(data, proposal_digest=_sha(proposal))})
         expected_activation = (trans, activation, _sha(activation), 'uncertain')
         if db.execute('SELECT transition_id,payload,digest,state FROM sim_reroute_activation_attempts WHERE task_id=?',
@@ -68,12 +74,12 @@ def finished_resources(db, progress, task, robot, path, old_resources):
         event_row = db.execute('SELECT payload,digest,task_id,robot_session,seq,state,result FROM sim_event_inbox '
                                'WHERE robot_id=? AND event_id=?', (robot, event_id)).fetchone()
         expected_result = _canonical({'status': 'reroute_reached_goal', 'task_id': task}).decode('ascii')
-        if not event_row or event_row[1:] != (event_digest, task, session, seq + 1, 'applied', expected_result):
+        if not event_row or event_row[1:] != (event_digest, task, session, final_seq, 'applied', expected_result):
             raise ValueError('finish event metadata differs')
         event, encoded, digest = _event(event_row[0].encode('ascii'))
         keep = {('node', path[-1])}
         if (encoded != event_row[0] or digest != event_digest or event['event_id'] != event_id
-                or event['order_id'] != task or event['robot_session'] != session or event['seq'] != seq + 1
+                or event['order_id'] != task or event['robot_session'] != session or event['seq'] != final_seq
                 or event['map_id'] != progress._map_id or event['stopped_at'] != path[-1]
                 or _resources(event['cleared_resources']) != (old_resources | new_resources) - keep):
             raise ValueError('finish clearance differs')
@@ -97,11 +103,16 @@ def finish_reroute(runtime, task_id, event_id, guard):
             with receiver._dispatch_lock, runtime.inbox._lock, robot._motion_fence:
                 with runtime.progress._transaction() as db:
                     payload, data = _execution(db, guard, task_id, robot, state='uncertain')
+                    from server.sim_reroute_multi_progress import validate_steps
+                    steps = validate_steps(db, runtime.progress._map, data)
+                    final_seq = data['parent_seq'] + 1 + len(steps)
+                    final_release = steps[-1]['next_order']['released_until'] if steps else data['released_until']
                     state = robot.executor.snapshot()
                     order, receipt = state.get('order') or {}, state.get('receipt') or {}
                     if (state.get('status') != 'stopped' or state.get('current_node') != data['nodes'][-1]
                             or state.get('visit_index') != state.get('released_index')
-                            or receipt.get('state') != 'completed' or receipt.get('seq') != data['parent_seq'] + 1
+                            or final_release != data['nodes'][-1] or (steps and steps[-1]['state'] != 'uncertain')
+                            or receipt.get('state') != 'completed' or receipt.get('seq') != final_seq
                             or order.get('nodes') != data['nodes'] or (robot.robot_id, event_id) not in receiver._occupied_events):
                         raise ValueError('new virtual goal stop is not confirmed')
                     row = db.execute('SELECT payload,digest,state FROM sim_event_inbox WHERE robot_id=? AND event_id=?',
@@ -114,7 +125,7 @@ def finish_reroute(runtime, task_id, event_id, guard):
                     keep = {('node', data['nodes'][-1])}
                     if (event_id == old_id or digest != row[1] or encoded != row[0]
                             or event['event_id'] != event_id or event['order_id'] != task_id
-                            or event['robot_session'] != data['robot_session'] or event['seq'] != data['parent_seq'] + 1
+                            or event['robot_session'] != data['robot_session'] or event['seq'] != final_seq
                             or event['map_id'] != data['map_id'] or event['stopped_at'] != data['nodes'][-1]
                             or _resources(event['cleared_resources']) != held - keep or not keep <= held):
                         raise ValueError('new virtual clearance does not match the held generation')

@@ -68,6 +68,7 @@ class SimMqttOrderRobot:
         self._event_segments = set()
         self._reroute_driver = None
         self._reroute_next_inflight = False
+        self._reroute_next_owner = None
         self._client = self._new_client()
 
     def _new_client(self):
@@ -333,10 +334,12 @@ class SimMqttOrderRobot:
                     if (order['seq'] != 1 and order['order_id'] == current.get('order_id')
                             and state.get('status') == 'stopped' and order['seq'] == current.get('seq', 0) + 1):
                         self._reroute_next_inflight = True
+                        self._reroute_next_owner = threading.get_ident()
                         next_message = (payload, mid, qos, False)
                     elif (order['seq'] != 1 and order['order_id'] == current.get('order_id')
                           and order['seq'] == current.get('seq')):
                         self._reroute_next_inflight = True
+                        self._reroute_next_owner = threading.get_ident()
                         next_message = (payload, mid, qos, True)
                     elif (order['seq'] != 1 or order['order_id'] == current.get('order_id')
                           or state['status'] != 'stopped' or state['current_node'] != current['nodes'][-1]):
@@ -368,16 +371,33 @@ class SimMqttOrderRobot:
                 try:
                     execution.accept_next(payload, next_payload, guard=generation_guard,
                                           expected_driver=driver, acknowledgement=(mid, qos), duplicate=duplicate)
-                except Exception:
+                except BaseException:
                     # Keep the in-flight marker set until failure is latched:
                     # another tick must not move an accepted but unacknowledged
                     # segment in the interval before _fail().
                     with self._lock:
                         self._fail()
                         self._reroute_next_inflight = False
+                        self._reroute_next_owner = None
                     raise
                 with self._lock:
+                    if duplicate or not self._queue.empty():
+                        try:
+                            if self._reroute_driver is not driver or not self.ready:
+                                raise RuntimeError('generation driver or connection changed after packet acceptance')
+                            state = self.executor.snapshot()
+                        except Exception:
+                            self._fail()
+                            self._reroute_next_inflight = False
+                            self._reroute_next_owner = None
+                            raise
+                        # A duplicate is bookkeeping only, and a later packet
+                        # must receive its own guard before another move.
+                        self._reroute_next_inflight = False
+                        self._reroute_next_owner = None
+                        return state
                     self._reroute_next_inflight = False
+                    self._reroute_next_owner = None
             return execution.tick(payload, dt_seconds, guard=generation_guard, expected_driver=driver)
         except Exception as exc:
             with self._lock:

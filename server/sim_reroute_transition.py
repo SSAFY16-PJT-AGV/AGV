@@ -195,6 +195,12 @@ def verify_prepared(db, progress, task_id, robot, path, stopped, seq, payload, o
                     or data.get('parent_seq') != seq or data.get('digest') != proposal_digest
                     or data.get('state') != 'accepted_not_executed'):
                 raise ValueError('accepted reroute receipt identity changed')
+            from server.sim_reroute_multi_progress import validate_steps
+            validate_steps(db, progress._map, proposal['data'])
+        else:
+            step_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sim_reroute_multi_steps'").fetchone()
+            if step_table and db.execute('SELECT 1 FROM sim_reroute_multi_steps WHERE task_id=?', (task_id,)).fetchone():
+                raise ValueError('unaccepted reroute has segment progress')
         return resources - old_resources
     except (ValueError, TypeError, KeyError, IndexError, RecursionError, sqlite3.Error, UnicodeError) as exc:
         raise AllocationConflict('prepared reroute is inconsistent') from exc
