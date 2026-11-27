@@ -15,6 +15,7 @@ from server.sim_reroute_activate_wire import publish_activation, SimRerouteActiv
 from server.sim_reroute_activate_receipt import ActivationReceiptInbox, ActivationReceiptReceiver
 from server.sim_reroute_execute_wire import prepare_execution, publish_execution, SimRerouteExecutionGuard
 from server.sim_reroute_finish import finish_reroute
+from server.sim_reroute_multi_progress import stage_next, publish_next
 from server.sim_reroute_receipt import SimRerouteReceiptInbox, SimRerouteReceiptReceiver
 from server.sim_reroute_wire import SimRerouteProposalGuard, publish_proposal
 from sim.reroute_acceptance import SimRerouteAcceptance
@@ -46,6 +47,7 @@ class SimRerouteAutoSession:
         self._cleanup_failure = None
         self._started, self._phase, self._task = False, 'idle', None
         self._evidence, self._event_id, self._payload = None, None, None
+        self._event_base, self._expected_next = None, None
         self.receipts = SimRerouteReceiptInbox(runtime, {robot.robot_id: key})
         self.observer = SimRerouteReceiptReceiver(self.receipts)
         self.acceptance = SimRerouteAcceptance(robot.executor, robot_session=session)
@@ -109,6 +111,7 @@ class SimRerouteAutoSession:
                 raise RuntimeError('previous simulated reroute has not been handed off')
             self._phase, self._task = 'idle', None
             self._evidence, self._event_id, self._payload = None, None, None
+            self._event_base, self._expected_next = None, None
         if not self._started or self._phase != 'idle':
             raise RuntimeError('reroute session is not idle')
         if self.runtime._tasks.get(task) != (self.robot.robot_id, self.session):
@@ -117,14 +120,14 @@ class SimRerouteAutoSession:
         if candidate.get('status') != 'candidate':
             return False
         nodes = candidate.get('nodes')
-        if not isinstance(nodes, list) or len(nodes) < 2 or plan_segment(self.runtime.progress._map, nodes).released_until != nodes[-1]:
-            return False  # Multi-segment generations are deliberately unsupported.
+        if not isinstance(nodes, list) or len(nodes) < 2:
+            return False
         self._task, self._phase = task, 'preparing'
         try:
             result = self.runtime.prepare_reroute(task)
             if result.get('state') != 'prepared' or result.get('nodes') != nodes:
                 raise RuntimeError('reroute reservation outcome is unknown')
-            self._event_id = 'reroute-' + result['transition_id']
+            self._event_base = 'reroute-' + result['transition_id']
             self._phase = 'proposal_attempted'
             publish_proposal(self.runtime, task)
             return True
@@ -168,26 +171,31 @@ class SimRerouteAutoSession:
                 state = self.robot.tick(dt)
                 if state.get('status') == 'moving':
                     return None
-                if state.get('status') != 'stopped' or state.get('current_node') != data['nodes'][-1]:
+                if state.get('status') != 'stopped':
                     raise RuntimeError('simulated reroute stop differs')
                 receipt, order = state.get('receipt') or {}, state.get('order') or {}
-                if (receipt.get('state') != 'completed' or receipt.get('seq') != data['parent_seq'] + 1
-                        or order.get('order_id') != task or order.get('nodes') != data['nodes']):
+                stop = state.get('current_node')
+                if (receipt.get('state') != 'completed' or receipt.get('seq') != order.get('seq')
+                        or order.get('order_id') != task or order.get('nodes') != data['nodes']
+                        or stop != order.get('released_until')):
                     raise RuntimeError('simulated generation receipt differs')
                 # The guard verifies the exact live route, session, both holds,
                 # and stopped robot before deriving the new clearance event.
                 with self.guard.guard(self._payload):
                     held = {item for item, owner in self.runtime.store.list_occupancy().items()
                             if owner == self.robot.robot_id}
-                    keep = {('node', data['nodes'][-1])}
+                    keep = {('node', stop)}
                     if not keep <= held:
-                        raise RuntimeError('goal reservation is unavailable')
+                        raise RuntimeError('stop reservation is unavailable')
+                    final = stop == data['nodes'][-1]
+                    self._event_id = self._event_base if data['released_until'] == data['nodes'][-1] else \
+                        '{}-{}'.format(self._event_base, receipt['seq'])
                     event = {'type': 'rear_clear', 'event_id': self._event_id, 'robot_session': self.session,
                              'order_id': task, 'seq': receipt['seq'], 'map_id': data['map_id'],
-                             'stopped_at': data['nodes'][-1], 'cleared_resources':
-                             [list(item) for item in sorted(held - keep)]}
+                             'stopped_at': stop, 'cleared_resources':
+                             [list(item) for item in sorted(held - keep)] if final else []}
                     self._evidence = {'task_id': task, 'session': self.session, 'robot_id': self.robot.robot_id,
-                        'seq': receipt['seq'], 'stopped_at': data['nodes'][-1], 'event_id': self._event_id,
+                        'seq': receipt['seq'], 'stopped_at': stop, 'event_id': self._event_id,
                         'map_id': data['map_id'], 'digest': receipt['digest']}
                 self._phase = 'event_attempted'
                 self.robot.publish_event(event)
@@ -200,11 +208,32 @@ class SimRerouteAutoSession:
                     raise RuntimeError('new generation event outcome is not pending')
                 if (self.robot.robot_id, self._event_id) not in self.runtime.receiver._occupied_events:
                     return None
+                data = json.loads(self._payload)['data']
+                if self._evidence['stopped_at'] != data['nodes'][-1]:
+                    result = stage_next(self.runtime, task, self._event_id, self.guard)
+                    self._expected_next = result['next_seq']
+                    self._phase = 'next_attempted'
+                    publish_next(self.runtime, task, self.guard)
+                    return None
                 result = finish_reroute(self.runtime, task, self._event_id, self.guard)
                 if result.get('state') != 'reached_goal_held':
                     raise RuntimeError('simulated completion outcome is unknown')
                 self._phase = 'finished'
                 return dict(self._evidence)
+            if self._phase == 'next_attempted':
+                if self.robot._queue.empty():
+                    return None
+                state = self.robot.tick(dt)
+                observed = (state.get('receipt') or {}).get('seq')
+                if observed == self._expected_next - 1 and state.get('status') == 'stopped':
+                    # The driver has already authenticated this exact QoS1
+                    # duplicate under the live generation guard. It does not
+                    # constitute acceptance of the next segment.
+                    return None
+                if observed != self._expected_next:
+                    raise RuntimeError('next virtual segment was not accepted')
+                self._phase = 'execution_attempted'
+                return None
             if self._phase == 'finished':
                 return dict(self._evidence)
             raise RuntimeError('unexpected automatic reroute state')
