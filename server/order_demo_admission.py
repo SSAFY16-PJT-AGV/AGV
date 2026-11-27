@@ -65,9 +65,11 @@ class OrderAdmission:
         with self._lock:
             return not self._stopped and len(self._records) < self.max_records
 
-    def submit(self, operation, fingerprint, request_key=None):
+    def submit(self, operation, fingerprint, request_key=None, *, pass_request_id=False):
         if not callable(operation):
             raise ValueError('operation must be callable')
+        if type(pass_request_id) is not bool:
+            raise ValueError('request ID forwarding must be explicit')
         self._identifier(fingerprint, 'fingerprint', 512)
         if request_key is not None:
             self._identifier(request_key, 'request_key', 128)
@@ -89,7 +91,11 @@ class OrderAdmission:
                 self._records[request_id] = job
                 if request_key is not None:
                     self._keys[request_key] = request_id
-                self._queue.append((job, operation))
+                if pass_request_id:
+                    execute = lambda: operation(request_id)
+                else:
+                    execute = operation
+                self._queue.append((job, execute))
                 if self._worker is None:
                     worker = threading.Thread(target=self._drain, name='order-admission', daemon=True)
                     self._worker = worker

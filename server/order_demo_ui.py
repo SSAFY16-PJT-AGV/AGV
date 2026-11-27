@@ -108,6 +108,13 @@ HTML_PAGE = r'''<!doctype html>
       </form>
       <p id="product-feedback" class="feedback" role="status" aria-live="polite"></p>
       <ul id="submission-list" aria-live="polite"></ul>
+      <section id="synthetic-replenishment" hidden aria-labelledby="synthetic-title">
+        <h2 id="synthetic-title">가상 재고 부족 확인</h2>
+        <p class="help">Unreal 선반 상태에서 합성한 관찰입니다. 실제 카메라나 실물 재고가 아닙니다. 선반에 상품이 한 개 미만일 때 부족으로 표시합니다.</p>
+        <button id="synthetic-capture" type="button">가상 선반 확인</button>
+        <p id="synthetic-result" class="help" role="status">선반을 확인한 뒤 위에서 상품을 선택하세요.</p>
+        <button id="synthetic-approve" type="button" disabled>선택 상품 보충 승인</button>
+      </section>
       <details id="direct-orders">
       <summary>노드 직접 선택</summary>
       <p class="help">가상 운반 지점을 직접 지정할 때 사용합니다.</p>
@@ -137,6 +144,7 @@ HTML_PAGE = r'''<!doctype html>
       <div id="fleet-status" aria-live="polite" hidden></div>
       <p id="status-feedback" class="feedback" role="status" aria-live="polite"></p>
       <p class="notice">이 화면은 가상 시연입니다. 실제 상품이나 로봇 운행 결과는 아닙니다.</p>
+      <p id="team-shelf-lifetime" class="notice" hidden>팀 선반 주문과 재고는 이번 시연 중에만 확인할 수 있습니다. 서버 재시작 후 작업을 자동 복구하지 않으며, 기존 Unreal 세계를 다시 사용하지 않습니다.</p>
     </section>
   <section class="card" id="map-card" aria-labelledby="map-title">
     <div class="card-top"><div><p class="section-kicker">03 / WAREHOUSE MAP</p><h2 id="map-title">가상 창고 맵</h2></div><span class="section-icon" aria-hidden="true">⌖</span></div>
@@ -193,6 +201,9 @@ HTML_PAGE = r'''<!doctype html>
   let mapBounds = null;
   let lastMapStatus = null;
   let activeTimelines = [];
+  let syntheticReport = null;
+  let syntheticObservedAt = 0;
+  let syntheticBusy = false;
   const pendingSubmissions = new Map();
   // Write the key before POST. A missing server record is not proof that a
   // timed-out request was never accepted, so recovery never sends another POST.
@@ -234,6 +245,10 @@ HTML_PAGE = r'''<!doctype html>
                      submissionUnknown || postDelayUnknown;
     submit.disabled = !nodesReady || submitting || jobActive || awaiting;
     productSubmit.disabled = !productsReady || submitting || jobActive || awaiting;
+    const syntheticApprove = document.getElementById('synthetic-approve');
+    const entry = syntheticReport && syntheticReport[product.value];
+    syntheticApprove.disabled = !entry || entry.status !== 'shortage' || submitting || syntheticBusy ||
+      jobActive || awaiting || observationExpired(syntheticObservedAt, 4500);
   }
   function makeRequestKey() {
     if (typeof crypto === 'undefined') throw new Error('secure randomness is unavailable');
@@ -288,7 +303,7 @@ HTML_PAGE = r'''<!doctype html>
   function rememberAttempt(key, url, label) {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(key) || typeof label !== 'string' || !label || label.length > 256)
       throw new Error('invalid request identity');
-    const record = {version: 1, key, kind: url.endsWith('/product-orders') ? 'product' : 'direct', label};
+    const record = {version: 1, key, kind: (url.endsWith('/product-orders') || url.endsWith('/synthetic-replenishment')) ? 'product' : 'direct', label};
     const name = attemptPrefix + key;
     if (localStorage.getItem(name) !== null) throw new Error('request key already recorded');
     const encoded = JSON.stringify(record);
@@ -568,7 +583,7 @@ HTML_PAGE = r'''<!doctype html>
       message(productFeedback, '상품 목록을 불러오지 못했습니다. 서버 상태를 확인하고 새로고침해 주세요.');
     }
   }
-  product.addEventListener('change', showProductDetails);
+  product.addEventListener('change', () => { showProductDetails(); updateButton(); });
   function addNodes(select, nodes) {
     select.replaceChildren();
     const placeholder = document.createElement('option');
@@ -810,8 +825,12 @@ HTML_PAGE = r'''<!doctype html>
       for (const row of rows) list.appendChild(row);
       document.getElementById('inventory-freshness').textContent = inventory.fresh === true
         ? '현재 가상 세계에서 확인된 재고' : '마지막 저장 재고 · 현재 상태 확인 필요';
-      const parts = Object.entries(inventory.shelves || {}).map(([name, shelf]) =>
-        `${name}: ${shelf.slots.filter(value => value === true).length}/${shelf.slots.length}칸 적재`);
+      const parts = Object.entries(inventory.shelves || {}).map(([name, shelf]) => {
+        const unknown = shelf.slots.filter(value => value === null).length;
+        const claimed = Array.isArray(shelf.claimed) ? shelf.claimed.length : 0;
+        return `${name}: ${shelf.slots.filter(value => value === true).length}/${shelf.slots.length}칸 적재` +
+          `${unknown ? ` · 확인 불가 ${unknown}칸` : ''}${claimed ? ` · 예약 ${claimed}칸` : ''}`;
+      });
       if (inventory.pickup && inventory.pickup.sources) {
         for (const [name, source] of Object.entries(inventory.pickup.sources)) {
           const count = Number.isInteger(source.available) ? `${source.available}개` : '확인 전';
@@ -909,6 +928,8 @@ HTML_PAGE = r'''<!doctype html>
       lastMapStatus=data;
       renderMapRobots(data);
       const synthetic = data.action_source === 'synthetic';
+      document.getElementById('team-shelf-lifetime').hidden = data.team_shelf_mode !== true;
+      document.getElementById('synthetic-replenishment').hidden = data.team_shelf_mode !== true;
       const timelineFresh = !stale && data.stale === false && data.connected === true && data.unreal_connected === true;
       document.getElementById('dashboard-source').textContent = synthetic ? '합성 세계 · 가상' : 'Unreal · 가상';
       const health = document.getElementById('dashboard-health');
@@ -990,6 +1011,35 @@ HTML_PAGE = r'''<!doctype html>
       if (generation === statusGeneration) { polling=false; statusController=null; }
     }
   }
+  document.getElementById('synthetic-capture').addEventListener('click', async () => {
+    if (syntheticBusy || submitting) return;
+    syntheticBusy = true; syntheticReport = null; updateButton();
+    const display = document.getElementById('synthetic-result');
+    display.textContent = 'Unreal 가상 선반을 확인 중입니다.';
+    try {
+      const result = await readJson(await fetch('/order-demo/api/synthetic-shortages', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({threshold: 1})
+      }));
+      if (!result || result.source !== 'synthetic_from_unreal_snapshot' || !result.products)
+        throw new Error('invalid synthetic observation');
+      syntheticReport = result.products; syntheticObservedAt = observationClock();
+      const names = {milk: '우유', tissue: '휴지', egg: '달걀', juice: '주스'};
+      const labels = {shortage: '부족', sufficient: '충분', unknown: '확인 불가', mismatch: '상품 불일치'};
+      display.textContent = Object.keys(names).map(id => `${names[id]}: ${labels[result.products[id]?.status] || '확인 불가'}`).join(' · ') +
+        ' · 결과는 잠시만 유효합니다.';
+    } catch (_) { display.textContent = '가상 선반을 확인하지 못했습니다. 연결과 작업 상태를 확인해 주세요.'; }
+    finally { syntheticBusy = false; updateButton(); }
+  });
+  document.getElementById('synthetic-approve').addEventListener('click', async () => {
+    scanStoredAttempts(); updateButton();
+    if (document.getElementById('synthetic-approve').disabled) return;
+    const id = product.value;
+    syntheticReport = null; submitting = true; updateButton();
+    try { await submitRequest('/order-demo/api/synthetic-replenishment',
+      {product_id: id, threshold: 1, approved: true}, productFeedback,
+      '가상 상품 보충을 접수했습니다.', (products.get(id)?.label || id) + ' 보충'); }
+    finally { submitting = false; updateButton(); }
+  });
   document.getElementById('product-form').addEventListener('submit', async event => {
     event.preventDefault();
     scanStoredAttempts();

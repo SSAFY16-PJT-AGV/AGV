@@ -18,7 +18,7 @@ import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, StrictStr
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, StrictStr
 import paho.mqtt.client as mqtt
 
 from server.mqtt_client import start_mqtt, stop_mqtt
@@ -454,6 +454,10 @@ class DemoRuntime:
         result['stale'] = stale
         result['connected'] = not stale and ready and self.connected.is_set() and not self.stop_event.is_set()
         result['unreal_connected'] = not stale and self.actions.available_fast()
+        if getattr(self, 'team_shelves', False):
+            result['team_shelf_mode'] = True
+            result['state_persistence'] = 'process_only'
+            result['restart_recovery'] = False
         if self._action_source == 'synthetic':
             result['action_source'] = 'synthetic'
         if self.journal is not None:
@@ -491,7 +495,7 @@ class DemoRuntime:
         finally:
             self.lock.release()
 
-    def create_product_order(self, product_id):
+    def create_product_order(self, product_id, *, request_id=None):
         product = next((item for item in self.products if item['id'] == product_id), None)
         if product is None:
             raise ValueError('unknown product')
@@ -503,9 +507,12 @@ class DemoRuntime:
                     raise ConnectionError('authenticated Unreal connection unavailable')
                 self._invalidate_snapshot()
                 try:
+                    options = {'request_id': request_id} if request_id is not None and getattr(self, 'team_shelves', False) else {}
+                    if request_id is not None and not options:
+                        raise ValueError('explicit slot request ID is only supported by team shelf mode')
                     result = self.engine.create_product_order(product['product_type'], product['pickup_node'],
                                                               product['destination_node'], product['shelf_id'],
-                                                              product['slot_index'])
+                                                              product['slot_index'], **options)
                     self._store_snapshot(self.engine.snapshot(), self._ready())
                     return result
                 except Exception as exc:
@@ -513,9 +520,11 @@ class DemoRuntime:
         finally:
             self.lock.release()
 
-    def _submit(self, operation, fingerprint, request_key=None):
+    def _submit(self, operation, fingerprint, request_key=None, *, pass_request_id=False):
         # A request accepted by admission is never silently cancelled or
         # retried. The operation itself rejects before mutation if busy.
+        if pass_request_id:
+            return self.admission.submit(operation, fingerprint, request_key=request_key, pass_request_id=True)
         return self.admission.submit(operation, fingerprint, request_key=request_key)
 
     def submit_product_order(self, product_id, request_key=None):
@@ -529,13 +538,16 @@ class DemoRuntime:
             # making any reservation or publishing any order.
             with self.actions._owner_fast_lock:
                 owner = self.actions._fast_owner if self.actions.available_fast() else None
-            operation = lambda: self._wait_for_product_order(product_id, owner)
+            if getattr(self, 'team_shelves', False):
+                operation = lambda request_id: self._wait_for_product_order(product_id, owner, request_id=request_id)
+            else:
+                operation = lambda: self._wait_for_product_order(product_id, owner)
         else:
             operation = lambda: self.create_product_order(product_id)
-        return self._submit(operation,
-                            'product:' + product_id, request_key)
+        return self._submit(operation, 'product:' + product_id, request_key,
+                            pass_request_id=bool(self._fleet_mode and getattr(self, 'team_shelves', False)))
 
-    def _wait_for_product_order(self, product_id, owner):
+    def _wait_for_product_order(self, product_id, owner, *, request_id=None):
         """Wait outside the control lock until an admitted fleet order can start."""
         product = next(item for item in self.products if item['id'] == product_id)
         while not self.stop_event.is_set():
@@ -556,11 +568,23 @@ class DemoRuntime:
                         and not inventory.can_reserve(product['shelf_id'], product['product_type'])):
                     raise ShelfFull('no confirmed empty simulated shelf slot')
                 destination_ready = getattr(self.engine, 'can_dispatch_destination', lambda _destination: True)
+                pickup_ready = True
+                if getattr(self, 'team_shelves', False):
+                    from server.team_shelf_pickup_gate import pickup_is_clear
+                    try:
+                        zones = {zone['id'] for zone in self.map_runtime.map_data['zones']
+                                 if zone.get('type') == 'shared'
+                                 and set(zone.get('nodes', ())) & {'D01', 'N01'}}
+                        pickup_ready = pickup_is_clear(inventory.store, self.map_runtime, zones)
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        pickup_ready = False
                 if (self._ready() and state.get('accepting_orders') is True
-                        and destination_ready(product['destination_node'])):
+                        and pickup_ready and destination_ready(product['destination_node'])):
                     # RLock holds readiness, the chosen owner and dispatch in
                     # one serialized operation. The existing method applies
                     # its own motion fence and repeats safety checks.
+                    if request_id is not None:
+                        return self.create_product_order(product_id, request_id=request_id)
                     return self.create_product_order(product_id)
             self.stop_event.wait(.05)
         raise AdmissionStopped('demo stopped before dispatch')
@@ -745,6 +769,12 @@ async def lifespan(app):
             or any(os.environ.get(key) for key in ('MQTT_USERNAME', 'MQTT_PASSWORD', 'MQTT_TLS_CA'))):
         raise RuntimeError('explicit isolated local demo configuration required')
     action_source = os.environ.get('AGV_ORDER_ACTION_SOURCE', 'unreal')
+    team_shelves = os.environ.get('AGV_ORDER_TEAM_SHELVES') == '1'
+    if team_shelves and (action_source != 'unreal' or os.environ.get('AGV_ORDER_PERSIST_DIR')
+            or not os.environ.get('AGV_ORDER_FIELD_CONFIG')
+            or any(os.environ.get(key) != '1' for key in
+                   ('AGV_ORDER_COORDINATED', 'AGV_ORDER_FLEET', 'AGV_ORDER_SHELF_SYNC'))):
+        raise ValueError('team shelf demo requires a fresh nonpersistent Unreal fleet and v3 field mapping')
     if action_source not in ('unreal', 'synthetic'):
         raise ValueError('invalid simulated action source')
     if action_source == 'synthetic' and (not os.environ.get('AGV_ORDER_PERSIST_DIR')
@@ -762,8 +792,12 @@ async def lifespan(app):
     if os.environ.get('AGV_ORDER_FIELD_CONFIG'):
         if os.environ.get('AGV_ORDER_COORDINATED') != '1' or os.environ.get('AGV_ORDER_FLEET') != '1':
             raise ValueError('field mapping requires the isolated coordinated fleet')
-        from server.field_twin_mapping import load_field_twin_mapping
-        field_map, field_mapping = load_field_twin_mapping(os.environ['AGV_ORDER_FIELD_CONFIG'], map_data)
+        if team_shelves:
+            from server.team_shelf_web_mapping import load_team_shelf_mapping
+            field_map, field_mapping = load_team_shelf_mapping(os.environ['AGV_ORDER_FIELD_CONFIG'], map_data)
+        else:
+            from server.field_twin_mapping import load_field_twin_mapping
+            field_map, field_mapping = load_field_twin_mapping(os.environ['AGV_ORDER_FIELD_CONFIG'], map_data)
     products = field_mapping.products if field_mapping is not None else PRODUCTS
     node_map = field_map if field_mapping is not None else map_data
     nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in node_map['nodes']]
@@ -892,7 +926,7 @@ async def lifespan(app):
                     runtime, robot, sim_map, product_lookup, robot_id=robot_id,
                     twin_id={'sim-r1': 'AGV_01', 'sim-r2': 'AGV_02'}[robot_id],
                     session=session_names[robot_id], task_prefix=prefixes[robot_id],
-                    wait_for_reservation=fleet_enabled)
+                    wait_for_reservation=fleet_enabled, defer_delivery_handoff=team_shelves)
                 if journal is not None:
                     completed = [row for row in journal.list_orders() if row['state'] == 'completed'
                                  and isinstance(row['result'], dict)
@@ -908,8 +942,32 @@ async def lifespan(app):
                 cleanup.callback(robot.stop)
             if field_mapping is not None:
                 runtime.bind_reroute_simulators({robot_id: item.robot for robot_id, item in engines.items()})
-            inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in products}, store=journal)
-                         if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
+            if team_shelves:
+                from server.team_shelf_order_slots import TeamShelfOrderSlots
+                from server.team_shelf_web_adapter import TeamShelfSimInventory
+                from server.team_shelf_world_registry import TeamShelfWorldRegistry
+                slot_store = TeamShelfOrderSlots.create_new(folder / 'team-slots.sqlite3')
+                registry_path = Path(os.environ.get('AGV_ORDER_TEAM_WORLD_REGISTRY',
+                    str(Path(__file__).resolve().parents[1] / '.venv' / 'team-shelf-worlds.sqlite3')))
+                registry = TeamShelfWorldRegistry(registry_path)
+                def validate_initial_world(data):
+                    observed = {item['agv_id']: item for item in data['robots']}
+                    for item in engines.values():
+                        seen = observed.get(item.TWIN)
+                        state = item.snapshot()
+                        if (not isinstance(seen, dict) or seen['carrying'] or seen['interpolating']
+                                or state['status'] != 'idle' or state['pose'] is None):
+                            return False
+                        expected = field_mapping.pose(state['pose'])
+                        if (math.hypot(seen['x'] - expected['x'], seen['y'] - expected['y']) > .05
+                                or abs((seen['yaw'] - expected['yaw'] + 180.) % 360. - 180.) > 1.):
+                            return False
+                    return True
+                inventory = TeamShelfSimInventory(slot_store, validate_initial=validate_initial_world,
+                                                  claim_world=registry.claim)
+            else:
+                inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in products}, store=journal)
+                             if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
             engine = FleetProductControlEngine(engines, sim_map, inventory=inventory) if fleet_enabled else engines['sim-r1']
         else:
             from server.order_demo_engine import OrderDemoEngine
@@ -922,6 +980,30 @@ async def lifespan(app):
                            journal=journal, recovery_blocked=recovery_blocked, pickup_store=pickup_store,
                            field_mapping=field_mapping, products=products, action_source=action_source,
                            map_runtime=runtime)
+        demo.team_shelves = team_shelves
+        if team_shelves:
+            from server.team_shelf_web_adapter import TeamShelfActionSession
+            def confirmed_arrival(request_id, agv_id, action, node):
+                selected = engine._selected_action
+                item = engine.engines.get(selected)
+                reservation = engine._slot_reservations.get(selected)
+                if item is None or not reservation or reservation['reservation_id'] != request_id or item.TWIN != agv_id:
+                    return False
+                pending = item.snapshot().get('pending_action')
+                expected_action = 'grab' if action == 'pick' else 'place'
+                if not pending or pending.get('action') != expected_action or pending.get('agv_id') != agv_id:
+                    return False
+                task = item._pickup_task if action == 'pick' else item._delivery_task
+                evidence = item._pickup_evidence if action == 'pick' else item._delivery_evidence
+                if pending.get('order_id') != task:
+                    return False
+                item._validate_finished(evidence, task, node)
+                return True
+            demo.actions = TeamShelfActionSession(engine, demo.lock, inventory,
+                arrival_guard=confirmed_arrival, can_dispatch=demo._ready,
+                on_change=demo._invalidate_snapshot, pause_on_unavailable=True)
+            from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
+            demo.synthetic_replenishment = SyntheticReplenishment(demo)
         app.state.mqtt_service = service
         try:
             demo.start()
@@ -983,6 +1065,16 @@ class ProductOrderRequest(BaseModel):
     product_id: StrictStr
 
 
+class SyntheticShortageRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    threshold: StrictInt
+
+
+class SyntheticReplenishmentRequest(SyntheticShortageRequest):
+    product_id: StrictStr
+    approved: StrictBool
+
+
 @app.get('/order-demo/', response_class=HTMLResponse)
 def page(request: Request):
     _demo(request)
@@ -1030,10 +1122,40 @@ def _public_order(row):
                 error=row.get('error'))
 
 
+def _team_shelf_observation(demo):
+    from server.team_shelf_web_adapter import TeamShelfSimInventory
+    inventory = getattr(getattr(demo, 'engine', None), 'inventory', None)
+    if not getattr(demo, 'team_shelves', False) or type(inventory) is not TeamShelfSimInventory:
+        return None
+    data = inventory.store.inspect()
+    claims = {row['slot_id'] for row in data['claims']}
+    shelves = {}
+    for row in data['slots']:
+        shelf = shelves.setdefault(row['shelf_id'], {'slots': [], 'products': [], 'claimed': []})
+        shelf['slots'].append({'empty': False, 'occupied': True, 'unknown': None}[row['state']])
+        shelf['products'].append(row['product_type'])
+        if row['slot_id'] in claims:
+            shelf['claimed'].append(row['slot_index'])
+    labels = {'reserved': 'active', 'picking': 'active', 'carried': 'active', 'placing': 'active',
+              'completed': 'completed', 'failed': 'failed', 'unknown': 'unknown'}
+    orders = [{'request_id': row['request_id'], 'product_id': row['product_type'],
+               'status': labels[row['state']], 'shelf_id': row['destination_shelf'],
+               'slot_index': (row['destination_slot_id'] - 1) % 4} for row in data['orders']]
+    return {'scope': 'team_shelf_process_only', 'fresh': bool(inventory.ready and demo.actions.available_fast()),
+            'shelves': shelves, 'orders': orders}
+
+
 @app.get('/order-demo/api/orders')
 def order_history(request: Request):
-    journal = getattr(_demo(request), 'journal', None)
+    demo = _demo(request)
+    journal = getattr(demo, 'journal', None)
     if journal is None:
+        try:
+            team = _team_shelf_observation(demo)
+        except Exception:
+            raise HTTPException(503, '가상 주문을 확인할 수 없습니다') from None
+        if team is not None:
+            return {'scope': team['scope'], 'orders': team['orders']}
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
     return {'orders': [_public_order(row) for row in journal.list_orders()]}
 
@@ -1054,8 +1176,18 @@ def metrics(request: Request):
 
 @app.get('/order-demo/api/orders/{request_id}')
 def order_status(request_id: str, request: Request):
-    journal = getattr(_demo(request), 'journal', None)
+    demo = _demo(request)
+    journal = getattr(demo, 'journal', None)
     if journal is None:
+        try:
+            team = _team_shelf_observation(demo)
+        except Exception:
+            raise HTTPException(503, '가상 주문을 확인할 수 없습니다') from None
+        if team is not None:
+            row = next((item for item in team['orders'] if item['request_id'] == request_id), None)
+            if row is not None:
+                return row
+            raise HTTPException(404, '주문을 찾을 수 없습니다')
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
     try:
         return _public_order(journal.get_order(request_id))
@@ -1068,6 +1200,12 @@ def inventory_status(request: Request):
     demo = _demo(request)
     journal = getattr(demo, 'journal', None)
     if journal is None:
+        try:
+            team = _team_shelf_observation(demo)
+        except Exception:
+            raise HTTPException(503, '가상 재고를 확인할 수 없습니다') from None
+        if team is not None:
+            return {key: team[key] for key in ('scope', 'fresh', 'shelves')}
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
     result = journal.load_shelves()
     result['fresh'] = bool(demo.actions.available_fast() and demo._world_ready.is_set()
@@ -1111,6 +1249,41 @@ def _submission_response(result):
     if isinstance(result, dict) and result.get('status') in ('pending', 'unknown') and result.get('request_id'):
         return JSONResponse(result, status_code=202)
     return result
+
+
+@app.post('/order-demo/api/synthetic-shortages')
+def synthetic_shortages(body: SyntheticShortageRequest, request: Request):
+    demo = _demo(request, mutate=True)
+    service = getattr(demo, 'synthetic_replenishment', None)
+    if service is None:
+        raise HTTPException(404, '팀 선반 가상 시연에서만 사용할 수 있습니다')
+    if not 1 <= body.threshold <= 4:
+        raise HTTPException(422, '부족 기준은 1~4여야 합니다')
+    try:
+        result = service.capture(threshold=body.threshold)
+    except (ConnectionError, RuntimeError, ValueError):
+        raise HTTPException(503, '가상 선반 상태를 확인할 수 없습니다') from None
+    return {'source': 'synthetic_from_unreal_snapshot', 'threshold': body.threshold, 'products': result}
+
+
+@app.post('/order-demo/api/synthetic-replenishment')
+def synthetic_replenishment(body: SyntheticReplenishmentRequest, request: Request):
+    demo = _demo(request, mutate=True)
+    service = getattr(demo, 'synthetic_replenishment', None)
+    if service is None:
+        raise HTTPException(404, '팀 선반 가상 시연에서만 사용할 수 있습니다')
+    key = _request_key(request)
+    if not key or body.approved is not True or not 1 <= body.threshold <= 4:
+        raise HTTPException(422, '주문 키와 명시적 승인, 올바른 부족 기준이 필요합니다')
+    try:
+        return _submission_response(service.submit(body.product_id, threshold=body.threshold,
+                                                   approved=True, request_key=key))
+    except AdmissionConflict:
+        raise HTTPException(409, '요청 키가 다른 주문에 사용됐습니다') from None
+    except (AdmissionBusy, AdmissionStopped, ConnectionError):
+        raise HTTPException(503, '가상 보충을 접수할 수 없습니다') from None
+    except (ValueError, RuntimeError):
+        raise HTTPException(409, '가상 부족 상태를 다시 확인해 주세요') from None
 
 
 @app.post('/order-demo/api/product-orders')
