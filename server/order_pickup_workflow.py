@@ -26,7 +26,7 @@ class PickupWorkflow:
     def __init__(self, runtime, robot, map_data, product_lookup, *, simulation_enabled=False,
                  clock=time.monotonic, timeout_seconds=30, task_id=TASK, session=SESSION,
                  action_at_end=None, accept_preceding=None, prepare_options=None,
-                 robot_id=ROBOT, wait_for_reservation=False):
+                 robot_id=ROBOT, wait_for_reservation=False, reroute_session=None):
         if simulation_enabled is not True:
             raise ValueError('isolated simulation must be explicitly enabled')
         if not isinstance(product_lookup, dict) or not product_lookup or not callable(clock):
@@ -43,6 +43,13 @@ class PickupWorkflow:
         _topic(robot_id)
         if type(wait_for_reservation) is not bool:
             raise ValueError('reservation waiting must be explicitly enabled')
+        if reroute_session is not None:
+            from server.sim_reroute_automatic import SimRerouteAutoSession
+            if (type(reroute_session) is not SimRerouteAutoSession or reroute_session.runtime is not runtime
+                    or reroute_session.robot is not robot or reroute_session.session != session
+                    or not wait_for_reservation):
+                raise ValueError('matching explicit virtual reroute session is required')
+        self.reroute_session = reroute_session
         self.ROBOT = robot_id
         self.wait_for_reservation = wait_for_reservation
         action = copy.deepcopy({'type': 'load'} if action_at_end is None else action_at_end)
@@ -107,6 +114,14 @@ class PickupWorkflow:
     def _reset_deadline(self):
         self._deadline = self.clock() + self.timeout_seconds
 
+    @property
+    def reroute_handoff_guard(self):
+        session = self.reroute_session
+        if (session is None or session._phase != 'finished' or session._task != self.task_id
+                or self._finished_evidence is None):
+            return None
+        return session.guard
+
     def _unknown(self):
         self._status = 'unknown'
         self._error = 'simulation outcome unavailable'
@@ -121,6 +136,9 @@ class PickupWorkflow:
             if self._robot_state is not None:
                 result.update(current_node=self._robot_state.get('current_node'),
                               pose=copy.deepcopy(self._robot_state.get('pose')))
+            if self._status == 'rerouting':
+                actual = self._robot_state.get('status') if isinstance(self._robot_state, dict) else None
+                result['reroute_motion'] = {'moving': 'moving', 'stopped': 'waiting'}.get(actual, 'unknown')
             return result
 
     def _is_preceding_stop(self, state):
@@ -226,6 +244,9 @@ class PickupWorkflow:
                 result = self.runtime.receiver.retry_occupied_event(self.ROBOT, waiting['event_id'])
                 if result.get('status') == 'occupied':
                     self._status = 'waiting_reservation'
+                    if self.reroute_session is not None and self.reroute_session.begin(self.task_id):
+                        self._status = 'rerouting'
+                        self._reset_deadline()
                 elif result.get('status') == 'not_occupied':
                     if self._status == 'waiting_reservation':
                         raise ValueError('reservation wait evidence disappeared')
@@ -321,6 +342,18 @@ class PickupWorkflow:
                         raise ValueError('idle simulation state changed during reservation wait')
                     if self.clock() >= self._next_retry:
                         self._prepare_once()
+                    return self.snapshot()
+                if self._status == 'rerouting':
+                    evidence = self.reroute_session.step(dt_seconds)
+                    self._robot_state = copy.deepcopy(self.robot.executor.snapshot())
+                    position = (self._robot_state.get('current_node'), repr(self._robot_state.get('pose')))
+                    if position != self._last_position:
+                        self._last_position = position
+                        self._reset_deadline()
+                    if evidence is not None:
+                        self._finished_evidence = copy.deepcopy(evidence)
+                        self._waiting = None
+                        self._status = 'pickup_reached'
                     return self.snapshot()
                 if self._waiting and not self._confirm_waiting():
                     return self.snapshot()

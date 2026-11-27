@@ -37,6 +37,10 @@ async function run(extra){
  x=await run({state_persistence:'durable',restart_recovery:true,
   restart_recovery_scope:'completed_only',synthetic_replenishment_available:true});
  assert(!x.note.hidden);assert(x.note.textContent.includes('완료'));assert(!x.synthetic.hidden);
+ x=await run({state_persistence:'durable',restart_recovery:true,
+  restart_recovery_scope:'completed_except_rerouted_handoffs',synthetic_replenishment_available:true});
+ assert(!x.note.hidden);assert(x.note.textContent.includes('우회'));
+ assert(x.note.textContent.includes('복구'));
  x=await run({state_persistence:'process_only',restart_recovery:false,
   restart_recovery_scope:'none',synthetic_replenishment_available:true});
  assert(!x.note.hidden);assert(x.note.textContent.includes('이번 시연'));

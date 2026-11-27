@@ -120,6 +120,17 @@ class ProductControlTests(unittest.TestCase):
         resumed = self.engine.tick(.1)
         self.assertEqual((resumed['status'], resumed['phase']), ('moving', 'to_pickup'))
 
+    def test_virtual_reroute_distinguishes_waiting_from_motion(self):
+        self.product_order()
+        Workflow.created[0].current.update(status='rerouting', reroute_motion='waiting')
+        waiting = self.engine.tick(.1)
+        self.assertEqual((waiting['status'], waiting['phase']), ('waiting', 'reroute_wait'))
+        Workflow.created[0].current['reroute_motion'] = 'moving'
+        moving = self.engine.tick(.1)
+        self.assertEqual((moving['status'], moving['phase']), ('moving', 'reroute_moving'))
+        Workflow.created[0].current.pop('reroute_motion')
+        self.assertEqual(self.engine.tick(.1)['status'], 'unknown')
+
     def finish_pickup(self):
         self.robot.executor.state = {'status': 'stopped', 'current_node': 'P',
             'pose': {'x': 1000, 'y': 0, 'th': 0},
@@ -184,6 +195,21 @@ class ProductControlTests(unittest.TestCase):
         self.assertTrue(self.ack(place))
         self.assertEqual((self.engine.snapshot()['status'], self.engine.snapshot()['phase']),
                          ('completed', 'done'))
+
+    def test_completed_reroute_guard_follows_each_handoff(self):
+        self.product_order()
+        pickup_guard, delivery_guard = object(), object()
+        Workflow.created[0].reroute_handoff_guard = pickup_guard
+        grab = self.finish_pickup()['pending_action']
+        self.ack(grab)
+        self.assertIs(self.handoff.call_args.kwargs['reroute_guard'], pickup_guard)
+        Workflow.created[1].reroute_handoff_guard = delivery_guard
+        place = self.finish_delivery()['pending_action']
+        self.ack(place)
+        calls_before = list(self.runtime.calls)
+        self.engine.create_product_order('Blue', 'A', 'D', 'SHELF_BLUE', 0)
+        self.assertIs(self.handoff.call_args.kwargs['reroute_guard'], delivery_guard)
+        self.assertEqual(self.runtime.calls, calls_before)
 
     def test_next_product_refreshes_proof_and_atomically_hands_off_previous_stop(self):
         self.product_order()

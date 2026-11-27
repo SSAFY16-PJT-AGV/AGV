@@ -618,6 +618,7 @@ HTML_PAGE = r'''<!doctype html>
     unknown: '결과 확인 불가', failed: '작업 실패', error: '오류'};
   const phases = {idle: '대기 중', pending: '경로 준비 중', to_pickup: '출발지로 이동',
     pickup: '출발지 도착', to_destination: '도착지로 이동', completed: '가상 도착', done: '가상 도착',
+    reroute_wait: '우회 경로 확인 중', reroute_moving: '우회 경로 이동 중',
     waiting_reservation: '구간 예약 대기', reservation_wait: '구간 예약 대기',
     waiting_grab: '집기 확인 중', waiting_place: '적재 확인 중', unknown: '결과 확인 불가',
     arrived: '가상 도착', failed: '처리 실패', connection_lost: '연결 끊김'};
@@ -931,10 +932,15 @@ HTML_PAGE = r'''<!doctype html>
       const shelfLifetime = document.getElementById('team-shelf-lifetime');
       shelfLifetime.hidden = data.team_shelf_mode !== true;
       if (data.team_shelf_mode === true) {
-        shelfLifetime.textContent = data.state_persistence === 'durable' &&
-          data.restart_recovery === true && data.restart_recovery_scope === 'completed_only'
-          ? '완료된 팀 선반 주문과 재고는 같은 Unreal 세계에서 확인 후 복원됩니다. 진행 중이거나 결과가 불명인 작업은 차단됩니다.'
-          : '팀 선반 주문과 재고는 이번 시연 중에만 확인할 수 있습니다. 서버 재시작 후 작업을 자동 복구하지 않으며, 기존 Unreal 세계를 다시 사용하지 않습니다.';
+        if (data.state_persistence === 'durable' && data.restart_recovery === true &&
+            data.restart_recovery_scope === 'completed_except_rerouted_handoffs') {
+          shelfLifetime.textContent = '완료된 주문은 같은 Unreal 세계에서 확인 후 복원합니다. 우회 인계가 기록된 작업은 서버 재시작 시 자동 복구가 차단됩니다.';
+        } else if (data.state_persistence === 'durable' && data.restart_recovery === true &&
+                   data.restart_recovery_scope === 'completed_only') {
+          shelfLifetime.textContent = '완료된 팀 선반 주문과 재고는 같은 Unreal 세계에서 확인 후 복원됩니다. 진행 중이거나 결과가 불명인 작업은 차단됩니다.';
+        } else {
+          shelfLifetime.textContent = '팀 선반 주문과 재고는 이번 시연 중에만 확인할 수 있습니다. 서버 재시작 후 작업을 자동 복구하지 않으며, 기존 Unreal 세계를 다시 사용하지 않습니다.';
+        }
       }
       document.getElementById('synthetic-replenishment').hidden =
         data.team_shelf_mode !== true || data.synthetic_replenishment_available !== true;

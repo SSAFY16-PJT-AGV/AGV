@@ -84,6 +84,17 @@ class OrderDemoLauncherTests(unittest.TestCase):
                     patch('builtins.print'):
                 tool.run(map_file, broker_deps=deps, state_dir=root / 'state', field_config=config_file)
             self.assertEqual(popen.call_args_list[1].kwargs['env']['AGV_ORDER_FIELD_CONFIG'], str(config_file.resolve()))
+            self.assertNotIn('AGV_ORDER_AUTO_REROUTE', popen.call_args_list[1].kwargs['env'])
+            with patch.object(tool, '_select_broker_port', return_value=18832), \
+                    patch.object(tool, 'wait_for_ready_log'), patch.object(tool, 'wait_for_demo'), \
+                    patch.object(tool.subprocess, 'Popen', side_effect=[broker, server]) as popen, \
+                    patch.object(tool, 'stop_process'), patch.object(tool.time, 'sleep', side_effect=KeyboardInterrupt), \
+                    patch('builtins.print'):
+                tool.run(map_file, broker_deps=deps, state_dir=root / 'state', field_config=config_file,
+                         auto_reroute_sim=True)
+            self.assertEqual(popen.call_args_list[1].kwargs['env']['AGV_ORDER_AUTO_REROUTE'], '1')
+            with self.assertRaisesRegex(ValueError, 'explicit field config'):
+                tool.run(map_file, broker_deps=deps, state_dir=root / 'state', auto_reroute_sim=True)
             config['field_map_sha256'] = '0' * 64
             config_file.write_text(json.dumps(config), encoding='utf-8')
             with self.assertRaises(ValueError):

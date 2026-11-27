@@ -486,6 +486,10 @@ class DemoRuntime:
             result['synthetic_replenishment_available'] = True
         if self._action_source == 'synthetic':
             result['action_source'] = 'synthetic'
+        if getattr(self, 'auto_reroute_sim', False):
+            result['automatic_reroute'] = 'isolated_simulation'
+            if result.get('restart_recovery'):
+                result['restart_recovery_scope'] = 'completed_except_rerouted_handoffs'
         if self.journal is not None:
             result['recovery_required'] = self._restart_blocked or not self._world_ready.is_set()
         if stale or not result['connected'] or not result['unreal_connected']:
@@ -804,6 +808,10 @@ async def lifespan(app):
             or any(os.environ.get(key) for key in ('MQTT_USERNAME', 'MQTT_PASSWORD', 'MQTT_TLS_CA'))):
         raise RuntimeError('explicit isolated local demo configuration required')
     action_source = os.environ.get('AGV_ORDER_ACTION_SOURCE', 'unreal')
+    auto_reroute = os.environ.get('AGV_ORDER_AUTO_REROUTE', '')
+    if auto_reroute not in ('', '1'):
+        raise ValueError('invalid isolated reroute option')
+    auto_reroute = auto_reroute == '1'
     team_shelves = os.environ.get('AGV_ORDER_TEAM_SHELVES') == '1'
     if team_shelves and (action_source != 'unreal'
             or not os.environ.get('AGV_ORDER_FIELD_CONFIG')
@@ -833,6 +841,8 @@ async def lifespan(app):
         else:
             from server.field_twin_mapping import load_field_twin_mapping
             field_map, field_mapping = load_field_twin_mapping(os.environ['AGV_ORDER_FIELD_CONFIG'], map_data)
+    if auto_reroute and field_mapping is None:
+        raise ValueError('automatic reroute requires the explicit isolated field fleet')
     products = field_mapping.products if field_mapping is not None else PRODUCTS
     node_map = field_map if field_mapping is not None else map_data
     nodes = [{'id': node['id'], 'type': node.get('type', '')} for node in node_map['nodes']]
@@ -962,6 +972,7 @@ async def lifespan(app):
                 sessions[robot_id] = {task: session_names[robot_id] for task in task_ids}
             runtime = SimRuntime(db_path, sim_map, sessions, port=port,
                                  client_id='web-order-workflow', simulation_store=store,
+                                 reroute_transitions=auto_reroute,
                                  **({'field_simulation': True, 'field_initial_positions': starts}
                                     if field_mapping is not None else {}))
             runtime.start()
@@ -1015,6 +1026,13 @@ async def lifespan(app):
                 cleanup.callback(robot.stop)
             if field_mapping is not None:
                 runtime.bind_reroute_simulators({robot_id: item.robot for robot_id, item in engines.items()})
+            if auto_reroute:
+                from server.sim_reroute_automatic import SimRerouteAutoSession
+                for robot_id, engine in engines.items():
+                    session = SimRerouteAutoSession(runtime, engine.robot, session_names[robot_id],
+                                                     key=secrets.token_bytes(32), simulation_enabled=True).start()
+                    cleanup.callback(session.stop)
+                    engine.reroute_session = session
             if team_shelves:
                 from server.team_shelf_order_slots import TeamShelfOrderSlots
                 from server.team_shelf_web_adapter import TeamShelfSimInventory
@@ -1079,6 +1097,7 @@ async def lifespan(app):
                            field_mapping=field_mapping, products=products, action_source=action_source,
                            map_runtime=runtime)
         demo.team_shelves = team_shelves
+        demo.auto_reroute_sim = auto_reroute
         if team_shelves:
             from server.team_shelf_web_adapter import TeamShelfActionSession
             def confirmed_arrival(request_id, agv_id, action, node):

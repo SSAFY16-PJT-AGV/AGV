@@ -26,7 +26,7 @@ class ProductControlEngine:
 
     def __init__(self, runtime, robot, sim_map, product_lookup, *,
                  robot_id='sim-r1', twin_id='AGV_01', session='demo-session', task_prefix='web',
-                 wait_for_reservation=False, defer_delivery_handoff=False):
+                 wait_for_reservation=False, defer_delivery_handoff=False, reroute_session=None):
         if not isinstance(product_lookup, dict) or not product_lookup:
             raise ValueError('explicit simulated product mapping required')
         for name, value in (('robot_id', robot_id), ('twin_id', twin_id),
@@ -43,6 +43,7 @@ class ProductControlEngine:
             raise ValueError('deferred handoff must be explicit')
         self.defer_delivery_handoff = defer_delivery_handoff
         self.runtime, self.robot = runtime, robot
+        self.reroute_session = reroute_session
         self.map = copy.deepcopy(sim_map)
         self.graph = MapGraph(self.map)
         self.positions = {node['id']: tuple(node['pos']) for node in self.map['nodes']}
@@ -256,26 +257,29 @@ class ProductControlEngine:
                 options = {}
                 if previous is not None:
                     source, stop, evidence, ack = previous
-                    challenge = self.runtime.begin(source, self.SESSION)['challenge']
-                    if not isinstance(challenge, str) or not challenge:
-                        raise ValueError('fresh simulated challenge unavailable')
-                    proof = self.runtime.complete(source, self.SESSION, challenge, self.ROBOT,
-                                                  source, evidence['seq'], evidence['map_id'], stop,
-                                                  evidence['digest'], True)
-                    if not isinstance(proof, dict) or proof.get('reconciled') is not True:
-                        raise ValueError('fresh simulated proof unavailable')
+                    reroute_guard = getattr(self._delivery_workflow, 'reroute_handoff_guard', None)
+                    if reroute_guard is None:
+                        challenge = self.runtime.begin(source, self.SESSION)['challenge']
+                        if not isinstance(challenge, str) or not challenge:
+                            raise ValueError('fresh simulated challenge unavailable')
+                        proof = self.runtime.complete(source, self.SESSION, challenge, self.ROBOT,
+                                                      source, evidence['seq'], evidence['map_id'], stop,
+                                                      evidence['digest'], True)
+                        if not isinstance(proof, dict) or proof.get('reconciled') is not True:
+                            raise ValueError('fresh simulated proof unavailable')
                     adapter = SimHandoffCoordinatorStore(
                         self.runtime.store, target_task_id=self._pickup_task, source_task_id=source,
                         robot_id=self.ROBOT, robot_session=self.SESSION, seq=evidence['seq'],
                         stopped_at=stop, event_id=evidence['event_id'], action_ack=ack,
                         expected_twin_id=self.TWIN, gate=self.runtime.gate,
                         progress=self.runtime.progress, receiver=self.runtime.receiver,
-                        simulation_enabled=True)
+                        simulation_enabled=True, reroute_guard=reroute_guard)
                     options = {'accept_preceding': (source, stop), 'prepare_options': {'handoff_store': adapter}}
                 self._pickup_workflow = PickupWorkflow(
                     self.runtime, self.robot, self.map, self.products,
                     simulation_enabled=True, task_id=self._pickup_task, session=self.SESSION,
-                    robot_id=self.ROBOT, wait_for_reservation=self.wait_for_reservation, **options)
+                    robot_id=self.ROBOT, wait_for_reservation=self.wait_for_reservation,
+                    reroute_session=self.reroute_session, **options)
                 result = self._pickup_workflow.submit(product_type)
                 if result.get('status') == 'unknown':
                     self._mark_unknown()
@@ -414,6 +418,12 @@ class ProductControlEngine:
                     raise RuntimeError('simulated workflow outcome unknown')
                 if result.get('status') == 'waiting_reservation':
                     self._status, self._phase = 'waiting', 'reservation_wait'
+                elif result.get('status') == 'rerouting':
+                    motion = result.get('reroute_motion')
+                    if motion not in ('waiting', 'moving'):
+                        raise ValueError('virtual reroute motion state is unavailable')
+                    self._status = motion
+                    self._phase = 'reroute_moving' if motion == 'moving' else 'reroute_wait'
                 else:
                     self._status, self._phase = 'moving', 'to_pickup' if pickup else 'to_destination'
                 if result.get('status') == 'pickup_reached':
@@ -469,12 +479,14 @@ class ProductControlEngine:
                 robot_session=self.SESSION, seq=evidence['seq'], stopped_at=self._pickup,
                 event_id=evidence['event_id'], action_ack=ack, expected_twin_id=self.TWIN,
                 gate=self.runtime.gate, progress=self.runtime.progress,
-                receiver=self.runtime.receiver, simulation_enabled=True)
+                receiver=self.runtime.receiver, simulation_enabled=True,
+                reroute_guard=getattr(self._pickup_workflow, 'reroute_handoff_guard', None))
             products = {self._product: {'pickup_node': self._destination}}
             self._delivery_workflow = PickupWorkflow(
                 self.runtime, self.robot, self.map, products, simulation_enabled=True,
                 task_id=self._delivery_task, session=self.SESSION, robot_id=self.ROBOT,
                 wait_for_reservation=self.wait_for_reservation,
+                reroute_session=self.reroute_session,
                 action_at_end={'type': 'unload'}, accept_preceding=(self._pickup_task, self._pickup),
                 prepare_options={'handoff_store': adapter})
             result = self._delivery_workflow.submit(self._product)

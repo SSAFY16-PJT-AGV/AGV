@@ -96,7 +96,10 @@ def wait_for_demo(server, log_path, timeout=20):
 
 
 def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
-        state_dir=ROOT / 'data' / 'order-demo-state', field_config=None, synthetic=False, team_shelves=False):
+        state_dir=ROOT / 'data' / 'order-demo-state', field_config=None, synthetic=False, team_shelves=False,
+        auto_reroute_sim=False):
+    if type(auto_reroute_sim) is not bool or (auto_reroute_sim and field_config is None):
+        raise ValueError('automatic virtual reroute requires an explicit field config')
     if team_shelves and (synthetic or editor is None or project is None or field_config is None):
         raise ValueError('team shelf mode requires Unreal and field config')
     if synthetic and (editor is not None or project is not None):
@@ -121,6 +124,8 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
         server_env['AGV_ORDER_FIELD_CONFIG'] = str(field_config)
     if team_shelves:
         server_env['AGV_ORDER_TEAM_SHELVES'] = '1'
+    if auto_reroute_sim:
+        server_env['AGV_ORDER_AUTO_REROUTE'] = '1'
     if state_dir is not None:
         server_env['AGV_ORDER_PERSIST_DIR'] = str(Path(state_dir).resolve())
     if synthetic:
@@ -157,7 +162,7 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
                     print('Ctrl+C로 시연 서버와 브로커를 종료합니다. Unreal은 직접 닫으세요.', flush=True)
                     while True:
                         if server.poll() is not None:
-                            if synthetic or (team_shelves and state_dir is None):
+                            if synthetic or auto_reroute_sim or (team_shelves and state_dir is None):
                                 raise RuntimeError('가상 세계가 종료됐습니다. 이전 상태로 다시 시작할 수 없습니다')
                             print('시연 서버가 종료되어 저장된 상태로 재시작합니다.', flush=True)
                             server = subprocess.Popen([base_python, '-m', 'uvicorn', 'server.order_demo_app:app',
@@ -208,6 +213,8 @@ def main():
                         help='use a fresh in-process simulated world instead of Unreal')
     parser.add_argument('--team-shelves', action='store_true',
                         help='use the six-shelf Unreal demo; use --state-dir for durable state')
+    parser.add_argument('--auto-reroute-sim', action='store_true',
+                        help='enable bounded automatic reroute for isolated simulated robots (requires --field-config)')
     args = parser.parse_args()
     try:
         if args.synthetic and not args.state_dir:
@@ -215,7 +222,8 @@ def main():
         state_dir = args.state_dir if args.team_shelves else args.state_dir or ROOT / 'data' / (
             'field-order-demo-state' if args.field_config else 'order-demo-state')
         run(args.map, args.editor, args.project, args.ddc_path, args.broker_deps, state_dir,
-            field_config=args.field_config, synthetic=args.synthetic, team_shelves=args.team_shelves)
+            field_config=args.field_config, synthetic=args.synthetic, team_shelves=args.team_shelves,
+            auto_reroute_sim=args.auto_reroute_sim)
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         print('시연 실패: {}'.format(exc), file=sys.stderr)
         return 1
