@@ -123,7 +123,24 @@ def _v3_logical_overlap(data, edge, nodes):
     return True
 
 
-def plan_field_route(data, *, map_ref, incoming_edge, goal, blocked_resources=None):
+def validate_field_route(data, *, map_ref, incoming_edge, nodes, edge_ids):
+    """Validate an explicit simple virtual route without requiring shortest cost.
+
+    This proves only that its directions, crossing rules and spur geometry
+    match the map. It does not establish position, reserve resources or permit
+    movement. Repeated-node paths require a separate occurrence-aware proof.
+    """
+    if (not isinstance(nodes, (list, tuple)) or not 2 <= len(nodes) <= 256
+            or any(not isinstance(node, str) or not node for node in nodes)
+            or len(nodes) != len(set(nodes)) or not isinstance(edge_ids, (list, tuple))
+            or len(edge_ids) != len(nodes) - 1
+            or any(not isinstance(edge, str) or not edge for edge in edge_ids)):
+        raise ValueError('explicit simple field nodes and edge IDs required')
+    return plan_field_route(data, map_ref=map_ref, incoming_edge=incoming_edge, goal=nodes[-1],
+                            _exact_route=(tuple(nodes), tuple(edge_ids)))
+
+
+def plan_field_route(data, *, map_ref, incoming_edge, goal, blocked_resources=None, _exact_route=None):
     """Compute a candidate path from the end of a known directed entry edge.
 
     Costs use team NavMap's edge-length precedence and 500 mm U-turn cost.
@@ -325,6 +342,74 @@ def plan_field_route(data, *, map_ref, incoming_edge, goal, blocked_resources=No
             if incoming_reverse is not None and outgoing_reverse is not None:
                 mapping[incoming_reverse] = outgoing_reverse
         crossing[node_id] = mapping
+
+    if _exact_route is not None:
+        # The direction planner normally finds the shortest candidate. A
+        # reserved reroute can be a longer legal path, so check its exact edge
+        # sequence using the same compiled crossing and U-turn rules without
+        # silently substituting the default shortest path.
+        if (not isinstance(_exact_route, tuple) or len(_exact_route) != 2
+                or not isinstance(_exact_route[0], tuple) or not isinstance(_exact_route[1], tuple)):
+            raise ValueError('invalid explicit route witness')
+        selected_nodes, selected_edges = _exact_route
+        if (not 2 <= len(selected_nodes) <= 256 or len(selected_edges) != len(selected_nodes) - 1
+                or any(not isinstance(node, str) or not node for node in selected_nodes)
+                or len(set(selected_nodes)) != len(selected_nodes)
+                or any(not isinstance(edge, str) or not edge for edge in selected_edges)):
+            raise ValueError('invalid explicit route witness')
+        if selected_nodes[0] != start or selected_nodes[-1] != goal:
+            raise ValueError('explicit route endpoints do not match')
+        offset, current, total = 0, incoming_edge, 0.0
+        if start_spur is not None:
+            parent, end, length, _inward, outward = spurs[start_spur]
+            if (selected_nodes[:2] != (end, parent) or selected_edges[0] != outward
+                    or not resource_allows(end, parent)):
+                raise ValueError('explicit route has an invalid spur exit')
+            offset, current, total = 1, None, length
+        last_main = len(selected_edges) - (1 if goal_spur is not None else 0)
+        while offset < last_main:
+            eid = selected_edges[offset]
+            if eid not in arcs:
+                raise ValueError('explicit route contains an unknown main arc')
+            source, target, _direction, cost, _reverse = arcs[eid]
+            if (source != selected_nodes[offset] or target != selected_nodes[offset + 1]
+                    or not resource_allows(source, target)):
+                raise ValueError('explicit route arc does not match its nodes')
+            if current is None:
+                if eid not in outs[source]:
+                    raise ValueError('explicit route cannot leave the spur parent')
+                turn_cost = 0.0
+            else:
+                if current not in arcs or arcs[current][1] != source:
+                    raise ValueError('explicit incoming direction does not match')
+                _previous_source, _previous_target, direction, _cost, reverse = arcs[current]
+                allowed = [arc for arc in outs[source] if arcs[arc][2] == direction]
+                if source in crossing:
+                    match = crossing[source].get(current)
+                    allowed = [arc for arc in allowed if arc == match]
+                node = nodes[source]
+                can_uturn = node.get('uturn')
+                if can_uturn is None:
+                    kind = _kind(node)
+                    can_uturn = (kind == 'patch' and not node.get('crossing')) or kind == 'spur_end'
+                if reverse is not None and can_uturn:
+                    allowed.append(reverse)
+                if eid not in allowed:
+                    raise ValueError('explicit route violates a crossing or U-turn rule')
+                turn_cost = _UTURN_MM if eid == reverse else 0.0
+            total += cost + turn_cost
+            if not math.isfinite(total):
+                raise ValueError('explicit route cost must be finite')
+            current, offset = eid, offset + 1
+        if goal_spur is not None:
+            parent, end, length, inward, _outward = spurs[goal_spur]
+            if (offset != len(selected_edges) - 1 or selected_nodes[offset:] != (parent, end)
+                    or selected_edges[offset] != inward or not resource_allows(parent, end)):
+                raise ValueError('explicit route has an invalid spur entry')
+            total += length
+        elif offset != len(selected_edges):
+            raise ValueError('explicit route contains unexpected edges')
+        return FieldRoute(expected_ref, incoming_edge, selected_nodes, selected_edges, total)
 
     if start_spur is not None and goal == spurs[start_spur][1]:
         # Validate the entire map even when already parked at the goal.
