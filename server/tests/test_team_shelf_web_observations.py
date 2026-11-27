@@ -50,3 +50,12 @@ class TeamShelfObservationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)['request_id'], 'internal-1')
         self.assertEqual((await request('GET', '/order-demo/api/orders/missing'))[0], 404)
+
+    async def test_blocked_persistent_recovery_does_not_present_slots_as_known(self):
+        app.state.demo.journal = object()
+        app.state.demo._restart_blocked = True
+        code, body = await request('GET', '/order-demo/api/inventory')
+        self.assertEqual(code, 200)
+        inventory = json.loads(body)
+        self.assertFalse(inventory['fresh'])
+        self.assertTrue(all(cell is None for row in inventory['shelves'].values() for cell in row['slots']))

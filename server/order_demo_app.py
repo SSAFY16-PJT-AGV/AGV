@@ -3,7 +3,7 @@
 This process publishes simulated observations, never physical robot commands.
 Launch it via the isolated demo launcher, not the production server.
 """
-from contextlib import asynccontextmanager, ExitStack, nullcontext
+from contextlib import asynccontextmanager, ExitStack, nullcontext, closing
 import copy
 import hashlib
 import json
@@ -307,7 +307,17 @@ class DemoRuntime:
                     inventory = self.engine.inventory
                     if not inventory.can_reserve(product['shelf_id'], product['product_type']):
                         raise ShelfFull('no confirmed empty simulated shelf slot')
-                    if (state.get('accepting_orders') is True
+                    pickup_ready = True
+                    if getattr(self, 'team_shelves', False):
+                        from server.team_shelf_pickup_gate import pickup_is_clear
+                        try:
+                            zones = {zone['id'] for zone in self.map_runtime.map_data['zones']
+                                     if zone.get('type') == 'shared'
+                                     and set(zone.get('nodes', ())) & {'D01', 'N01'}}
+                            pickup_ready = pickup_is_clear(inventory.store, self.map_runtime, zones)
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            pickup_ready = False
+                    if (pickup_ready and state.get('accepting_orders') is True
                             and self.engine.can_dispatch_destination(product['destination_node'])):
                         with self.actions.motion_guard() as owner_available:
                             if not owner_available or not self._ready():
@@ -408,6 +418,15 @@ class DemoRuntime:
                 self.journal.mark_unknown(order['request_id'], 'simulated order identity changed')
                 self._restart_blocked = True
             elif robot.get('status') == 'completed':
+                if getattr(self, 'team_shelves', False):
+                    try:
+                        slot = self.engine.inventory.store.get(order['request_id'])
+                        if slot['state'] != 'completed':
+                            raise ValueError('team slot result is not committed')
+                    except Exception:
+                        self.journal.mark_unknown(order['request_id'], 'team slot result is unavailable')
+                        self._restart_blocked = True
+                        continue
                 checkpoint = self.engine.engines[result['assigned_robot']].export_completed_checkpoint()
                 observation = {key: robot.get(key) for key in ('status', 'phase', 'current_node')}
                 self.journal.mark_completed(order['request_id'], {'checkpoint': checkpoint,
@@ -456,8 +475,10 @@ class DemoRuntime:
         result['unreal_connected'] = not stale and self.actions.available_fast()
         if getattr(self, 'team_shelves', False):
             result['team_shelf_mode'] = True
-            result['state_persistence'] = 'process_only'
-            result['restart_recovery'] = False
+            result['state_persistence'] = 'durable' if self.journal is not None else 'process_only'
+            result['restart_recovery'] = self.journal is not None
+            result['restart_recovery_scope'] = 'completed_only' if self.journal is not None else 'none'
+            result['synthetic_replenishment_available'] = self.journal is None
         if self._action_source == 'synthetic':
             result['action_source'] = 'synthetic'
         if self.journal is not None:
@@ -531,6 +552,15 @@ class DemoRuntime:
         if not any(item['id'] == product_id for item in self.products):
             raise ValueError('unknown product')
         if self.journal is not None:
+            if getattr(self, 'team_shelves', False) and self._restart_blocked:
+                if request_key is not None:
+                    try:
+                        original = self.admission.get_by_key(request_key)
+                    except (KeyError, ValueError):
+                        pass
+                    else:
+                        return {'status': 'unknown', 'request_id': original['request_id']}
+                raise AdmissionStopped('simulated recovery requires investigation')
             return self.admission.submit_product(product_id, request_key)
         if self._fleet_mode:
             # Capture the owner without waiting for the potentially slow
@@ -770,11 +800,11 @@ async def lifespan(app):
         raise RuntimeError('explicit isolated local demo configuration required')
     action_source = os.environ.get('AGV_ORDER_ACTION_SOURCE', 'unreal')
     team_shelves = os.environ.get('AGV_ORDER_TEAM_SHELVES') == '1'
-    if team_shelves and (action_source != 'unreal' or os.environ.get('AGV_ORDER_PERSIST_DIR')
+    if team_shelves and (action_source != 'unreal'
             or not os.environ.get('AGV_ORDER_FIELD_CONFIG')
             or any(os.environ.get(key) != '1' for key in
                    ('AGV_ORDER_COORDINATED', 'AGV_ORDER_FLEET', 'AGV_ORDER_SHELF_SYNC'))):
-        raise ValueError('team shelf demo requires a fresh nonpersistent Unreal fleet and v3 field mapping')
+        raise ValueError('team shelf demo requires an Unreal fleet and v3 field mapping')
     if action_source not in ('unreal', 'synthetic'):
         raise ValueError('invalid simulated action source')
     if action_source == 'synthetic' and (not os.environ.get('AGV_ORDER_PERSIST_DIR')
@@ -804,6 +834,7 @@ async def lifespan(app):
     with ExitStack() as cleanup:
         journal = None
         pickup_store = None
+        slot_store = None
         runtime = None
         recovery_blocked = False
         if os.environ.get('AGV_ORDER_COORDINATED') == '1':
@@ -842,35 +873,56 @@ async def lifespan(app):
                                                          allow_nan=False).encode('utf-8')).hexdigest())
                 journal = PersistentOrderStore(folder / 'orders.sqlite3', fingerprint, products,
                                                action_source=action_source)
-                from server.order_pickup_inventory import PickupInventory
-                pickup_path = folder / 'pickup-inventory.sqlite3'
-                pickup_sources = {item['pickup_node']: item['product_type'] for item in products}
-                if journal.pickup_id is not None:
-                    pickup_store = PickupInventory.open_existing(pickup_path, pickup_sources,
-                                                                 expected_creation_id=journal.pickup_id)
-                elif pickup_path.exists() or journal.simulation_id is not None:
-                    raise RuntimeError('unbound pickup inventory requires manual recovery')
+                if team_shelves:
+                    from server.team_shelf_order_slots import TeamShelfOrderSlots
+                    from server.team_shelf_persistent_orders import TeamShelfPersistentOrders
+                    slot_path = folder / 'team-slots.sqlite3'
+                    if journal.pickup_id is not None:
+                        slot_store = TeamShelfOrderSlots.open_existing(slot_path,
+                            expected_creation_id=journal.pickup_id)
+                    elif slot_path.exists() or journal.simulation_id is not None:
+                        raise RuntimeError('unbound team slot inventory requires manual recovery')
+                    else:
+                        slot_store = TeamShelfOrderSlots.create_new(slot_path)
+                    journal = TeamShelfPersistentOrders(folder / 'orders.sqlite3', fingerprint, products, slot_store)
                 else:
-                    pickup_store = PickupInventory.create_new(pickup_path, pickup_sources,
-                                                              action_source=action_source)
-                    journal.bind_pickup_id(pickup_store.creation_id)
+                    from server.order_pickup_inventory import PickupInventory
+                    pickup_path = folder / 'pickup-inventory.sqlite3'
+                    pickup_sources = {item['pickup_node']: item['product_type'] for item in products}
+                    if journal.pickup_id is not None:
+                        pickup_store = PickupInventory.open_existing(pickup_path, pickup_sources,
+                                                                     expected_creation_id=journal.pickup_id)
+                    elif pickup_path.exists() or journal.simulation_id is not None:
+                        raise RuntimeError('unbound pickup inventory requires manual recovery')
+                    else:
+                        pickup_store = PickupInventory.create_new(pickup_path, pickup_sources,
+                                                                  action_source=action_source)
+                        journal.bind_pickup_id(pickup_store.creation_id)
                 journal.recover_interrupted()
                 saved_orders = journal.list_orders()
                 recovery_blocked = any(row['state'] == 'unknown' for row in saved_orders)
-                saved_pickups = pickup_store.snapshot()['reservations']
-                pickup_by_request = {item['request_id']: item for item in saved_pickups}
-                order_by_request = {item['request_id']: item for item in saved_orders}
-                for row in saved_orders:
-                    reservation = pickup_by_request.get(row['request_id'])
-                    if row['state'] == 'queued' and reservation and reservation['state'] != 'reserved':
+                if team_shelves:
+                    from server.team_shelf_persistent_orders import check_recovered_team_orders
+                    try:
+                        recovery_blocked |= not check_recovered_team_orders(journal, slot_store)
+                    except ValueError:
                         recovery_blocked = True
-                    if row['state'] == 'completed':
-                        result = row.get('result') or {}
-                        if (not reservation or reservation['state'] != 'consumed'
-                                or reservation['reservation_id'] != result.get('pickup_reservation_id')):
+                        logging.getLogger(__name__).exception('saved team order and slot histories differ')
+                else:
+                    saved_pickups = pickup_store.snapshot()['reservations']
+                    pickup_by_request = {item['request_id']: item for item in saved_pickups}
+                    order_by_request = {item['request_id']: item for item in saved_orders}
+                    for row in saved_orders:
+                        reservation = pickup_by_request.get(row['request_id'])
+                        if row['state'] == 'queued' and reservation and reservation['state'] != 'reserved':
                             recovery_blocked = True
-                if any(item['request_id'] not in order_by_request for item in saved_pickups):
-                    recovery_blocked = True
+                        if row['state'] == 'completed':
+                            result = row.get('result') or {}
+                            if (not reservation or reservation['state'] != 'consumed'
+                                    or reservation['reservation_id'] != result.get('pickup_reservation_id')):
+                                recovery_blocked = True
+                    if any(item['request_id'] not in order_by_request for item in saved_pickups):
+                        recovery_blocked = True
                 db_path = folder / 'simulation.sqlite3'
             else:
                 folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='agv-web-workflow-')))
@@ -909,6 +961,22 @@ async def lifespan(app):
                                     if field_mapping is not None else {}))
             runtime.start()
             cleanup.callback(runtime.stop)
+            if team_shelves and journal is not None:
+                from server.team_shelf_persistent_orders import check_completed_action_bindings
+                def saved_grab_ack(checkpoint):
+                    with closing(runtime.store._connect()) as db:
+                        row = db.execute('SELECT target_task_id,robot_id,robot_session,ack_json '
+                                         'FROM sim_handoff_transfers WHERE source_task_id=?',
+                                         (checkpoint['pickup_task'],)).fetchone()
+                    if (row is None or row[:3] != (checkpoint['delivery_task'], checkpoint['robot_id'],
+                                                  checkpoint['session'])):
+                        raise ValueError('saved simulated handoff differs')
+                    return json.loads(row[3])
+                try:
+                    check_completed_action_bindings(journal, slot_store, saved_grab_ack)
+                except (ValueError, KeyError, TypeError, OSError):
+                    recovery_blocked = True
+                    logging.getLogger(__name__).exception('saved team action bindings differ')
             map_id = '{}@v{}'.format(sim_map['map_id'], sim_map['version'])
             product_lookup = {item['product_type']: dict(item) for item in products}
             engines = {}
@@ -946,25 +1014,50 @@ async def lifespan(app):
                 from server.team_shelf_order_slots import TeamShelfOrderSlots
                 from server.team_shelf_web_adapter import TeamShelfSimInventory
                 from server.team_shelf_world_registry import TeamShelfWorldRegistry
-                slot_store = TeamShelfOrderSlots.create_new(folder / 'team-slots.sqlite3')
+                if slot_store is None:
+                    slot_store = TeamShelfOrderSlots.create_new(folder / 'team-slots.sqlite3')
                 registry_path = Path(os.environ.get('AGV_ORDER_TEAM_WORLD_REGISTRY',
                     str(Path(__file__).resolve().parents[1] / '.venv' / 'team-shelf-worlds.sqlite3')))
                 registry = TeamShelfWorldRegistry(registry_path)
                 def validate_initial_world(data):
+                    if journal is not None and journal.world_id is not None:
+                        from server.team_shelf_persistent_orders import check_recovered_team_snapshot
+                        if journal.world_id != data['world_id'].lower():
+                            return False
+                        check_recovered_team_snapshot(slot_store, data['world_id'], data['slots'])
                     observed = {item['agv_id']: item for item in data['robots']}
+                    mismatch = False
                     for item in engines.values():
                         seen = observed.get(item.TWIN)
                         state = item.snapshot()
                         if (not isinstance(seen, dict) or seen['carrying'] or seen['interpolating']
-                                or state['status'] != 'idle' or state['pose'] is None):
+                                or state['status'] not in ('idle', 'completed') or state['pose'] is None):
                             return False
                         expected = field_mapping.pose(state['pose'])
                         if (math.hypot(seen['x'] - expected['x'], seen['y'] - expected['y']) > .05
                                 or abs((seen['yaw'] - expected['yaw'] + 180.) % 360. - 180.) > 1.):
+                            mismatch = True
+                    if mismatch:
+                        pristine = (journal is not None and journal.world_id is None
+                                    and not journal.list_orders() and not slot_store.inspect()['orders']
+                                    and all(item.snapshot()['status'] == 'idle' for item in engines.values()))
+                        if not pristine:
                             return False
+                        demo._team_bootstrap_needed = True
+                    else:
+                        demo._team_bootstrap_needed = False
                     return True
+                def validate_team_refresh(data):
+                    return not getattr(demo, '_bootstrap_pending', False) or validate_initial_world(data)
+                def claim_team_world(world):
+                    if journal is None:
+                        registry.claim(world)
+                    else:
+                        previous = journal.world_id
+                        registry.claim_persistent(world, slot_store.creation_id, resume=previous is not None)
+                        journal.bind_world_id(world)
                 inventory = TeamShelfSimInventory(slot_store, validate_initial=validate_initial_world,
-                                                  claim_world=registry.claim)
+                                                  validate_refresh=validate_team_refresh, claim_world=claim_team_world)
             else:
                 inventory = (ShelfInventory({item['shelf_id']: item['product_type'] for item in products}, store=journal)
                              if fleet_enabled and os.environ.get('AGV_ORDER_SHELF_SYNC') == '1' else None)
@@ -999,11 +1092,21 @@ async def lifespan(app):
                     return False
                 item._validate_finished(evidence, task, node)
                 return True
+            def accept_team_world():
+                if getattr(demo, '_team_bootstrap_needed', False):
+                    demo._bootstrap_pending = True
+                else:
+                    demo._bootstrap_pending = False
+                    demo._world_ready.set()
             demo.actions = TeamShelfActionSession(engine, demo.lock, inventory,
                 arrival_guard=confirmed_arrival, can_dispatch=demo._ready,
-                on_change=demo._invalidate_snapshot, pause_on_unavailable=True)
-            from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
-            demo.synthetic_replenishment = SyntheticReplenishment(demo)
+                on_change=demo._invalidate_snapshot, pause_on_unavailable=True,
+                can_send_state=demo._may_send_state if journal else None,
+                on_snapshot=accept_team_world if journal else None,
+                on_invalidate=demo._invalidate_world if journal else None)
+            if journal is None:
+                from server.team_shelf_synthetic_replenishment import SyntheticReplenishment
+                demo.synthetic_replenishment = SyntheticReplenishment(demo)
         app.state.mqtt_service = service
         try:
             demo.start()
@@ -1122,18 +1225,36 @@ def _public_order(row):
                 error=row.get('error'))
 
 
+def _team_recovery_unverified(demo):
+    return bool(getattr(demo, 'team_shelves', False) and getattr(demo, '_restart_blocked', False))
+
+
+def _safe_order(demo, row):
+    result = _public_order(row)
+    if _team_recovery_unverified(demo):
+        result['status'] = 'unknown'
+    return result
+
+
+def _safe_submission(demo, result):
+    if _team_recovery_unverified(demo):
+        return {'status': 'unknown', 'request_id': result['request_id']}
+    return result
+
+
 def _team_shelf_observation(demo):
     from server.team_shelf_web_adapter import TeamShelfSimInventory
     inventory = getattr(getattr(demo, 'engine', None), 'inventory', None)
     if not getattr(demo, 'team_shelves', False) or type(inventory) is not TeamShelfSimInventory:
         return None
     data = inventory.store.inspect()
+    blocked = getattr(demo, '_restart_blocked', False) is True
     claims = {row['slot_id'] for row in data['claims']}
     shelves = {}
     for row in data['slots']:
         shelf = shelves.setdefault(row['shelf_id'], {'slots': [], 'products': [], 'claimed': []})
-        shelf['slots'].append({'empty': False, 'occupied': True, 'unknown': None}[row['state']])
-        shelf['products'].append(row['product_type'])
+        shelf['slots'].append(None if blocked else {'empty': False, 'occupied': True, 'unknown': None}[row['state']])
+        shelf['products'].append(None if blocked else row['product_type'])
         if row['slot_id'] in claims:
             shelf['claimed'].append(row['slot_index'])
     labels = {'reserved': 'active', 'picking': 'active', 'carried': 'active', 'placing': 'active',
@@ -1141,7 +1262,8 @@ def _team_shelf_observation(demo):
     orders = [{'request_id': row['request_id'], 'product_id': row['product_type'],
                'status': labels[row['state']], 'shelf_id': row['destination_shelf'],
                'slot_index': (row['destination_slot_id'] - 1) % 4} for row in data['orders']]
-    return {'scope': 'team_shelf_process_only', 'fresh': bool(inventory.ready and demo.actions.available_fast()),
+    return {'scope': 'team_shelf_persistent' if getattr(demo, 'journal', None) is not None else 'team_shelf_process_only',
+            'fresh': bool(not blocked and inventory.ready and demo.actions.available_fast()),
             'shelves': shelves, 'orders': orders}
 
 
@@ -1157,12 +1279,15 @@ def order_history(request: Request):
         if team is not None:
             return {'scope': team['scope'], 'orders': team['orders']}
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
-    return {'orders': [_public_order(row) for row in journal.list_orders()]}
+    return {'orders': [_safe_order(demo, row) for row in journal.list_orders()]}
 
 
 @app.get('/order-demo/api/metrics')
 def metrics(request: Request):
-    journal = getattr(_demo(request), 'journal', None)
+    demo = _demo(request)
+    if _team_recovery_unverified(demo):
+        raise HTTPException(503, '가상 작업 복구 확인이 필요합니다', headers={'Cache-Control': 'no-store'})
+    journal = getattr(demo, 'journal', None)
     if journal is None:
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다',
                             headers={'Cache-Control': 'no-store'})
@@ -1190,7 +1315,7 @@ def order_status(request_id: str, request: Request):
             raise HTTPException(404, '주문을 찾을 수 없습니다')
         raise HTTPException(404, '영속 저장이 활성화되지 않았습니다')
     try:
-        return _public_order(journal.get_order(request_id))
+        return _safe_order(demo, journal.get_order(request_id))
     except (KeyError, ValueError):
         raise HTTPException(404, '주문을 찾을 수 없습니다') from None
 
@@ -1199,7 +1324,7 @@ def order_status(request_id: str, request: Request):
 def inventory_status(request: Request):
     demo = _demo(request)
     journal = getattr(demo, 'journal', None)
-    if journal is None:
+    if journal is None or getattr(demo, 'team_shelves', False):
         try:
             team = _team_shelf_observation(demo)
         except Exception:
@@ -1219,7 +1344,7 @@ def inventory_status(request: Request):
 def submission(request_id: str, request: Request):
     demo = _demo(request)
     try:
-        return demo.admission.get(request_id)
+        return _safe_submission(demo, demo.admission.get(request_id))
     except (KeyError, ValueError):
         raise HTTPException(404, '요청을 찾을 수 없습니다') from None
 
@@ -1232,7 +1357,7 @@ def submission_lookup(request: Request):
     if len(values) != 1:
         raise HTTPException(422, '요청 키가 필요합니다', headers={'Cache-Control': 'no-store'})
     try:
-        result = demo.admission.get_by_key(values[0])
+        result = _safe_submission(demo, demo.admission.get_by_key(values[0]))
     except (KeyError, ValueError):
         raise HTTPException(404, '요청을 확인할 수 없습니다', headers={'Cache-Control': 'no-store'}) from None
     return JSONResponse(result, headers={'Cache-Control': 'no-store'})

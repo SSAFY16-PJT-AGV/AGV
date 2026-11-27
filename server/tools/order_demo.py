@@ -97,8 +97,8 @@ def wait_for_demo(server, log_path, timeout=20):
 
 def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv' / 'broker-deps',
         state_dir=ROOT / 'data' / 'order-demo-state', field_config=None, synthetic=False, team_shelves=False):
-    if team_shelves and (synthetic or editor is None or project is None or field_config is None or state_dir is not None):
-        raise ValueError('team shelf mode requires Unreal, field config and no state directory')
+    if team_shelves and (synthetic or editor is None or project is None or field_config is None):
+        raise ValueError('team shelf mode requires Unreal and field config')
     if synthetic and (editor is not None or project is not None):
         raise ValueError('synthetic mode cannot be combined with Unreal')
     if synthetic and Path(state_dir).exists():
@@ -121,7 +121,7 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
         server_env['AGV_ORDER_FIELD_CONFIG'] = str(field_config)
     if team_shelves:
         server_env['AGV_ORDER_TEAM_SHELVES'] = '1'
-    else:
+    if state_dir is not None:
         server_env['AGV_ORDER_PERSIST_DIR'] = str(Path(state_dir).resolve())
     if synthetic:
         server_env['AGV_ORDER_ACTION_SOURCE'] = 'synthetic'
@@ -157,7 +157,7 @@ def run(map_path, editor=None, project=None, ddc=None, broker_deps=ROOT / '.venv
                     print('Ctrl+C로 시연 서버와 브로커를 종료합니다. Unreal은 직접 닫으세요.', flush=True)
                     while True:
                         if server.poll() is not None:
-                            if synthetic or team_shelves:
+                            if synthetic or (team_shelves and state_dir is None):
                                 raise RuntimeError('가상 세계가 종료됐습니다. 이전 상태로 다시 시작할 수 없습니다')
                             print('시연 서버가 종료되어 저장된 상태로 재시작합니다.', flush=True)
                             server = subprocess.Popen([base_python, '-m', 'uvicorn', 'server.order_demo_app:app',
@@ -207,7 +207,7 @@ def main():
     parser.add_argument('--synthetic', action='store_true',
                         help='use a fresh in-process simulated world instead of Unreal')
     parser.add_argument('--team-shelves', action='store_true',
-                        help='use the nonpersistent six-shelf Unreal demo; requires editor/project and v3 field config')
+                        help='use the six-shelf Unreal demo; use --state-dir for durable state')
     args = parser.parse_args()
     try:
         if args.synthetic and not args.state_dir:

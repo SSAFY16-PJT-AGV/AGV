@@ -928,8 +928,16 @@ HTML_PAGE = r'''<!doctype html>
       lastMapStatus=data;
       renderMapRobots(data);
       const synthetic = data.action_source === 'synthetic';
-      document.getElementById('team-shelf-lifetime').hidden = data.team_shelf_mode !== true;
-      document.getElementById('synthetic-replenishment').hidden = data.team_shelf_mode !== true;
+      const shelfLifetime = document.getElementById('team-shelf-lifetime');
+      shelfLifetime.hidden = data.team_shelf_mode !== true;
+      if (data.team_shelf_mode === true) {
+        shelfLifetime.textContent = data.state_persistence === 'durable' &&
+          data.restart_recovery === true && data.restart_recovery_scope === 'completed_only'
+          ? '완료된 팀 선반 주문과 재고는 같은 Unreal 세계에서 확인 후 복원됩니다. 진행 중이거나 결과가 불명인 작업은 차단됩니다.'
+          : '팀 선반 주문과 재고는 이번 시연 중에만 확인할 수 있습니다. 서버 재시작 후 작업을 자동 복구하지 않으며, 기존 Unreal 세계를 다시 사용하지 않습니다.';
+      }
+      document.getElementById('synthetic-replenishment').hidden =
+        data.team_shelf_mode !== true || data.synthetic_replenishment_available !== true;
       const timelineFresh = !stale && data.stale === false && data.connected === true && data.unreal_connected === true;
       document.getElementById('dashboard-source').textContent = synthetic ? '합성 세계 · 가상' : 'Unreal · 가상';
       const health = document.getElementById('dashboard-health');

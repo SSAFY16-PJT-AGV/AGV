@@ -16,17 +16,20 @@ from server.team_shelf_twin_protocol import TeamShelfTwinSession
 
 class TeamShelfSimInventory:
     """Adapt the 24-slot journal to the existing fleet inventory interface."""
-    def __init__(self, store, *, validate_initial=None, claim_world=None, clock=time.monotonic):
+    def __init__(self, store, *, validate_initial=None, validate_refresh=None, claim_world=None, clock=time.monotonic):
         if type(store) is not TeamShelfOrderSlots:
             raise ValueError('explicit team slot journal required')
         if validate_initial is not None and not callable(validate_initial):
             raise ValueError('initial world validator must be callable')
+        if validate_refresh is not None and not callable(validate_refresh):
+            raise ValueError('world refresh validator must be callable')
         if claim_world is not None and not callable(claim_world):
             raise ValueError('world claim must be callable')
         if not callable(clock):
             raise ValueError('monotonic snapshot clock required')
         self.store = store
         self.validate_initial = validate_initial
+        self.validate_refresh = validate_refresh
         self.claim_world = claim_world
         self.owner = self.session = self.world_id = self.fence = None
         self.pending = None
@@ -107,6 +110,8 @@ class TeamShelfSimInventory:
             self.fence = self.store.begin_snapshot(self.session)
         elif world != self.world_id:
             raise ValueError('Unreal world changed')
+        elif self.validate_refresh is not None and self.validate_refresh(data) is not True:
+            raise ValueError('refreshed Unreal world is not ready')
         self.store.apply_snapshot(self.session, data['slots'], fence=self.fence)
         if initial and self.claim_world is not None:
             try:
@@ -238,7 +243,9 @@ class TeamShelfActionSession(DemoActionSession):
                     self.team_twin = TeamShelfTwinSession(self.inventory.store, self.inventory.session,
                         self.inventory.world_id, client, self.arrival_guard, timeout=self.timeout_seconds)
                 output = self.team_twin.begin(request_id, action['agv_id'],
-                                              'pick' if action['action'] == 'grab' else 'place')
+                                              'pick' if action['action'] == 'grab' else 'place',
+                                              engine_binding={key: action[key] for key in
+                                                              ('order_id', 'action_id', 'agv_id')})
                 self.original_action = dict(action)
                 if not self._owner_available.is_set():
                     self._fail()
@@ -258,6 +265,8 @@ class TeamShelfActionSession(DemoActionSession):
                     return False
                 try:
                     accepted = self.inventory.apply_snapshot(client, message.get('data'))
+                    if accepted and self.on_snapshot is not None:
+                        self.on_snapshot()
                 except (TypeError, ValueError):
                     return False
                 self._shelf_request_id = self._shelf_requested_at = None

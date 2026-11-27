@@ -14,6 +14,30 @@ def sample_map():
 
 
 class OrderDemoLauncherTests(unittest.TestCase):
+    def test_team_shelves_explicit_state_directory_is_passed_to_server(self):
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as folder:
+            temp = Path(folder)
+            editor, project = temp / 'Editor.exe', temp / 'team.uproject'
+            editor.touch(); project.touch()
+            deps = temp / 'deps'
+            (deps / 'amqtt').mkdir(parents=True)
+            broker, server, unreal, restarted = (Mock(pid=i) for i in (101, 102, 103, 104))
+            broker.poll.return_value = None
+            server.poll.return_value = 1
+            restarted.poll.return_value = None
+            with patch.object(tool, '_select_broker_port', return_value=18832), \
+                    patch.object(tool, 'wait_for_ready_log'), patch.object(tool, 'wait_for_demo'), \
+                    patch.object(tool.subprocess, 'Popen', side_effect=[broker, server, unreal, restarted]) as popen, \
+                    patch.object(tool, 'stop_process'), patch.object(tool.time, 'sleep', side_effect=KeyboardInterrupt), \
+                    patch('builtins.print'):
+                tool.run(root / 'server/examples/mat_ssafy_v3_unreal_sim.json', editor, project,
+                         None, deps, temp / 'state', field_config=root / 'server/examples/field_unreal_v3_sim.json',
+                         team_shelves=True)
+            self.assertEqual(popen.call_count, 4)
+            self.assertEqual(popen.call_args_list[1].kwargs['env']['AGV_ORDER_PERSIST_DIR'], str(temp / 'state'))
+            self.assertEqual(popen.call_args_list[3].kwargs['env']['AGV_ORDER_PERSIST_DIR'], str(temp / 'state'))
+
     def test_team_shelves_opt_in_has_no_persistence_and_will_not_restart_server(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as folder:

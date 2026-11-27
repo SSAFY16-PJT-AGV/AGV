@@ -44,7 +44,7 @@ def api(port, method, path, key=None):
 
 @unittest.skipUnless(os.environ.get('AMQTT_TEST_PATH'), 'requires isolated aMQTT dependencies')
 class TeamShelfWorldRestartHttpTest(unittest.TestCase):
-    def test_same_world_and_request_key_after_server_restart_do_not_publish(self):
+    def test_same_world_and_request_key_after_server_restart_do_not_publish(self, expect_retry=True):
         ports = set()
         while len(ports) < 2:
             port = free_port()
@@ -138,6 +138,8 @@ class TeamShelfWorldRestartHttpTest(unittest.TestCase):
                                 self.assertNotEqual(retry_code, 200, repr(retry))
                                 with self.assertRaises(queue.Empty):
                                     messages.get(timeout=3)
+                                if not expect_retry:
+                                    continue
                                 # A later world must not cause the pre-world retry to
                                 # start. The old key may belong to an already-issued
                                 # operation, so a failed world cannot queue it for

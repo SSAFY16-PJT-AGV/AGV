@@ -43,6 +43,7 @@ class TeamShelfPersistenceIdentityTest(unittest.TestCase):
             store.reserve(session, 'order-1', 'milk')
             with closing(sqlite3.connect(path)) as db:
                 db.execute('DROP TABLE identity')
+                db.execute('DROP TABLE action_bindings')
                 db.execute('PRAGMA user_version=1')
                 db.commit()
             reopened = TeamShelfOrderSlots.open_existing(path)
@@ -60,6 +61,37 @@ class TeamShelfPersistenceIdentityTest(unittest.TestCase):
             reopened = TeamShelfOrderSlots.open_existing(path, expected_creation_id=store.creation_id)
             self.assertEqual(reopened.get('order-1')['state'], 'unknown')
             self.assertEqual({row['slot_id'] for row in reopened.inspect()['claims']}, {1, 5})
+
+    def test_action_binding_is_durable_and_correlated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'slots.db'
+            store = TeamShelfOrderSlots.create_new(path)
+            session = store.begin_session('a' * 32)
+            store.apply_snapshot(session, snapshot(), fence=store.begin_snapshot(session))
+            store.reserve(session, 'order-1', 'milk')
+            binding = {'order_id': 'web-pickup', 'action_id': 'engine-1', 'agv_id': 'AGV_01'}
+            store.mark_dispatched(session, 'order-1', 'pick', 'slot-1', binding=binding)
+            store.complete_action(session, 'order-1', 'slot-1', True)
+            reopened = TeamShelfOrderSlots.open_existing(path, expected_creation_id=store.creation_id)
+            self.assertEqual(reopened.action_bindings('order-1'), [dict(binding, slot_action_id='slot-1',
+                                                                         phase='pick', state='applied')])
+
+    def test_completed_order_retains_proven_source_after_intervening_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = TeamShelfOrderSlots.create_new(Path(folder) / 'slots.db')
+            session = store.begin_session('a' * 32)
+            current = snapshot()
+            store.apply_snapshot(session, current, fence=store.begin_snapshot(session))
+            store.reserve(session, 'order-1', 'milk')
+            store.mark_dispatched(session, 'order-1', 'pick', 'pick')
+            store.complete_action(session, 'order-1', 'pick', True)
+            current[0] = {'slot_id': 1, 'state': 'empty', 'product_type': None}
+            store.apply_snapshot(session, current, fence=store.begin_snapshot(session))
+            store.mark_dispatched(session, 'order-1', 'place', 'place')
+            store.complete_action(session, 'order-1', 'place', True)
+            rows = {row['slot_id']: row for row in store.inspect()['slots']}
+            self.assertEqual((rows[1]['state'], rows[1]['product_type']), ('empty', None))
+            self.assertEqual((rows[5]['state'], rows[5]['product_type']), ('occupied', 'milk'))
 
 
 if __name__ == '__main__':

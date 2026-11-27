@@ -41,7 +41,7 @@ class TeamShelfTwinSession:
         self._pending = {}
         self._lock = threading.RLock()
 
-    def begin(self, request_id, agv_id, action):
+    def begin(self, request_id, agv_id, action, *, engine_binding=None):
         with self._lock:
             if self.owner is None or agv_id not in ('AGV_01', 'AGV_02') or action not in ('pick', 'place'):
                 raise ValueError('active twin owner, simulated robot and valid action required')
@@ -65,7 +65,7 @@ class TeamShelfTwinSession:
                     'slot_index': (slot - 1) % 4, 'product_type': order['product_type'],
                     'expected_x': x, 'expected_y': y}
             # Commit the attempt before handing the message to any transport.
-            self.slots.mark_dispatched(self.session, request_id, action, action_id)
+            self.slots.mark_dispatched(self.session, request_id, action, action_id, binding=engine_binding)
             self._pending[action_id] = {'data': data, 'deadline': time.monotonic() + self.timeout}
             return {'type': 'team.shelf.action.v1', 'data': dict(data)}
 

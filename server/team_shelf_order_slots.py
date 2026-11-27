@@ -65,7 +65,7 @@ class TeamShelfOrderSlots:
             self._file_identity = (stat.st_dev, stat.st_ino)
             with self._write() as db:
                 db.execute('PRAGMA application_id=1095194691')
-                db.execute('PRAGMA user_version=2')
+                db.execute('PRAGMA user_version=3')
                 db.execute('CREATE TABLE identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
                            'creation_id TEXT NOT NULL UNIQUE)')
                 self._creation_id = secrets.token_hex(32)
@@ -88,6 +88,7 @@ class TeamShelfOrderSlots:
                 db.execute('CREATE TABLE actions (action_id TEXT PRIMARY KEY, request_id TEXT NOT NULL '
                            'REFERENCES orders(request_id), phase TEXT NOT NULL, session TEXT NOT NULL, '
                            'state TEXT NOT NULL)')
+                self._create_bindings(db)
         else:
             if os.path.islink(self.path) or not os.path.isfile(self.path):
                 raise ValueError('existing regular simulation journal required')
@@ -96,7 +97,7 @@ class TeamShelfOrderSlots:
             with self._write() as db:
                 version = db.execute('PRAGMA user_version').fetchone()
                 if (db.execute('PRAGMA application_id').fetchone() != (1095194691,)
-                        or version not in ((1,), (2,))
+                        or version not in ((1,), (2,), (3,))
                         or db.execute('PRAGMA quick_check').fetchall() != [('ok',)]
                         or db.execute('PRAGMA foreign_key_check').fetchone() is not None):
                     raise ValueError('invalid simulated slot journal')
@@ -106,7 +107,9 @@ class TeamShelfOrderSlots:
                     db.execute('CREATE TABLE identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), '
                                'creation_id TEXT NOT NULL UNIQUE)')
                     db.execute('INSERT INTO identity VALUES (1,?)', (secrets.token_hex(32),))
-                    db.execute('PRAGMA user_version=2')
+                if version in ((1,), (2,)):
+                    self._create_bindings(db)
+                    db.execute('PRAGMA user_version=3')
                 identities = db.execute('SELECT creation_id FROM identity WHERE singleton=1').fetchall()
                 if (len(identities) != 1 or not isinstance(identities[0][0], str)
                         or re.fullmatch(r'[0-9a-f]{64}', identities[0][0]) is None
@@ -138,6 +141,21 @@ class TeamShelfOrderSlots:
                 raise ValueError('simulated slot journal identity changed')
             return self._creation_id
 
+    @property
+    def world_id(self):
+        with self._write() as db:
+            self._integrity(db)
+            row = db.execute('SELECT world_id FROM meta WHERE singleton=1').fetchone()
+            if row is None:
+                raise ValueError('simulated slot world is unavailable')
+            return row[0]
+
+    @staticmethod
+    def _create_bindings(db):
+        db.execute('CREATE TABLE action_bindings (slot_action_id TEXT PRIMARY KEY '
+                   'REFERENCES actions(action_id), engine_order_id TEXT NOT NULL, '
+                   'engine_action_id TEXT NOT NULL UNIQUE, agv_id TEXT NOT NULL)')
+
     @contextmanager
     def _write(self):
         with self._lock:
@@ -164,9 +182,11 @@ class TeamShelfOrderSlots:
 
     def _integrity(self, db):
         if (db.execute('PRAGMA application_id').fetchone() != (1095194691,)
-                or db.execute('PRAGMA user_version').fetchone() != (2,)
+                or db.execute('PRAGMA user_version').fetchone() != (3,)
                 or db.execute('SELECT creation_id FROM identity WHERE singleton=1').fetchone() != (self._creation_id,)):
             raise ValueError('simulated slot journal identity changed')
+        if db.execute('PRAGMA foreign_key_check').fetchone() is not None:
+            raise ValueError('simulated slot journal binding is invalid')
         rows = db.execute('SELECT slot_id,shelf_id,slot_index,marker_id,state,product_type '
                           'FROM slots ORDER BY slot_id').fetchall()
         if len(rows) != 24:
@@ -210,7 +230,7 @@ class TeamShelfOrderSlots:
         world_id = _text(world_id, 'world ID')
         with self._write() as db:
             row = db.execute('SELECT world_id FROM meta WHERE singleton=1').fetchone()
-            if row is None or row[0] not in (None, world_id):
+            if row is None or (row[0] is not None and row[0].lower() != world_id.lower()):
                 raise ValueError('simulation world differs')
             db.execute("UPDATE orders SET state='unknown' WHERE state NOT IN ('completed','failed')")
             db.execute("UPDATE actions SET state='unknown' WHERE state='inflight'")
@@ -297,11 +317,18 @@ class TeamShelfOrderSlots:
             self._change(db)
             return self._order(db, request_id)
 
-    def mark_dispatched(self, session, request_id, phase, action_id):
+    def mark_dispatched(self, session, request_id, phase, action_id, *, binding=None):
         _text(request_id, 'request ID')
         _text(action_id, 'action ID')
         if phase not in ('pick', 'place'):
             raise ValueError('unknown action')
+        if binding is not None:
+            if not isinstance(binding, dict) or set(binding) != {'order_id', 'action_id', 'agv_id'}:
+                raise ValueError('invalid simulated engine action binding')
+            for key in ('order_id', 'action_id', 'agv_id'):
+                _text(binding[key], key)
+            if binding['agv_id'] not in ('AGV_01', 'AGV_02'):
+                raise ValueError('unknown simulated engine robot')
         with self._write() as db:
             self._active(db, session, fresh=True)
             self._admission()
@@ -310,11 +337,24 @@ class TeamShelfOrderSlots:
                 raise ValueError('order is not ready for that action')
             try:
                 db.execute('INSERT INTO actions VALUES (?,?,?,?,?)', (action_id, request_id, phase, session, 'inflight'))
+                if binding is not None:
+                    db.execute('INSERT INTO action_bindings VALUES (?,?,?,?)',
+                               (action_id, binding['order_id'], binding['action_id'], binding['agv_id']))
             except sqlite3.IntegrityError as exc:
                 raise ValueError('duplicate action ID') from exc
             db.execute('UPDATE orders SET state=? WHERE request_id=?',
                        ('picking' if phase == 'pick' else 'placing', request_id))
             self._change(db)
+
+    def action_bindings(self, request_id):
+        _text(request_id, 'request ID')
+        with self._write() as db:
+            self._integrity(db)
+            return [{'slot_action_id': row[0], 'phase': row[1], 'state': row[2],
+                     'order_id': row[3], 'action_id': row[4], 'agv_id': row[5]}
+                    for row in db.execute('SELECT a.action_id,a.phase,a.state,b.engine_order_id,'
+                        'b.engine_action_id,b.agv_id FROM actions a JOIN action_bindings b '
+                        'ON b.slot_action_id=a.action_id WHERE a.request_id=? ORDER BY a.rowid', (request_id,))]
 
     def begin_navigation(self, session, request_id, task_id):
         """Durably mark the one allowed simulated navigation publish attempt."""
@@ -373,6 +413,10 @@ class TeamShelfOrderSlots:
                 db.execute("UPDATE slots SET state='empty',product_type=NULL WHERE slot_id=?", (order['source_slot_id'],))
                 state = 'carried'
             elif phase == 'place' and applied:
+                # Both slots remained claimed after the confirmed pick. A
+                # snapshot while they were held may have masked the source as
+                # unknown; no other order could refill that held slot.
+                db.execute("UPDATE slots SET state='empty',product_type=NULL WHERE slot_id=?", (order['source_slot_id'],))
                 db.execute("UPDATE slots SET state='occupied',product_type=? WHERE slot_id=?",
                            (order['product_type'], order['destination_slot_id']))
                 state = 'completed'
