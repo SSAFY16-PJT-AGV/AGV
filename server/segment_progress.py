@@ -315,6 +315,9 @@ class SegmentProgress:
         task_id, seq = event['order_id'], event['seq']
         with self._transaction() as db:
             _verify_field_global(db, field_required=self._field_required)
+            from server.sim_reroute_transition import is_prepared
+            if is_prepared(db, task_id):
+                raise SegmentOccupied('a prepared simulated reroute retains both segments')
             self._authorize(db, task_id, event['robot_session'], seq, event['stopped_at'])
             existing = db.execute('SELECT digest,task_id,seq,next_seq,result FROM progress_events '
                                   'WHERE robot_id=? AND event_id=?', (robot_id, event['event_id'])).fetchone()

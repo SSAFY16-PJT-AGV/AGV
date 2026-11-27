@@ -59,6 +59,9 @@ class SimOrderAuthorizer:
                                 verify_fleet(db)
                             parsed, canonical, digest = _decode(payload, self.robot_id, progress._map_id)
                             task = parsed['order_id']
+                            from server.sim_reroute_transition import is_prepared
+                            if is_prepared(db, task):
+                                raise ValueError('prepared simulated reroute does not authorize motion')
                             mapping = runtime._tasks.get(task)
                             if (not isinstance(mapping, tuple) or len(mapping) != 2 or mapping[0] != self.robot_id
                                     or receiver.robot_sessions.get(self.robot_id, {}).get(task) != mapping[1]):

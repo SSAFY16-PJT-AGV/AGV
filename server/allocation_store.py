@@ -100,6 +100,9 @@ def _verify_field_global(db, *, field_required=False):
         for task_id, status, map_id, nodes_json, stopped in jobs:
             robot, path, stop = progress._job(db, task_id) if status == 'ASSIGNED' else (None, None, None)
             if status != 'ASSIGNED':
+                from server.sim_reroute_transition import is_prepared
+                if is_prepared(db, task_id):
+                    raise AllocationConflict('completed task retains an unfinished reroute')
                 # The separate handoff workflow can retain completed history,
                 # but completed jobs must no longer own active resources.
                 if status != 'DONE' or db.execute('SELECT 1 FROM allocation_occupancy WHERE task_id=?',
@@ -139,6 +142,11 @@ def _verify_field_global(db, *, field_required=False):
             if finished and (stop != path[-1] or order['released_until'] != path[-1]):
                 raise AllocationConflict('finished field task has not reached its destination')
             expected = {('node', path[-1])} if finished else set(segment.resources)
+            from server.sim_reroute_transition import is_prepared, verify_prepared
+            if finished and is_prepared(db, task_id):
+                raise AllocationConflict('finished task retains an unfinished reroute')
+            expected |= verify_prepared(db, progress, task_id, robot, path, stop, seq,
+                                        initial[0] if not rows else _payload, expected)
             held = set(db.execute('SELECT kind,resource_id FROM allocation_occupancy WHERE task_id=?',
                                   (task_id,)).fetchall())
             if held != expected:

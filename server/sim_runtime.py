@@ -70,13 +70,16 @@ class SimRuntime:
     def __init__(self, db_path, map_data, robot_sessions, *, port, client_id,
                  host='127.0.0.1', connect_timeout=5.0, ack_timeout=3.0, simulation_store=None,
                  field_simulation=False, field_initial_positions=None, command_observations=False,
-                 investigation_notes=False):
+                 investigation_notes=False, reroute_transitions=False):
         if type(field_simulation) is not bool:
             raise ValueError('field_simulation must be boolean')
         if type(command_observations) is not bool or (command_observations and not field_simulation):
             raise ValueError('command observations require explicit field simulation')
         if type(investigation_notes) is not bool:
             raise ValueError('investigation notes must be boolean')
+        if type(reroute_transitions) is not bool or (reroute_transitions and not field_simulation):
+            raise ValueError('reroute transitions require explicit field simulation')
+        self._reroute_transitions = reroute_transitions
         if field_initial_positions is not None and not field_simulation:
             raise ValueError('field initial positions require field simulation')
         self._field_initial_positions = copy.deepcopy(field_initial_positions)
@@ -255,6 +258,10 @@ class SimRuntime:
                     options['field_simulation'] = True
                 self.progress = SegmentProgress(self.store, self.map_data, **options)
                 self.progress.initialize()
+                if self._reroute_transitions:
+                    from server.sim_reroute_transition import initialize
+                    with self.store._write() as db:
+                        initialize(db)
                 if self._investigation_notes_enabled:
                     from server.sim_investigation_notes import SimInvestigationNotes
                     self.investigation_notes = SimInvestigationNotes(
@@ -658,6 +665,13 @@ class SimRuntime:
         """Calculate a non-executable candidate against verified virtual waits."""
         from server.sim_reroute_candidate import propose_reroute
         return propose_reroute(self, task_id)
+
+    def prepare_reroute(self, task_id):
+        """Reserve both segments for a stopped simulated task; never publish."""
+        from server.sim_reroute_candidate import propose_reroute
+        if not self._reroute_transitions:
+            raise RuntimeError('simulated reroute transitions are disabled')
+        return propose_reroute(self, task_id, prepare=True)
 
     def bind_reroute_simulators(self, robots):
         """Bind local virtual executors once; never accept this from an API."""

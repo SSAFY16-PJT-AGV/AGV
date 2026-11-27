@@ -38,7 +38,9 @@ def _owned_simulator(runtime, robot_id, robot):
             and authorizer.runtime is runtime and authorizer.robot_id == robot_id)
 
 
-def propose_reroute(runtime, task_id):
+def propose_reroute(runtime, task_id, *, prepare=False):
+    if type(prepare) is not bool or (prepare and not runtime._reroute_transitions):
+        raise ValueError('explicit simulated reroute transition required')
     if not isinstance(task_id, str) or not task_id or len(task_id.encode('utf-8')) > 256:
         return _result('unknown', 'invalid_task')
     with runtime._runtime_read_operation():
@@ -54,10 +56,10 @@ def propose_reroute(runtime, task_id):
                     or robot._event_uncertain or not robot._queue.empty()):
                 return _result('unknown', 'direction_checkpoint_unavailable')
             client = robot._client
-            return _propose_locked(runtime, task_id, robot, client, bindings)
+            return _propose_locked(runtime, task_id, robot, client, bindings, prepare=prepare)
 
 
-def _propose_locked(runtime, task_id, robot, client, bindings):
+def _propose_locked(runtime, task_id, robot, client, bindings, *, prepare=False):
         with runtime._lock:
             if runtime._reroute_simulators is not bindings:
                 return _result('unknown', 'direction_checkpoint_unavailable')
@@ -146,6 +148,12 @@ def _propose_locked(runtime, task_id, robot, client, bindings):
                                     or virtual_robot.executor.field_stop_direction() != (stopped, incoming)
                                     or receiver is not runtime.receiver or not receiver.ready):
                                 return _result('unknown', 'direction_checkpoint_mismatch')
+                            if prepare:
+                                from server.sim_reroute_transition import reserve
+                                result = reserve(db, runtime, task_id, wait, path, incoming, candidate,
+                                                 blocked, progress._occupancy(db, task_id))
+                                _verify_field_global(db, field_required=progress._field_required)
+                                return result
                             return {'status': 'candidate', 'reason': None, 'scope': 'isolated_simulation',
                                     'control_effect': 'none', 'nodes': list(candidate.nodes),
                                     'edge_ids': list(candidate.edge_ids), 'incoming_edge': incoming,
